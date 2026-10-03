@@ -262,7 +262,7 @@ use gpui::{
 };
 use language::{Language, Rope};
 use plan::{CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment};
-use settings::{RegisterSetting, Settings, SettingsContent};
+use settings::Settings;
 use util::ResultExt;
 
 actions!(
@@ -274,27 +274,11 @@ actions!(
         /// Toggles `*italic*` on the selection, the same way `ToggleBold`
         /// does for bold — see `intercept_toggle_italic`.
         ToggleItalic,
+        /// Toggles Markdown live preview in this editor only, without
+        /// changing any settings file — see `toggle_live_preview`.
+        ToggleLivePreview,
     ]
 );
-
-/// The `visual_md` user setting: `{ "visual_md": { "enabled": true } }`. Defaults to
-/// on, per the project goal of always using live preview for Markdown in Zed.
-#[derive(RegisterSetting)]
-pub struct VisualMdSettings {
-    pub enabled: bool,
-}
-
-impl Settings for VisualMdSettings {
-    fn from_settings(content: &SettingsContent) -> Self {
-        Self {
-            enabled: content
-                .visual_md
-                .as_ref()
-                .and_then(|visual_md| visual_md.enabled)
-                .unwrap_or(true),
-        }
-    }
-}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(register_editor).detach();
@@ -322,11 +306,14 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let newline_action = editor.register_action(cx.listener(intercept_newline));
     let toggle_bold_action = editor.register_action(cx.listener(intercept_toggle_bold));
     let toggle_italic_action = editor.register_action(cx.listener(intercept_toggle_italic));
+    let toggle_live_preview_action = editor.register_action(cx.listener(toggle_live_preview));
     editor.register_addon(VisualMdAddon {
         _state: state,
         _newline_action: newline_action,
         _toggle_bold_action: toggle_bold_action,
         _toggle_italic_action: toggle_italic_action,
+        _toggle_live_preview_action: toggle_live_preview_action,
+        enabled_override: None,
         active: false,
         folded_markers: Vec::new(),
         hr_blocks: Vec::new(),
@@ -380,9 +367,7 @@ fn intercept_newline(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    if !is_markdown_editor(editor, cx)
-        || !VisualMdSettings::try_get(cx).is_some_and(|settings| settings.enabled)
-    {
+    if !live_preview_enabled(editor, cx) {
         cx.propagate();
         return;
     }
@@ -466,9 +451,7 @@ fn intercept_toggle(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    if !is_markdown_editor(editor, cx)
-        || !VisualMdSettings::try_get(cx).is_some_and(|settings| settings.enabled)
-    {
+    if !live_preview_enabled(editor, cx) {
         cx.propagate();
         return;
     }
@@ -521,6 +504,65 @@ fn is_markdown_editor(editor: &Editor, cx: &App) -> bool {
         .is_some_and(|language| language.name().as_ref() == "Markdown")
 }
 
+/// The `visual_md_enabled` language setting for this editor's buffer, which
+/// resolves default, user, project and per-language settings in that order.
+/// Read at offset 0, the same place `is_markdown_editor` checks the language.
+fn live_preview_setting(editor: &Editor, cx: &App) -> bool {
+    editor
+        .buffer()
+        .read(cx)
+        .language_settings_at(MultiBufferOffset(0), cx)
+        .visual_md_enabled
+}
+
+/// Whether live preview should currently decorate this editor: it must be a
+/// Markdown buffer, and this editor's own `ToggleLivePreview` override, if it
+/// has one, takes priority over the settings.
+fn live_preview_enabled(editor: &Editor, cx: &App) -> bool {
+    if !is_markdown_editor(editor, cx) {
+        return false;
+    }
+    editor
+        .addon::<VisualMdAddon>()
+        .and_then(|addon| addon.enabled_override)
+        .unwrap_or_else(|| live_preview_setting(editor, cx))
+}
+
+/// Drops `enabled_override` once the settings agree with it, so a later
+/// settings change is not masked by an override that no longer overrides
+/// anything.
+fn drop_redundant_override(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let setting = live_preview_setting(editor, cx);
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>()
+        && addon.enabled_override == Some(setting)
+    {
+        addon.enabled_override = None;
+    }
+}
+
+/// Handles `ToggleLivePreview`: flips what this editor currently shows without
+/// writing any settings. The override is dropped as soon as it matches the
+/// setting again, so a later settings change is not masked by a stale override.
+fn toggle_live_preview(
+    editor: &mut Editor,
+    _: &ToggleLivePreview,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    if !is_markdown_editor(editor, cx) {
+        cx.propagate();
+        return;
+    }
+
+    let enabled = live_preview_enabled(editor, cx);
+    let setting = live_preview_setting(editor, cx);
+    let Some(addon) = editor.addon_mut::<VisualMdAddon>() else {
+        return;
+    };
+    addon.enabled_override = (!enabled != setting).then_some(!enabled);
+    refresh(editor, window, cx);
+}
+
 /// Addon registered on every visual_md-managed editor. Besides keeping
 /// [`VisualMdState`] (and the editor-event subscriptions it owns) alive, this
 /// is where the currently-folded marker creases are tracked so `refresh` can
@@ -536,6 +578,11 @@ struct VisualMdAddon {
     /// `_newline_action` does.
     _toggle_bold_action: Subscription,
     _toggle_italic_action: Subscription,
+    _toggle_live_preview_action: Subscription,
+    /// What `ToggleLivePreview` last forced for this editor, taking priority
+    /// over the settings. `None` once the toggle lands back on the setting's
+    /// own value.
+    enabled_override: Option<bool>,
     /// Whether `refresh` last found this editor markdown-and-enabled.
     /// `extend_key_context` reads this to add the `visual_md` context key the
     /// keymap's `Editor && visual_md` bindings (`ToggleBold`/`ToggleItalic`)
@@ -688,11 +735,28 @@ impl VisualMdState {
                     &buffer,
                     window,
                     |state: &mut VisualMdState, _buffer, event, window, cx| {
-                        if matches!(event, multi_buffer::Event::LanguageChanged(..)) {
-                            state
-                                .editor
-                                .update(cx, |editor, cx| force_refresh(editor, window, cx))
-                                .log_err();
+                        match event {
+                            multi_buffer::Event::LanguageChanged(..) => {
+                                state
+                                    .editor
+                                    .update(cx, |editor, cx| force_refresh(editor, window, cx))
+                                    .log_err();
+                            }
+                            // Emitted only when a buffer's own resolved
+                            // language settings change, so this covers the
+                            // user file, a project's `.zed/settings.json` and
+                            // a `languages` entry, for just the buffers they
+                            // affect.
+                            multi_buffer::Event::SettingsChanged => {
+                                state
+                                    .editor
+                                    .update(cx, |editor, cx| {
+                                        drop_redundant_override(editor, cx);
+                                        refresh(editor, window, cx)
+                                    })
+                                    .log_err();
+                            }
+                            _ => {}
                         }
                     },
                 ),
@@ -869,8 +933,7 @@ fn visible_byte_range(
 /// makes typing feel laggy, not the tree-sitter parse itself. See
 /// `plan_viewport`'s own doc comment for the full reasoning.
 fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
-    let enabled = is_markdown_editor(editor, cx)
-        && VisualMdSettings::try_get(cx).is_some_and(|settings| settings.enabled);
+    let enabled = live_preview_enabled(editor, cx);
 
     let was_active = editor
         .addon_mut::<VisualMdAddon>()
@@ -3621,6 +3684,252 @@ mod integration_tests {
             editor.key_context(window, cx).contains("visual_md")
         });
         assert!(context_with_markdown);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PreviewState {
+        active: bool,
+        folded_markers: usize,
+        highlight_keys: usize,
+    }
+
+    fn preview_state(cx: &mut EditorTestContext) -> PreviewState {
+        cx.update_editor(|editor, window, cx| PreviewState {
+            active: editor.key_context(window, cx).contains("visual_md"),
+            folded_markers: editor
+                .addon::<VisualMdAddon>()
+                .map_or(0, |addon| addon.folded_markers.len()),
+            highlight_keys: editor
+                .addon::<VisualMdAddon>()
+                .map_or(0, |addon| addon.nonempty_highlight_keys.len()),
+        })
+    }
+
+    fn assert_preview_on(cx: &mut EditorTestContext) {
+        let state = preview_state(cx);
+        assert!(state.active, "{state:?}");
+        assert!(state.folded_markers > 0, "{state:?}");
+        assert!(state.highlight_keys > 0, "{state:?}");
+    }
+
+    fn assert_preview_off(cx: &mut EditorTestContext) {
+        assert_eq!(
+            preview_state(cx),
+            PreviewState {
+                active: false,
+                folded_markers: 0,
+                highlight_keys: 0,
+            }
+        );
+    }
+
+    async fn markdown_preview_context(cx: &mut TestAppContext) -> EditorTestContext {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("# Heading text\n\nˇother paragraph\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx
+    }
+
+    fn update_user_settings(
+        cx: &mut EditorTestContext,
+        update: impl FnOnce(&mut settings::SettingsContent),
+    ) {
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, update);
+        });
+        cx.run_until_parked();
+    }
+
+    fn set_project_settings(cx: &mut EditorTestContext, content: Option<&str>) {
+        let worktree_id = cx
+            .update_buffer(|buffer, cx| buffer.file().map(|file| file.worktree_id(cx)))
+            .expect("the test buffer should belong to a worktree");
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store
+                .set_local_settings(
+                    worktree_id,
+                    settings::LocalSettingsPath::InWorktree(util::rel_path::RelPath::empty_arc()),
+                    settings::LocalSettingsKind::Settings,
+                    content,
+                    cx,
+                )
+                .expect("project settings should load");
+        });
+        cx.run_until_parked();
+    }
+
+    fn visual_md_setting(enabled: bool) -> Option<settings::VisualMdSettingsContent> {
+        Some(settings::VisualMdSettingsContent {
+            enabled: Some(enabled),
+        })
+    }
+
+    #[gpui::test]
+    async fn user_setting_toggles_live_preview_without_an_edit(cx: &mut TestAppContext) {
+        let mut cx = markdown_preview_context(cx).await;
+        assert_preview_on(&mut cx);
+
+        update_user_settings(&mut cx, |content| {
+            content.project.all_languages.defaults.visual_md = visual_md_setting(false);
+        });
+        assert_preview_off(&mut cx);
+
+        update_user_settings(&mut cx, |content| {
+            content.project.all_languages.defaults.visual_md = visual_md_setting(true);
+        });
+        assert_preview_on(&mut cx);
+    }
+
+    #[gpui::test]
+    async fn project_setting_overrides_user_setting(cx: &mut TestAppContext) {
+        let mut cx = markdown_preview_context(cx).await;
+
+        set_project_settings(&mut cx, Some(r#"{"visual_md":{"enabled":false}}"#));
+        assert_preview_off(&mut cx);
+
+        // An emptied file rather than `None`: `SettingsStore::set_local_settings`
+        // with no content drops the file but leaves its previously resolved
+        // values in effect, so it cannot model "the override went away".
+        set_project_settings(&mut cx, Some("{}"));
+        assert_preview_on(&mut cx);
+
+        update_user_settings(&mut cx, |content| {
+            content.project.all_languages.defaults.visual_md = visual_md_setting(false);
+        });
+        assert_preview_off(&mut cx);
+
+        set_project_settings(&mut cx, Some(r#"{"visual_md":{"enabled":true}}"#));
+        assert_preview_on(&mut cx);
+
+        set_project_settings(&mut cx, Some("{}"));
+        assert_preview_off(&mut cx);
+    }
+
+    #[gpui::test]
+    async fn language_setting_overrides_the_default(cx: &mut TestAppContext) {
+        let mut cx = markdown_preview_context(cx).await;
+
+        update_user_settings(&mut cx, |content| {
+            content
+                .languages_mut()
+                .entry("Rust".to_string())
+                .or_default()
+                .visual_md = visual_md_setting(false);
+        });
+        assert_preview_on(&mut cx);
+
+        update_user_settings(&mut cx, |content| {
+            content
+                .languages_mut()
+                .entry("Markdown".to_string())
+                .or_default()
+                .visual_md = visual_md_setting(false);
+        });
+        assert_preview_off(&mut cx);
+
+        update_user_settings(&mut cx, |content| {
+            content
+                .languages_mut()
+                .entry("Markdown".to_string())
+                .or_default()
+                .visual_md = None;
+        });
+        assert_preview_on(&mut cx);
+
+        set_project_settings(
+            &mut cx,
+            Some(r#"{"languages":{"Markdown":{"visual_md":{"enabled":false}}}}"#),
+        );
+        assert_preview_off(&mut cx);
+    }
+
+    #[gpui::test]
+    async fn toggle_live_preview_overrides_one_editor_without_touching_settings(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = markdown_preview_context(cx).await;
+        let override_state = |cx: &mut EditorTestContext| {
+            cx.update_editor(|editor, _window, _cx| {
+                editor
+                    .addon::<VisualMdAddon>()
+                    .and_then(|addon| addon.enabled_override)
+            })
+        };
+        let setting = |cx: &mut EditorTestContext| {
+            cx.update_editor(|editor, _window, cx| live_preview_setting(editor, cx))
+        };
+
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+        assert_preview_off(&mut cx);
+        assert_eq!(override_state(&mut cx), Some(false));
+        assert!(setting(&mut cx), "toggling must not change the setting");
+
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+        assert_preview_on(&mut cx);
+        assert_eq!(override_state(&mut cx), None);
+
+        update_user_settings(&mut cx, |content| {
+            content.project.all_languages.defaults.visual_md = visual_md_setting(false);
+        });
+        assert_preview_off(&mut cx);
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+        assert_preview_on(&mut cx);
+        assert_eq!(override_state(&mut cx), Some(true));
+
+        // Once the setting agrees with the override it must stop overriding,
+        // or the next settings change would be masked.
+        update_user_settings(&mut cx, |content| {
+            content.project.all_languages.defaults.visual_md = visual_md_setting(true);
+        });
+        assert_preview_on(&mut cx);
+        assert_eq!(override_state(&mut cx), None);
+        update_user_settings(&mut cx, |content| {
+            content.project.all_languages.defaults.visual_md = visual_md_setting(false);
+        });
+        assert_preview_off(&mut cx);
+    }
+
+    #[gpui::test]
+    async fn toggle_live_preview_does_nothing_in_a_non_markdown_buffer(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("# Heading text\n\nˇother paragraph\n");
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+
+        assert_preview_off(&mut cx);
+        let override_state = cx.update_editor(|editor, _window, _cx| {
+            editor
+                .addon::<VisualMdAddon>()
+                .and_then(|addon| addon.enabled_override)
+        });
+        assert_eq!(override_state, None);
+    }
+
+    #[gpui::test]
+    async fn toggle_bold_falls_through_while_live_preview_is_off(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleBold);
+        cx.assert_editor_state("Hello **«worldˇ»** now\n");
     }
 
     /// Exercises the M11 callout title widget through a real `refresh()`,

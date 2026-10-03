@@ -816,6 +816,8 @@ pub struct LanguageSettingsContent {
     ///
     /// Default: false
     pub colorize_brackets: Option<bool>,
+    /// Settings for live-preview Markdown editing.
+    pub visual_md: Option<VisualMdSettingsContent>,
 }
 
 /// Controls how whitespace should be displayedin the editor.
@@ -887,6 +889,23 @@ pub enum RewrapBehavior {
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct JsxTagAutoCloseSettingsContent {
     /// Enables or disables auto-closing of JSX tags.
+    pub enabled: Option<bool>,
+}
+
+/// Settings for Zed MD's live-preview Markdown editing: Markdown formatting
+/// is rendered inline as you type, with the raw syntax revealed only on the line
+/// (or span) the cursor is touching. See docs/visual-md-spec.md for the full
+/// behavior spec.
+///
+/// Like other language settings, this can be set in the user settings, in a
+/// project's `.zed/settings.json`, and per language under `languages`.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdSettingsContent {
+    /// Whether to render Markdown buffers with live preview instead of plain
+    /// source text.
+    ///
+    /// Default: true
     pub enabled: Option<bool>,
 }
 
