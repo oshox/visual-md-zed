@@ -339,6 +339,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         parsed: None,
         planned: None,
         nonempty_highlight_keys: HashSet::new(),
+        last_applied: None,
+        selection_refresh_queued: false,
     });
     refresh(editor, window, cx);
 
@@ -588,6 +590,14 @@ struct VisualMdAddon {
     /// `set_visual_md_highlight` can skip re-clearing a key that is already
     /// empty.
     nonempty_highlight_keys: HashSet<usize>,
+    /// The buffer's `edit_count` and the plan the last refresh applied. A
+    /// refresh that plans the same thing again (a drag-select that touches the
+    /// same constructs, a scroll that reveals nothing new) has nothing to
+    /// apply and skips it.
+    last_applied: Option<(usize, Plan)>,
+    /// Whether a selection-triggered refresh is already queued for the next
+    /// frame, so a burst of selection events costs one refresh.
+    selection_refresh_queued: bool,
 }
 
 struct ParsedDocument {
@@ -657,8 +667,13 @@ impl VisualMdState {
                         // get decorated rather than staying stale/blank until
                         // the next edit or cursor move.
                         match event {
-                            EditorEvent::BufferEdited | EditorEvent::SelectionsChanged { .. } => {
+                            EditorEvent::BufferEdited => {
                                 editor.update(cx, |editor, cx| refresh(editor, window, cx));
+                            }
+                            EditorEvent::SelectionsChanged { .. } => {
+                                editor.update(cx, |editor, cx| {
+                                    queue_selection_refresh(editor, window, cx)
+                                });
                             }
                             EditorEvent::ScrollPositionChanged { .. } => {
                                 editor.update(cx, |editor, cx| {
@@ -676,7 +691,7 @@ impl VisualMdState {
                         if matches!(event, multi_buffer::Event::LanguageChanged(..)) {
                             state
                                 .editor
-                                .update(cx, |editor, cx| refresh(editor, window, cx))
+                                .update(cx, |editor, cx| force_refresh(editor, window, cx))
                                 .log_err();
                         }
                     },
@@ -921,6 +936,18 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         }
     };
 
+    let edit_count = snapshot.edit_count();
+    let unchanged = enabled == was_active
+        && editor
+            .addon::<VisualMdAddon>()
+            .and_then(|addon| addon.last_applied.as_ref())
+            .is_some_and(|(applied_edit_count, applied)| {
+                *applied_edit_count == edit_count && *applied == computed
+            });
+    if unchanged {
+        return;
+    }
+
     let editor_handle = cx.weak_entity();
     // The `String` alongside each range is a content key, not just an
     // identifier: `apply_folds` diffs on `(range, key)` together, not range
@@ -1023,6 +1050,41 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .collect();
     ensure_code_languages_loaded(editor, window, cx, code_languages);
     apply_code_syntax_highlights(editor, &snapshot, &text, &computed, cx);
+
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+        addon.last_applied = Some((edit_count, computed));
+    }
+}
+
+/// `refresh`, but re-applying even if the plan is unchanged: for when
+/// something the plan doesn't capture (a language finishing loading) changed
+/// what applying it produces.
+fn force_refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+        addon.last_applied = None;
+    }
+    refresh(editor, window, cx);
+}
+
+/// Defers a selection-triggered refresh to the next frame. A mouse drag can
+/// report selection changes far faster than frames are drawn, and only the
+/// final selection of each frame is ever visible.
+fn queue_selection_refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon_mut::<VisualMdAddon>() else {
+        return;
+    };
+    if std::mem::replace(&mut addon.selection_refresh_queued, true) {
+        return;
+    }
+    let editor_entity = cx.entity();
+    window.on_next_frame(move |window, cx| {
+        editor_entity.update(cx, |editor, cx| {
+            if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+                addon.selection_refresh_queued = false;
+            }
+            refresh(editor, window, cx);
+        });
+    });
 }
 
 /// Returns the buffer text and its block parse for `snapshot`, reusing the
@@ -2148,7 +2210,7 @@ fn ensure_code_languages_loaded(
                             addon.code_languages.insert(name.clone(), language);
                             addon.pending_language_tasks.remove(&name);
                         }
-                        refresh(editor, window, cx);
+                        force_refresh(editor, window, cx);
                     })
                     .ok();
             }
@@ -3120,14 +3182,9 @@ mod integration_tests {
             text.push_str(&format!("filler line number {i}\n"));
         }
         let bottom_heading_row = text.matches('\n').count() as u32;
-        // The cursor sits two lines after the bottom heading, not on the
-        // heading itself or immediately after it: `plan_heading` treats a
-        // heading's `atx_heading` node range (which includes its trailing
-        // newline) as "touched" by a selection sitting right at that
-        // boundary, which correctly reveals (dims) the marker instead of
-        // folding it — this test is about viewport visibility, not
-        // selection-revealing, so it deliberately puts the cursor
-        // unambiguously outside the heading's own node range.
+        // The cursor sits on the line after the blank line below the heading:
+        // this test is about viewport visibility, not selection-revealing, so
+        // it deliberately keeps the cursor off the heading's own line.
         text.push_str("# Bottom Heading\n\nˇfiller line after bottom heading\n");
 
         cx.set_state(&text);
@@ -3157,6 +3214,64 @@ mod integration_tests {
                 "the on-screen bottom heading's marker should have been folded: {folded:?}"
             );
         });
+    }
+
+    /// Dragging a selection across text on one heading line (many selection
+    /// changes, no edits) must leave the applied folds untouched, and moving
+    /// the cursor off the heading must still re-hide its marker.
+    #[gpui::test]
+    async fn selection_changes_within_a_heading_line_keep_folds_stable(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+
+        cx.set_state("# Heading text\n\nˇother paragraph\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        let folded_ids = |cx: &mut EditorTestContext| {
+            cx.update_editor(|editor, _window, _cx| {
+                editor
+                    .addon::<VisualMdAddon>()
+                    .unwrap()
+                    .folded_markers
+                    .iter()
+                    .map(|(range, key, id)| (range.clone(), key.clone(), *id))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let select = |cx: &mut EditorTestContext, range: Range<usize>| {
+            cx.update_editor(|editor, window, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([
+                        MultiBufferOffset(range.start)..MultiBufferOffset(range.end)
+                    ]);
+                });
+            });
+            // Selection refreshes are queued for the next frame.
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        select(&mut cx, 4..4);
+        let on_heading = folded_ids(&mut cx);
+        assert!(
+            !on_heading.iter().any(|(range, _, _)| range.start == 0),
+            "the marker must be revealed while the cursor is on the heading line: {on_heading:?}"
+        );
+        for end in 5..=12 {
+            select(&mut cx, 4..end);
+        }
+        assert_eq!(on_heading, folded_ids(&mut cx));
+
+        select(&mut cx, 16..16);
+        assert!(
+            folded_ids(&mut cx)
+                .iter()
+                .any(|(range, _, _)| range.start == 0),
+            "the marker must be hidden again once the cursor leaves the heading line"
+        );
     }
 
     /// A scroll alone (no `refresh` call from the test) must still decorate
