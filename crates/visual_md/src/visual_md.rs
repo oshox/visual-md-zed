@@ -329,6 +329,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         pending_language_tasks: HashMap::new(),
         active_syntax_ids: HashSet::new(),
         table_dividers: Vec::new(),
+        parsed: None,
+        planned: None,
+        nonempty_highlight_keys: HashSet::new(),
     });
     refresh(editor, window, cx);
 
@@ -562,6 +565,23 @@ struct VisualMdAddon {
     /// `apply_table_dividers`) -- structurally identical to `hr_blocks`,
     /// since a divider line's rendering never varies either.
     table_dividers: Vec<(Range<usize>, CustomBlockId)>,
+    /// The buffer text and its block-level parse as of `edit_count`, reused
+    /// by every refresh (scroll, cursor move) that doesn't follow an edit.
+    parsed: Option<ParsedDocument>,
+    /// The buffer's `edit_count` and the byte range (viewport plus overscan)
+    /// the last refresh planned decorations for. `refresh_after_scroll` skips
+    /// a scroll that stays inside it.
+    planned: Option<(usize, Range<usize>)>,
+    /// `VisualMd` highlight sub-keys currently holding non-empty ranges, so
+    /// `set_visual_md_highlight` can skip re-clearing a key that is already
+    /// empty.
+    nonempty_highlight_keys: HashSet<usize>,
+}
+
+struct ParsedDocument {
+    edit_count: usize,
+    text: Arc<str>,
+    block_tree: tree_sitter::Tree,
 }
 
 impl Addon for VisualMdAddon {
@@ -624,13 +644,16 @@ impl VisualMdState {
                         // scrolled-into-view content needs its own refresh to
                         // get decorated rather than staying stale/blank until
                         // the next edit or cursor move.
-                        if matches!(
-                            event,
-                            EditorEvent::BufferEdited
-                                | EditorEvent::SelectionsChanged { .. }
-                                | EditorEvent::ScrollPositionChanged { .. }
-                        ) {
-                            editor.update(cx, |editor, cx| refresh(editor, window, cx));
+                        match event {
+                            EditorEvent::BufferEdited | EditorEvent::SelectionsChanged { .. } => {
+                                editor.update(cx, |editor, cx| refresh(editor, window, cx));
+                            }
+                            EditorEvent::ScrollPositionChanged { .. } => {
+                                editor.update(cx, |editor, cx| {
+                                    refresh_after_scroll(editor, window, cx)
+                                });
+                            }
+                            _ => {}
                         }
                     },
                 ),
@@ -770,6 +793,7 @@ fn visible_byte_range(
     editor: &Editor,
     display_snapshot: &DisplaySnapshot,
     text_len: usize,
+    overscan_rows: u32,
     cx: &App,
 ) -> Range<usize> {
     let Some(visible_lines) = editor.visible_line_count() else {
@@ -779,12 +803,12 @@ fn visible_byte_range(
     let scroll_top = editor
         .scroll_manager
         .scroll_top_display_point(display_snapshot, cx);
-    let top_row = scroll_top.row().0.saturating_sub(VIEWPORT_OVERSCAN_ROWS);
+    let top_row = scroll_top.row().0.saturating_sub(overscan_rows);
     let bottom_row = scroll_top
         .row()
         .0
         .saturating_add(visible_lines.ceil() as u32)
-        .saturating_add(VIEWPORT_OVERSCAN_ROWS);
+        .saturating_add(overscan_rows);
 
     // A column of `u32::MAX` is not a safe "clamp to end of line" sentinel:
     // `clip_point` clips the *row* first and the column arithmetic further
@@ -821,61 +845,68 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let enabled = is_markdown_editor(editor, cx)
         && VisualMdSettings::try_get(cx).is_some_and(|settings| settings.enabled);
 
-    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
-        addon.active = enabled;
+    let was_active = editor
+        .addon_mut::<VisualMdAddon>()
+        .map(|addon| std::mem::replace(&mut addon.active, enabled))
+        .unwrap_or(false);
+
+    // Every full-mode editor gets this addon (see `register_editor`), and
+    // `refresh` runs on every scroll tick and cursor move, so a buffer that
+    // isn't Markdown must cost nothing here rather than re-applying empty
+    // highlights and copying the whole buffer each time.
+    if !enabled && !was_active {
+        return;
     }
 
-    // Line numbers don't fit the live-preview reading experience (Obsidian's
-    // own live preview doesn't show them either), so hide them for as long
-    // as visual_md is actually decorating this buffer, restoring whatever the
-    // user's real global preference is otherwise so this doesn't fight a
-    // manual toggle once visual_md steps out of the way (e.g. the setting
-    // gets disabled, or the buffer's language changes away from Markdown).
-    editor.set_show_line_numbers(
-        if enabled {
-            false
-        } else {
-            editor::EditorSettings::get_global(cx).gutter.line_numbers
-        },
-        cx,
-    );
-
-    // Zed's gutter shows a fold-toggle chevron on hover for any row it
-    // thinks is "foldable" — including via a generic indentation heuristic
-    // (`EditorSnapshot::starts_indent`) that fires independently of any
-    // crease visual_md itself created, and does so for ordinary indented
-    // Markdown content (nested list items, etc.) with nothing real to fold.
-    // `hide_gutter_toggle` on visual_md's own creases (see `apply_folds`)
-    // only suppresses the toggle for rows *those* creases cover; this
-    // suppresses the indentation-heuristic fallback too, for the same
-    // reason line numbers are hidden above — "foldable" isn't a meaningful
-    // concept in a live-preview reading view.
-    editor.set_show_fold_indicators(
-        if enabled {
-            false
-        } else {
-            editor::EditorSettings::get_global(cx).gutter.folds
-        },
-        cx,
-    );
+    if enabled != was_active {
+        // Line numbers don't fit the live-preview reading experience, and
+        // "foldable" isn't meaningful there either (including the
+        // indentation-heuristic fold affordance, which fires independently
+        // of any crease visual_md made), so both are hidden only while
+        // visual_md is decorating this buffer and restored to the user's
+        // global preference otherwise.
+        let gutter = editor::EditorSettings::get_global(cx).gutter;
+        editor.set_show_line_numbers(if enabled { false } else { gutter.line_numbers }, cx);
+        editor.set_show_fold_indicators(if enabled { false } else { gutter.folds }, cx);
+    }
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
-    let computed = if enabled {
-        let text = snapshot.text();
-        let display_snapshot = editor.display_snapshot(cx);
-        let selections = editor
-            .selections
-            .all::<MultiBufferOffset>(&display_snapshot)
-            .into_iter()
-            .map(|selection| {
-                let range = selection.range();
-                range.start.0..range.end.0
-            })
-            .collect::<Vec<_>>();
-        let visible_range = visible_byte_range(editor, &display_snapshot, text.len(), cx);
-        plan::plan_viewport(&text, &selections, visible_range)
-    } else {
-        Plan::default()
+    let document = enabled.then(|| parsed_document(editor, &snapshot));
+    let text: Arc<str> = document
+        .as_ref()
+        .map_or_else(|| Arc::from(""), |(text, _)| text.clone());
+    let computed = match &document {
+        Some((text, Some(block_tree))) => {
+            let display_snapshot = editor.display_snapshot(cx);
+            let selections = editor
+                .selections
+                .all::<MultiBufferOffset>(&display_snapshot)
+                .into_iter()
+                .map(|selection| {
+                    let range = selection.range();
+                    range.start.0..range.end.0
+                })
+                .collect::<Vec<_>>();
+            let visible_range = visible_byte_range(
+                editor,
+                &display_snapshot,
+                text.len(),
+                VIEWPORT_OVERSCAN_ROWS,
+                cx,
+            );
+            let plan =
+                plan::plan_viewport_with_tree(text, block_tree, &selections, visible_range.clone());
+            if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+                addon.planned = Some((snapshot.edit_count(), visible_range));
+            }
+            plan
+        }
+        _ => {
+            if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+                addon.planned = None;
+            }
+            Plan::default()
+        }
     };
 
     let editor_handle = cx.weak_entity();
@@ -965,9 +996,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 )
             }),
     );
-    folds.extend(table_alignment_spacer_folds(
-        &computed, &snapshot, window, cx,
-    ));
+    folds.extend(table_alignment_spacer_folds(&computed, &text, window, cx));
 
     apply_folds(editor, &snapshot, folds, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, enabled, cx);
@@ -980,7 +1009,83 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .filter_map(|(_, name)| name.clone())
         .collect();
     ensure_code_languages_loaded(editor, window, cx, code_languages);
-    apply_code_syntax_highlights(editor, &snapshot, &computed, cx);
+    apply_code_syntax_highlights(editor, &snapshot, &text, &computed, cx);
+}
+
+/// Returns the buffer text and its block parse for `snapshot`, reusing the
+/// previous refresh's when no edit has happened since. The tree is `None` only
+/// if tree-sitter failed to parse.
+fn parsed_document(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+) -> (Arc<str>, Option<tree_sitter::Tree>) {
+    let edit_count = snapshot.edit_count();
+    if let Some(cached) = editor
+        .addon::<VisualMdAddon>()
+        .and_then(|addon| addon.parsed.as_ref())
+        .filter(|cached| cached.edit_count == edit_count)
+    {
+        return (cached.text.clone(), Some(cached.block_tree.clone()));
+    }
+
+    let text: Arc<str> = Arc::from(snapshot.text());
+    let block_tree = plan::parse_blocks(&text);
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+        addon.parsed = block_tree.clone().map(|block_tree| ParsedDocument {
+            edit_count,
+            text: text.clone(),
+            block_tree,
+        });
+    }
+    (text, block_tree)
+}
+
+/// Handles a scroll: re-plans only once the visible rows reach outside the
+/// range the last refresh planned (which already includes an overscan margin),
+/// since nothing a scroll alone changes is inside that range.
+fn refresh_after_scroll(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let still_covered = editor
+        .addon::<VisualMdAddon>()
+        .filter(|addon| addon.active)
+        .and_then(|addon| addon.planned.clone())
+        .is_some_and(|(edit_count, planned_range)| {
+            if edit_count != snapshot.edit_count() {
+                return false;
+            }
+            let display_snapshot = editor.display_snapshot(cx);
+            let visible_range =
+                visible_byte_range(editor, &display_snapshot, snapshot.len().0, 0, cx);
+            planned_range.start <= visible_range.start && visible_range.end <= planned_range.end
+        });
+    if !still_covered {
+        refresh(editor, window, cx);
+    }
+}
+
+/// Applies a `VisualMd` highlight, except that clearing a key that is already
+/// empty is skipped: every refresh sets all of them, and each call would
+/// otherwise rebuild the display map's highlights and notify for nothing.
+fn set_visual_md_highlight(
+    editor: &mut Editor,
+    key: usize,
+    ranges: Vec<Range<Anchor>>,
+    style: HighlightStyle,
+    cx: &mut Context<Editor>,
+) {
+    let is_empty = ranges.is_empty();
+    let was_nonempty = editor.addon_mut::<VisualMdAddon>().is_some_and(|addon| {
+        if is_empty {
+            addon.nonempty_highlight_keys.remove(&key)
+        } else {
+            addon.nonempty_highlight_keys.insert(key);
+            true
+        }
+    });
+    if is_empty && !was_nonempty {
+        return;
+    }
+    editor.highlight_text_key(HighlightKey::VisualMd(key), ranges, style, false, cx);
 }
 
 fn to_anchor_range(snapshot: &MultiBufferSnapshot, range: &Range<usize>) -> Range<Anchor> {
@@ -1583,7 +1688,7 @@ fn apply_table_dividers(
 /// doc comment.
 fn table_alignment_spacer_folds(
     computed: &Plan,
-    snapshot: &MultiBufferSnapshot,
+    text: &str,
     window: &Window,
     cx: &mut Context<Editor>,
 ) -> Vec<(Range<usize>, String, editor::FoldPlaceholder)> {
@@ -1591,7 +1696,6 @@ fn table_alignment_spacer_folds(
         return Vec::new();
     }
 
-    let text = snapshot.text();
     let (font, font_size) = {
         let settings = theme_settings::ThemeSettings::get_global(cx);
         (settings.ui_font.clone(), settings.ui_font_size(cx))
@@ -1885,6 +1989,7 @@ fn ensure_code_languages_loaded(
 fn apply_code_syntax_highlights(
     editor: &mut Editor,
     snapshot: &MultiBufferSnapshot,
+    text: &str,
     computed: &Plan,
     cx: &mut Context<Editor>,
 ) {
@@ -1892,8 +1997,6 @@ fn apply_code_syntax_highlights(
         use theme::ActiveTheme;
         cx.theme().syntax().clone()
     };
-    let text = snapshot.text();
-
     let mut ranges_by_id: HashMap<usize, Vec<Range<usize>>> = HashMap::new();
     for (content_range, language_name) in &computed.code_fence_content {
         let Some(name) = language_name else { continue };
@@ -1974,11 +2077,11 @@ fn apply_style_highlights(
             .collect()
     };
 
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_DIMMED_MARKER),
+    set_visual_md_highlight(
+        editor,
+        KEY_DIMMED_MARKER,
         anchor_ranges(&computed.dimmed_markers),
         dim_marker_style(),
-        false,
         cx,
     );
 
@@ -2003,34 +2106,34 @@ fn apply_style_highlights(
             .filter(|(_, style)| *style == SpanStyle::Heading(level))
             .map(|(range, _)| range.clone())
             .collect();
-        editor.highlight_text_key(
-            HighlightKey::VisualMd(heading_key(level)),
+        set_visual_md_highlight(
+            editor,
+            heading_key(level),
             anchor_ranges(&ranges),
             heading_style(level, normal_color),
-            false,
             cx,
         );
     }
 
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_BOLD),
+    set_visual_md_highlight(
+        editor,
+        KEY_BOLD,
         anchor_ranges(&spans_of(SpanStyle::Bold)),
         bold_style(normal_color),
-        false,
         cx,
     );
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_ITALIC),
+    set_visual_md_highlight(
+        editor,
+        KEY_ITALIC,
         anchor_ranges(&spans_of(SpanStyle::Italic)),
         italic_style(normal_color),
-        false,
         cx,
     );
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_STRIKETHROUGH),
+    set_visual_md_highlight(
+        editor,
+        KEY_STRIKETHROUGH,
         anchor_ranges(&spans_of(SpanStyle::Strikethrough)),
         strikethrough_style(normal_color),
-        false,
         cx,
     );
     // Inline code, ==highlight== marks, and callout bodies are deliberately
@@ -2055,11 +2158,11 @@ fn apply_style_highlights(
         use theme::ActiveTheme;
         cx.theme().colors().link_text_hover
     };
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_LINK),
+    set_visual_md_highlight(
+        editor,
+        KEY_LINK,
         anchor_ranges(&spans_of(SpanStyle::Link)),
         link_style(link_color),
-        false,
         cx,
     );
 
@@ -2077,14 +2180,14 @@ fn apply_style_highlights(
         CalloutKind::Other,
     ] {
         let (_, _, background) = callout_look(kind, cx);
-        editor.highlight_text_key(
-            HighlightKey::VisualMd(callout_key(kind)),
+        set_visual_md_highlight(
+            editor,
+            callout_key(kind),
             anchor_ranges(&spans_of(SpanStyle::Callout(kind))),
             HighlightStyle {
                 background_color: Some(background),
                 ..HighlightStyle::default()
             },
-            false,
             cx,
         );
     }
@@ -2118,14 +2221,14 @@ fn apply_style_highlights(
     } else {
         Vec::new()
     };
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_PROSE_FONT),
+    set_visual_md_highlight(
+        editor,
+        KEY_PROSE_FONT,
         prose_ranges,
         HighlightStyle {
             font_family: Some(FontFamilyName::new(&ui_font_family)),
             ..Default::default()
         },
-        false,
         cx,
     );
     let mut code_font_ranges = spans_of(SpanStyle::InlineCode);
@@ -2135,14 +2238,14 @@ fn apply_style_highlights(
             .iter()
             .map(|(range, _)| range.clone()),
     );
-    editor.highlight_text_key(
-        HighlightKey::VisualMd(KEY_CODE_FONT),
+    set_visual_md_highlight(
+        editor,
+        KEY_CODE_FONT,
         anchor_ranges(&code_font_ranges),
         HighlightStyle {
             font_family: Some(FontFamilyName::new(&buffer_font_family)),
             ..Default::default()
         },
-        false,
         cx,
     );
 }
@@ -2844,6 +2947,61 @@ mod integration_tests {
                     .iter()
                     .any(|(range, _, _)| range.start == bottom_marker_start),
                 "the on-screen bottom heading's marker should have been folded: {folded:?}"
+            );
+        });
+    }
+
+    /// A scroll alone (no `refresh` call from the test) must still decorate
+    /// newly visible content, and a scroll that stays inside the planned range
+    /// must not replace the plan.
+    #[gpui::test]
+    async fn scroll_events_replan_only_when_leaving_the_planned_range(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+
+        let mut text = String::from("# Top Heading\n");
+        for i in 0..600 {
+            text.push_str(&format!("filler line number {i}\n"));
+        }
+        let bottom_heading_row = text.matches('\n').count() as u32;
+        text.push_str("# Bottom Heading\n\nˇfiller line after bottom heading\n");
+
+        cx.set_state(&text);
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        // The scroll event's handler runs once `update_editor`'s closure has
+        // returned, so each scroll and the read of its effect are separate calls.
+        let planned = |cx: &mut EditorTestContext| {
+            cx.update_editor(|editor, _window, _cx| {
+                editor.addon::<VisualMdAddon>().unwrap().planned.clone()
+            })
+        };
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(gpui::Point::new(0.0, 1.0), window, cx);
+        });
+        let planned_before = planned(&mut cx);
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(gpui::Point::new(0.0, 2.0), window, cx);
+        });
+        assert!(planned_before.is_some());
+        assert_eq!(planned_before, planned(&mut cx));
+
+        let bottom_marker_start = text.rfind("# Bottom Heading").unwrap();
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(
+                gpui::Point::new(0.0, bottom_heading_row as f64),
+                window,
+                cx,
+            );
+        });
+        cx.update_editor(|editor, _window, _cx| {
+            let folded = &editor.addon::<VisualMdAddon>().unwrap().folded_markers;
+            assert!(
+                folded
+                    .iter()
+                    .any(|(range, _, _)| range.start == bottom_marker_start),
+                "scrolling alone should decorate the newly visible heading: {folded:?}"
             );
         });
     }

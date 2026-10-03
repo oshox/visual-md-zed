@@ -12,7 +12,7 @@
 
 use std::ops::Range;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 /// A persistent style to apply to a content span (never to its markers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,14 +293,30 @@ pub fn plan(text: &str, selections: &[Range<usize>]) -> Plan {
 /// notion of "visible" is ever stale relative to where the cursor actually
 /// is; cheap to guard against unconditionally).
 pub fn plan_viewport(text: &str, selections: &[Range<usize>], visible_range: Range<usize>) -> Plan {
-    let mut block_parser = Parser::new();
-    let Ok(()) = block_parser.set_language(&tree_sitter_md::LANGUAGE.into()) else {
+    let Some(block_tree) = parse_blocks(text) else {
         return Plan::default();
     };
-    let Some(block_tree) = block_parser.parse(text, None) else {
-        return Plan::default();
-    };
+    plan_viewport_with_tree(text, &block_tree, selections, visible_range)
+}
 
+/// Parses `text`'s Markdown block structure. Split out of [`plan_viewport`] so
+/// a caller planning repeatedly against unchanged text (scrolling, cursor
+/// moves) can parse once and reuse the tree.
+pub fn parse_blocks(text: &str) -> Option<Tree> {
+    let mut block_parser = Parser::new();
+    block_parser
+        .set_language(&tree_sitter_md::LANGUAGE.into())
+        .ok()?;
+    block_parser.parse(text, None)
+}
+
+/// [`plan_viewport`] against an already-parsed `block_tree` of `text`.
+pub fn plan_viewport_with_tree(
+    text: &str,
+    block_tree: &Tree,
+    selections: &[Range<usize>],
+    visible_range: Range<usize>,
+) -> Plan {
     let mut inline_parser = Parser::new();
     let Ok(()) = inline_parser.set_language(&tree_sitter_md::INLINE_LANGUAGE.into()) else {
         return Plan::default();

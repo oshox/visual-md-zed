@@ -3257,6 +3257,7 @@ impl EditorElement {
                         point_diagnostics: Vec::new(),
                         font_size,
                         row_height: style.text.line_height_in_pixels(window.rem_size()),
+                        row_top: Pixels::ZERO,
                     }
                 })
                 .collect()
@@ -7420,6 +7421,10 @@ pub(crate) struct LineWithInvisibles {
     /// `HighlightStyle::font_size_scale` (e.g. a Zed MD heading).
     /// `row_y_offset` sums these to position every row correctly.
     pub(crate) row_height: Pixels,
+    /// Sum of the `row_height`s of every earlier row in the same
+    /// `layout_lines` batch, set by `assign_row_tops`. Lets `row_y_offset` and
+    /// `row_for_y` avoid re-summing the batch on every call.
+    pub(crate) row_top: Pixels,
 }
 
 enum LineFragment {
@@ -7640,6 +7645,7 @@ impl LineWithInvisibles {
                             font_size: current_row_font_size,
                             row_height: uniform_line_height
                                 * (f32::from(current_row_font_size) / f32::from(font_size)),
+                            row_top: Pixels::ZERO,
                         });
 
                         line.clear();
@@ -7845,19 +7851,15 @@ impl LineWithInvisibles {
     ) -> Pixels {
         let index = row.0 as i64 - start_row.0 as i64;
 
-        let cumulative_height = |rows: i64| -> Pixels {
-            if rows <= 0 {
-                return line_height * rows as f32;
-            }
-            let in_range_count = (rows as usize).min(line_layouts.len());
-            let mut sum = Pixels::ZERO;
-            for line in &line_layouts[..in_range_count] {
-                sum += line.row_height;
-            }
-            if rows as usize > line_layouts.len() {
-                sum += line_height * (rows as usize - line_layouts.len()) as f32;
-            }
-            sum
+        let row_top = if index <= 0 {
+            line_height * index as f32
+        } else if let Some(line) = line_layouts.get(index as usize) {
+            line.row_top
+        } else {
+            let (end, count) = line_layouts.last().map_or((Pixels::ZERO, 0), |last| {
+                (last.row_top + last.row_height, line_layouts.len())
+            });
+            end + line_height * (index as usize - count) as f32
         };
 
         let first_row_height = line_layouts
@@ -7865,7 +7867,18 @@ impl LineWithInvisibles {
             .map_or(line_height, |line| line.row_height);
         let fractional_rows = scroll_position.y - start_row.as_f64();
 
-        cumulative_height(index) - first_row_height * fractional_rows as f32
+        row_top - first_row_height * fractional_rows as f32
+    }
+
+    /// Fills in each line's `row_top` as the running sum of the preceding
+    /// rows' heights. Must be called on the full result of `layout_lines`
+    /// before it is passed to `row_y_offset`/`row_for_y`.
+    pub(crate) fn assign_row_tops(lines: &mut [LineWithInvisibles]) {
+        let mut top = Pixels::ZERO;
+        for line in lines {
+            line.row_top = top;
+            top += line.row_height;
+        }
     }
 
     /// The inverse of [`Self::row_y_offset`]: given a Y position relative to
@@ -7892,17 +7905,16 @@ impl LineWithInvisibles {
             return DisplayRow((start_row.0 as i64 - rows_back - 1).max(0) as u32);
         }
 
-        let mut acc = 0.0f32;
-        for (ix, line) in line_layouts.iter().enumerate() {
-            let next = acc + f32::from(line.row_height);
-            if target < next {
-                return DisplayRow(start_row.0 + ix as u32);
-            }
-            acc = next;
+        let index = line_layouts
+            .partition_point(|line| f32::from(line.row_top + line.row_height) <= target);
+        if index < line_layouts.len() {
+            return DisplayRow(start_row.0 + index as u32);
         }
 
-        let remaining = target - acc;
-        let extra_rows = (remaining / line_height_f).floor().max(0.0) as u32;
+        let end = line_layouts
+            .last()
+            .map_or(0.0, |last| f32::from(last.row_top + last.row_height));
+        let extra_rows = ((target - end) / line_height_f).floor().max(0.0) as u32;
         DisplayRow(start_row.0 + line_layouts.len() as u32 + extra_rows)
     }
 
@@ -9216,6 +9228,7 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    LineWithInvisibles::assign_row_tops(&mut line_layouts);
 
                     // Laid out after `line_layouts` rather than alongside the
                     // other gutter elements: it needs each row's actual height
@@ -13817,6 +13830,7 @@ mod tests {
             width: px(3.25),
             font_size: px(13.),
             row_height: px(26.),
+            row_top: Pixels::ZERO,
         };
         let underline = point_diagnostic_test_style(WARNING);
         line.add_point_diagnostic(PointDiagnostic {
@@ -14089,13 +14103,23 @@ mod tests {
             width: Pixels::ZERO,
             font_size: px(16.),
             row_height: px(row_height),
+            row_top: Pixels::ZERO,
         }
+    }
+
+    fn lines_with_row_heights(row_heights: &[f32]) -> Vec<LineWithInvisibles> {
+        let mut lines: Vec<LineWithInvisibles> = row_heights
+            .iter()
+            .map(|&row_height| line_with_row_height(row_height))
+            .collect();
+        LineWithInvisibles::assign_row_tops(&mut lines);
+        lines
     }
 
     #[test]
     fn row_y_offset_matches_the_uniform_formula_when_every_row_is_default_height() {
         let line_height = px(20.);
-        let lines: Vec<LineWithInvisibles> = (0..5).map(|_| line_with_row_height(20.)).collect();
+        let lines = lines_with_row_heights(&[20.; 5]);
         let start_row = DisplayRow(10);
         let scroll_position = gpui::Point::new(0.0, 10.3);
         for row_offset in 0..5u32 {
@@ -14119,11 +14143,7 @@ mod tests {
     fn row_y_offset_shifts_every_row_below_a_taller_row_down() {
         let line_height = px(20.);
         // Row 0 is a heading-sized row (1.8x); the rest are normal height.
-        let lines = vec![
-            line_with_row_height(36.),
-            line_with_row_height(20.),
-            line_with_row_height(20.),
-        ];
+        let lines = lines_with_row_heights(&[36., 20., 20.]);
         let start_row = DisplayRow(0);
         let scroll_position = gpui::Point::new(0.0, 0.0);
         let y = |row| {
@@ -14152,11 +14172,7 @@ mod tests {
     #[test]
     fn row_for_y_is_the_inverse_of_row_y_offset_with_a_resized_row() {
         let line_height = px(20.);
-        let lines = vec![
-            line_with_row_height(36.),
-            line_with_row_height(20.),
-            line_with_row_height(20.),
-        ];
+        let lines = lines_with_row_heights(&[36., 20., 20.]);
         let start_row = DisplayRow(5);
         let scroll_position = gpui::Point::new(0.0, 5.0);
 
@@ -14188,7 +14204,7 @@ mod tests {
     #[test]
     fn row_for_y_handles_fractional_scroll_through_a_resized_first_row() {
         let line_height = px(20.);
-        let lines = vec![line_with_row_height(36.), line_with_row_height(20.)];
+        let lines = lines_with_row_heights(&[36., 20.]);
         let start_row = DisplayRow(0);
         // Scrolled halfway through the tall first row (18px of its 36px).
         let scroll_position = gpui::Point::new(0.0, 0.5);
