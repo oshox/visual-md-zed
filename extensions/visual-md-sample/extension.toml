@@ -1,0 +1,14 @@
+id = "visual-md-sample"
+name = "Zed MD Sample"
+description = "A sample for Zed MD's live preview: fenced code block renderers and an editor command."
+version = "0.1.0"
+schema_version = 1
+authors = ["Zed MD contributors"]
+repository = "https://github.com/oshox/visual-md-zed"
+
+[visual_md]
+fence_renderers = ["sample-flow", "sample-table", "sample-styled"]
+
+[visual_md.commands.uppercase]
+title = "Uppercase Selection"
+description = "Uppercases the selected text, or the current line when nothing is selected."

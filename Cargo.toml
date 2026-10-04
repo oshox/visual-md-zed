@@ -258,6 +258,7 @@ members = [
     "extensions/html",
     "extensions/proto",
     "extensions/test-extension",
+    "extensions/visual-md-sample",
 
     #
     # Tooling

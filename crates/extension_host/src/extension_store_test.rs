@@ -18,7 +18,8 @@ use extension::{
     DebugAdapterBinary, DebugRequest, DebugScenario, DebugTaskDefinition, Extension,
     ExtensionHostProxy, ExtensionVisualMdProxy, KeyValueStoreDelegate, LibManifestEntry,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput,
-    StartDebuggingRequestArgumentsRequest, Symbol, WorktreeDelegate,
+    StartDebuggingRequestArgumentsRequest, Symbol, VisualMdAppearance, VisualMdCommandContext,
+    VisualMdFenceOutput, VisualMdFenceRequest, WorktreeDelegate,
 };
 use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use futures::{AsyncReadExt, FutureExt, StreamExt, io::BufReader};
@@ -889,6 +890,149 @@ async fn test_visual_md_extensions_are_registered_and_unregistered_with_the_stor
             "unregister notes".to_string(),
         ]
     );
+}
+
+/// Runs the sample extension's real wasm through the host. It needs the
+/// extension built first (`script/visual-md-wasm build-sample`), and passes
+/// without checking anything when it has not been.
+#[gpui::test]
+async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let extension_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions/visual-md-sample");
+    let Ok(wasm_bytes) = std::fs::read(extension_dir.join("extension.wasm")) else {
+        eprintln!(
+            "skipping test_visual_md_sample_extension: run `script/visual-md-wasm build-sample` first"
+        );
+        return;
+    };
+
+    let fs: Arc<dyn Fs> = RealFs::new(None, cx.executor());
+    let extension_dir = extension_dir
+        .canonicalize()
+        .expect("the sample extension directory exists");
+    let mut manifest = ExtensionManifest::load(fs.clone(), &extension_dir)
+        .await
+        .expect("the sample's manifest loads");
+    manifest.lib = LibManifestEntry {
+        kind: Some(extension::ExtensionLibraryKind::Rust),
+        version: Some(semver::Version::new(0, 1, 0)),
+    };
+    assert_eq!(
+        manifest
+            .visual_md
+            .as_ref()
+            .map(|visual_md| visual_md.fence_renderers.len()),
+        Some(3)
+    );
+    let manifest = Arc::new(manifest);
+
+    let work_dir = TempTree::new(json!({}));
+    let wasm_host = cx.update(|cx| {
+        crate::wasm_host::WasmHost::new(
+            fs,
+            FakeHttpClient::with_200_response(),
+            NodeRuntime::unavailable(),
+            Arc::new(ExtensionHostProxy::new()),
+            work_dir.path().to_path_buf(),
+            cx,
+        )
+    });
+    let extension = wasm_host
+        .load_extension(wasm_bytes, &manifest, &cx.to_async())
+        .await
+        .expect("the sample loads");
+    assert_eq!(
+        extension.zed_api_version,
+        semver::Version::new(0, 9, 0),
+        "the sample is built against the fork's API"
+    );
+
+    let render = |renderer: &str, content: &str| {
+        extension.visual_md_render_fence(
+            renderer.to_string(),
+            VisualMdFenceRequest {
+                language: renderer.to_string(),
+                info: renderer.to_string(),
+                content: content.to_string(),
+                appearance: VisualMdAppearance::Dark,
+                path: None,
+            },
+        )
+    };
+
+    let flow = render("sample-flow", "parse -> check -> emit")
+        .await
+        .expect("the flow renders");
+    let VisualMdFenceOutput::Svg(svg) = flow.output else {
+        panic!("expected an SVG, got {:?}", flow.output);
+    };
+    assert_eq!(svg.matches("<rect").count(), 3);
+    assert_eq!(flow.height_hint, Some(3));
+
+    let table = render("sample-table", "Name, Role\nAda, Dev")
+        .await
+        .expect("the table renders");
+    assert_eq!(
+        table.output,
+        VisualMdFenceOutput::Markdown(
+            "| Name | Role |\n| --- | --- |\n| Ada | Dev |\n".to_string()
+        )
+    );
+
+    let styled = render("sample-styled", "build 42 FAILED")
+        .await
+        .expect("the styled text renders");
+    let VisualMdFenceOutput::StyledText(styled) = styled.output else {
+        panic!("expected styled text, got {:?}", styled.output);
+    };
+    assert_eq!(styled.text, "build 42 FAILED");
+    assert_eq!(
+        styled
+            .spans
+            .iter()
+            .map(|span| span.range.clone())
+            .collect::<Vec<_>>(),
+        vec![6..8, 9..15]
+    );
+
+    let error = render("no-such-renderer", "")
+        .await
+        .expect_err("an unknown renderer is an error");
+    assert!(
+        format!("{error:#}").contains("does not render `no-such-renderer`"),
+        "the guest's message reaches the host: {error:#}"
+    );
+
+    let uppercased = extension
+        .visual_md_run_command(
+            "uppercase".to_string(),
+            VisualMdCommandContext {
+                text: "say hello now".to_string(),
+                selections: vec![4..9],
+                path: None,
+            },
+        )
+        .await
+        .expect("the command runs");
+    assert_eq!(uppercased.edits.len(), 1);
+    assert_eq!(uppercased.edits[0].range, 4..9);
+    assert_eq!(uppercased.edits[0].new_text, "HELLO");
+    assert_eq!(uppercased.message.as_deref(), Some("Uppercased 1 place"));
+
+    extension
+        .visual_md_run_command(
+            "no-such-command".to_string(),
+            VisualMdCommandContext {
+                text: String::new(),
+                selections: Vec::new(),
+                path: None,
+            },
+        )
+        .await
+        .expect_err("an unknown command is an error");
 }
 
 #[gpui::test]
