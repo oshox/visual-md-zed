@@ -234,6 +234,7 @@
 //! single keystroke or cursor move touches only what changed.
 
 pub mod extensions;
+mod fence_render;
 mod format_toggle;
 mod list_continuation;
 mod plan;
@@ -285,6 +286,7 @@ actions!(
 
 pub fn init(cx: &mut App) {
     extensions::init(cx);
+    fence_render::init(cx);
     cx.observe_new(register_editor).detach();
 }
 
@@ -322,6 +324,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         folded_markers: Vec::new(),
         hr_blocks: Vec::new(),
         image_blocks: Vec::new(),
+        rendered_fence_blocks: Vec::new(),
         code_fence_borders: Vec::new(),
         code_languages: HashMap::new(),
         pending_language_tasks: HashMap::new(),
@@ -611,6 +614,9 @@ struct VisualMdAddon {
     /// source without moving the range's start, and the block must be rebuilt
     /// to show the new image.
     image_blocks: Vec<(Range<usize>, String, CustomBlockId)>,
+    /// Blocks standing in for fenced code blocks that an extension renders
+    /// (see `fence_render::apply_rendered_fences`).
+    rendered_fence_blocks: Vec<fence_render::RenderedFenceBlock>,
     /// Fenced-code-block fence-line border/chip blocks currently inserted
     /// (see `apply_code_fence_borders`). Diffed on `(range, language)`
     /// together, not range alone, the same reasoning `folded_markers`'
@@ -1023,8 +1029,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 VIEWPORT_OVERSCAN_ROWS,
                 cx,
             );
-            let plan =
-                plan::plan_viewport_with_tree(text, block_tree, &selections, visible_range.clone());
+            let plan = plan::plan_viewport_with_extensions(
+                text,
+                block_tree,
+                &selections,
+                visible_range.clone(),
+                &plan_extensions(cx),
+            );
             if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
                 addon.planned = Some((snapshot.edit_count(), visible_range));
             }
@@ -1146,6 +1157,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_images(editor, &snapshot, &computed, cx);
+    fence_render::apply_rendered_fences(editor, &snapshot, &text, &computed, cx);
     apply_table_dividers(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_code_fence_borders(editor, &snapshot, &computed, style_handle, cx);
     let code_languages: HashSet<String> = computed
@@ -1158,6 +1170,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
     if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
         addon.last_applied = Some((edit_count, computed));
+    }
+}
+
+/// What extensions currently claim, as far as the planner needs to know.
+fn plan_extensions(cx: &App) -> plan::PlanExtensions {
+    plan::PlanExtensions {
+        rendered_fence_languages: cx
+            .try_global::<extensions::VisualMdExtensions>()
+            .map(|registry| registry.fence_languages().into_iter().collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -2736,7 +2758,7 @@ mod integration_tests {
     use editor::test::editor_test_context::EditorTestContext;
     use gpui::{FontStyle, StrikethroughStyle, TestAppContext, rgb};
 
-    fn init_test(cx: &mut TestAppContext) {
+    pub(crate) fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
             let store = settings::SettingsStore::test(cx);
@@ -2757,7 +2779,7 @@ mod integration_tests {
         });
     }
 
-    fn markdown_language() -> std::sync::Arc<language::Language> {
+    pub(crate) fn markdown_language() -> std::sync::Arc<language::Language> {
         std::sync::Arc::new(language::Language::new(
             language::LanguageConfig {
                 name: "Markdown".into(),

@@ -395,48 +395,74 @@ impl VisualMdExtensions {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
-    use extension::{VisualMdAppearance, VisualMdFenceOutput};
-    use gpui::{BackgroundExecutor, TestAppContext};
+    use extension::VisualMdFenceOutput;
+    use gpui::BackgroundExecutor;
 
     use super::*;
 
     #[derive(Clone)]
-    enum Behavior {
+    pub(crate) enum Behavior {
         Succeed,
         Fail,
         TakeLongerThan(Duration),
     }
 
-    struct FakeHooks {
+    /// Stands in for an extension's wasm: answers every call the way it was told
+    /// to, and remembers what it was asked.
+    pub(crate) struct FakeHooks {
         executor: BackgroundExecutor,
         behavior: Mutex<Behavior>,
+        fence_output: Mutex<VisualMdFenceOutput>,
+        command_result: Mutex<VisualMdCommandResult>,
         calls: AtomicUsize,
+        fence_requests: Mutex<Vec<VisualMdFenceRequest>>,
     }
 
     impl FakeHooks {
-        fn new(executor: &BackgroundExecutor, behavior: Behavior) -> Arc<Self> {
+        pub(crate) fn new(executor: &BackgroundExecutor, behavior: Behavior) -> Arc<Self> {
             Arc::new(Self {
                 executor: executor.clone(),
                 behavior: Mutex::new(behavior),
+                fence_output: Mutex::new(VisualMdFenceOutput::Markdown("rendered".into())),
+                command_result: Mutex::new(VisualMdCommandResult::default()),
                 calls: AtomicUsize::new(0),
+                fence_requests: Mutex::new(Vec::new()),
             })
         }
 
-        fn set_behavior(&self, behavior: Behavior) {
-            *self.behavior.lock().unwrap() = behavior;
+        pub(crate) fn set_behavior(&self, behavior: Behavior) {
+            *self.behavior.lock().expect("the test lock is not poisoned") = behavior;
         }
 
-        fn calls(&self) -> usize {
+        pub(crate) fn set_fence_output(&self, output: VisualMdFenceOutput) {
+            *self
+                .fence_output
+                .lock()
+                .expect("the test lock is not poisoned") = output;
+        }
+
+        pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn fence_requests(&self) -> Vec<VisualMdFenceRequest> {
+            self.fence_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
         }
 
         fn respond<T: Send + 'static>(&self, value: T) -> BoxFuture<'static, Result<T>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let behavior = self.behavior.lock().unwrap().clone();
+            let behavior = self
+                .behavior
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone();
             let executor = self.executor.clone();
             async move {
                 match behavior {
@@ -456,10 +482,19 @@ mod tests {
         fn render_fence(
             &self,
             _renderer: String,
-            _request: VisualMdFenceRequest,
+            request: VisualMdFenceRequest,
         ) -> BoxFuture<'static, Result<VisualMdFenceResult>> {
+            self.fence_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(request);
+            let output = self
+                .fence_output
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone();
             self.respond(VisualMdFenceResult {
-                output: VisualMdFenceOutput::Markdown("rendered".into()),
+                output,
                 height_hint: None,
             })
         }
@@ -469,17 +504,47 @@ mod tests {
             _command: String,
             _context: VisualMdCommandContext,
         ) -> BoxFuture<'static, Result<VisualMdCommandResult>> {
-            self.respond(VisualMdCommandResult::default())
+            let result = self
+                .command_result
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone();
+            self.respond(result)
         }
     }
 
-    fn manifest(id: &str, visual_md: &str) -> ExtensionManifest {
+    pub(crate) fn manifest(id: &str, visual_md: &str) -> ExtensionManifest {
         toml::from_str(&format!(
             "id = \"{id}\"\nname = \"Extension {id}\"\nversion = \"1.0.0\"\nschema_version = 1\n\
             [visual_md]\n{visual_md}"
         ))
         .expect("the test manifest should parse")
     }
+
+    pub(crate) fn register(
+        cx: &mut gpui::TestAppContext,
+        id: &str,
+        visual_md: &str,
+        hooks: Option<Arc<FakeHooks>>,
+    ) {
+        let manifest = manifest(id, visual_md);
+        cx.update(|cx| {
+            VisualMdExtensions::register(
+                &manifest,
+                hooks.map(|hooks| hooks as Arc<dyn VisualMdHooks>),
+                cx,
+            )
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use extension::{VisualMdAppearance, VisualMdFenceOutput};
+    use gpui::TestAppContext;
+
+    use super::test_support::{Behavior, FakeHooks, manifest, register};
+    use super::*;
 
     fn fence_request() -> VisualMdFenceRequest {
         VisualMdFenceRequest {
@@ -493,17 +558,6 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(init);
-    }
-
-    fn register(cx: &mut TestAppContext, id: &str, visual_md: &str, hooks: Option<Arc<FakeHooks>>) {
-        let manifest = manifest(id, visual_md);
-        cx.update(|cx| {
-            VisualMdExtensions::register(
-                &manifest,
-                hooks.map(|hooks| hooks as Arc<dyn VisualMdHooks>),
-                cx,
-            )
-        });
     }
 
     fn render_fence(

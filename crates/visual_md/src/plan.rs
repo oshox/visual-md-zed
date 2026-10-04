@@ -10,6 +10,7 @@
 //! and so the same logic can later be scoped to a viewport without touching
 //! the rendering side at all.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use tree_sitter::{Node, Parser, Tree};
@@ -217,6 +218,27 @@ pub struct Plan {
     /// `horizontal_rules` are: an image needs the editor's real width, which
     /// a fold can't stretch to. See `apply_images` in visual_md.rs.
     pub images: Vec<ImageInfo>,
+    /// Fenced code blocks an extension renders in place of the block, which a
+    /// selection does not touch. Such a block gets neither borders nor
+    /// `code_fence_content`: the extension's output stands in for all of it.
+    pub rendered_fences: Vec<RenderedFence>,
+}
+
+/// A fenced code block that an extension renders, see `Plan::rendered_fences`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedFence {
+    /// From the start of the opening fence to the end of the closing fence,
+    /// without the closing line's newline, so a cursor at the start of the next
+    /// line does not touch it.
+    pub range: Range<usize>,
+    /// The lowercased language tag.
+    pub language: String,
+    /// The info string after the opening fence, trimmed.
+    pub info: String,
+    pub content_range: Range<usize>,
+    /// A hash of the content, so a change to it that leaves the ranges alone
+    /// (an undo, a replace elsewhere) still makes the plan differ.
+    pub content_hash: u64,
 }
 
 /// A standalone image line, see `Plan::images`.
@@ -349,6 +371,32 @@ pub fn plan_viewport_with_tree(
     selections: &[Range<usize>],
     visible_range: Range<usize>,
 ) -> Plan {
+    plan_viewport_with_extensions(
+        text,
+        block_tree,
+        selections,
+        visible_range,
+        &PlanExtensions::default(),
+    )
+}
+
+/// What extensions claim, as far as planning is concerned. Kept as plain data
+/// so this module still knows nothing about extensions or GPUI.
+#[derive(Debug, Clone, Default)]
+pub struct PlanExtensions {
+    /// The lowercased language tags of fenced code blocks that an extension
+    /// renders in place of the block.
+    pub rendered_fence_languages: HashSet<String>,
+}
+
+/// [`plan_viewport_with_tree`], also planning what `extensions` claim.
+pub fn plan_viewport_with_extensions(
+    text: &str,
+    block_tree: &Tree,
+    selections: &[Range<usize>],
+    visible_range: Range<usize>,
+    extensions: &PlanExtensions,
+) -> Plan {
     let mut inline_parser = Parser::new();
     let Ok(()) = inline_parser.set_language(&tree_sitter_md::INLINE_LANGUAGE.into()) else {
         return Plan::default();
@@ -367,6 +415,7 @@ pub fn plan_viewport_with_tree(
         selections,
         &mut inline_parser,
         &visible_range,
+        extensions,
         &mut plan,
     );
 
@@ -524,6 +573,14 @@ fn subtract_ranges(ranges: &[Range<usize>], subtract: &[Range<usize>]) -> Vec<Ra
     result
 }
 
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    hasher.write(text.as_bytes());
+    hasher.finish()
+}
+
 fn touches_selection(range: &Range<usize>, selections: &[Range<usize>]) -> bool {
     selections
         .iter()
@@ -543,6 +600,7 @@ fn walk_block(
     selections: &[Range<usize>],
     inline_parser: &mut Parser,
     visible_range: &Range<usize>,
+    extensions: &PlanExtensions,
     plan: &mut Plan,
 ) {
     if !overlaps(&node.byte_range(), visible_range) {
@@ -558,11 +616,27 @@ fn walk_block(
             return;
         }
         "list" => {
-            plan_list(node, text, selections, inline_parser, visible_range, plan);
+            plan_list(
+                node,
+                text,
+                selections,
+                inline_parser,
+                visible_range,
+                extensions,
+                plan,
+            );
             return;
         }
         "block_quote" => {
-            plan_block_quote(node, text, selections, inline_parser, visible_range, plan);
+            plan_block_quote(
+                node,
+                text,
+                selections,
+                inline_parser,
+                visible_range,
+                extensions,
+                plan,
+            );
             return;
         }
         "thematic_break" => {
@@ -572,18 +646,34 @@ fn walk_block(
             return;
         }
         "fenced_code_block" => {
-            plan_fenced_code_block(node, text, selections, plan);
+            plan_fenced_code_block(node, text, selections, extensions, plan);
             return;
         }
         "pipe_table" => {
-            plan_pipe_table(node, text, selections, inline_parser, visible_range, plan);
+            plan_pipe_table(
+                node,
+                text,
+                selections,
+                inline_parser,
+                visible_range,
+                extensions,
+                plan,
+            );
             return;
         }
         _ => {}
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_block(child, text, selections, inline_parser, visible_range, plan);
+        walk_block(
+            child,
+            text,
+            selections,
+            inline_parser,
+            visible_range,
+            extensions,
+            plan,
+        );
     }
 }
 
@@ -660,6 +750,7 @@ fn plan_list(
     selections: &[Range<usize>],
     inline_parser: &mut Parser,
     visible_range: &Range<usize>,
+    extensions: &PlanExtensions,
     plan: &mut Plan,
 ) {
     let mut ordinal = first_ordinal(node, text);
@@ -713,7 +804,15 @@ fn plan_list(
                 "task_list_marker_unchecked" => {
                     plan.checkboxes.push((child.byte_range(), false));
                 }
-                _ => walk_block(*child, text, selections, inline_parser, visible_range, plan),
+                _ => walk_block(
+                    *child,
+                    text,
+                    selections,
+                    inline_parser,
+                    visible_range,
+                    extensions,
+                    plan,
+                ),
             }
         }
     }
@@ -747,6 +846,7 @@ fn plan_block_quote(
     selections: &[Range<usize>],
     inline_parser: &mut Parser,
     visible_range: &Range<usize>,
+    extensions: &PlanExtensions,
     plan: &mut Plan,
 ) {
     let mut cursor = node.walk();
@@ -771,7 +871,15 @@ fn plan_block_quote(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() != "block_quote_marker" {
-            walk_block(child, text, selections, inline_parser, visible_range, plan);
+            walk_block(
+                child,
+                text,
+                selections,
+                inline_parser,
+                visible_range,
+                extensions,
+                plan,
+            );
         }
     }
 }
@@ -787,7 +895,13 @@ fn plan_block_quote(
 /// if the grammar didn't produce a `code_fence_content` child at all -- an
 /// unterminated fence at end-of-file is the one realistic way that happens,
 /// and it's not worth guessing at where the "content" would have ended.
-fn plan_fenced_code_block(node: Node, text: &str, selections: &[Range<usize>], plan: &mut Plan) {
+fn plan_fenced_code_block(
+    node: Node,
+    text: &str,
+    selections: &[Range<usize>],
+    extensions: &PlanExtensions,
+    plan: &mut Plan,
+) {
     let mut opening_delimiter: Option<Range<usize>> = None;
     let mut closing_delimiter: Option<Range<usize>> = None;
     let mut info_string: Option<Range<usize>> = None;
@@ -825,6 +939,30 @@ fn plan_fenced_code_block(node: Node, text: &str, selections: &[Range<usize>], p
         .and_then(|range| text.get(range.clone()))
         .and_then(|s| s.split_whitespace().next())
         .map(str::to_string);
+
+    // An unclosed fence is left alone: without a closing line there is no
+    // block to stand a rendering in for.
+    if let (Some(closing_delimiter), Some(language)) = (&closing_delimiter, &language)
+        && extensions
+            .rendered_fence_languages
+            .contains(&language.to_lowercase())
+    {
+        let range = opening_delimiter.start..closing_delimiter.end;
+        if !touches_selection(&range, selections) {
+            plan.rendered_fences.push(RenderedFence {
+                range,
+                language: language.to_lowercase(),
+                info: info_string
+                    .as_ref()
+                    .and_then(|range| text.get(range.clone()))
+                    .map(|info| info.trim().to_string())
+                    .unwrap_or_default(),
+                content_hash: hash_text(text.get(content.clone()).unwrap_or_default()),
+                content_range: content,
+            });
+            return;
+        }
+    }
 
     // The opening delimiter (plus info string, if any) already spans the
     // entire first line including its trailing newline -- `info_string`
@@ -871,6 +1009,7 @@ fn plan_pipe_table(
     selections: &[Range<usize>],
     inline_parser: &mut Parser,
     visible_range: &Range<usize>,
+    extensions: &PlanExtensions,
     plan: &mut Plan,
 ) {
     let mut cursor = node.walk();
@@ -911,7 +1050,15 @@ fn plan_pipe_table(
         let mut cell_cursor = row_node.walk();
         for cell in row_node.children(&mut cell_cursor) {
             if cell.kind() == "pipe_table_cell" {
-                walk_block(cell, text, selections, inline_parser, visible_range, plan);
+                walk_block(
+                    cell,
+                    text,
+                    selections,
+                    inline_parser,
+                    visible_range,
+                    extensions,
+                    plan,
+                );
             }
         }
     }
@@ -2362,6 +2509,174 @@ mod tests {
             vec![(0..8, Some("rust".to_string())), (21..25, None)],
             "cursor being in the content shouldn't reveal either fence line"
         );
+    }
+
+    fn plan_with_claimed_languages(
+        text: &str,
+        selections: &[Range<usize>],
+        languages: &[&str],
+    ) -> Plan {
+        let tree = parse_blocks(text).expect("the document should parse");
+        let extensions = PlanExtensions {
+            rendered_fence_languages: languages
+                .iter()
+                .map(|language| language.to_string())
+                .collect(),
+        };
+        plan_viewport_with_extensions(text, &tree, selections, 0..text.len(), &extensions)
+    }
+
+    #[test]
+    fn claimed_fenced_code_block_is_rendered_without_borders_or_content() {
+        let text = "```flow\na -> b\n```\n";
+        let result = plan_with_claimed_languages(text, &[], &["flow"]);
+
+        assert_eq!(
+            result.rendered_fences,
+            vec![RenderedFence {
+                range: 0..18,
+                language: "flow".to_string(),
+                info: "flow".to_string(),
+                content_range: 8..15,
+                content_hash: hash_text("a -> b\n"),
+            }]
+        );
+        assert!(result.code_fence_borders.is_empty());
+        assert!(result.code_fence_content.is_empty());
+    }
+
+    #[test]
+    fn unclaimed_fenced_code_block_is_planned_as_before() {
+        let text = "```rust\nfn main() {}\n```\n";
+        let result = plan_with_claimed_languages(text, &[], &["flow"]);
+
+        assert!(result.rendered_fences.is_empty());
+        assert_eq!(result.code_fence_borders.len(), 2);
+        assert_eq!(result.code_fence_content.len(), 1);
+        assert_eq!(result, plan(text, &[]));
+    }
+
+    #[test]
+    fn claim_matches_the_language_ignoring_case_and_keeps_the_whole_info_string() {
+        let text = "```Flow {width=3}\na -> b\n```\n";
+        let result = plan_with_claimed_languages(text, &[], &["flow"]);
+
+        let fence = &result.rendered_fences[0];
+        assert_eq!(fence.language, "flow");
+        assert_eq!(fence.info, "Flow {width=3}");
+    }
+
+    #[test]
+    fn an_indented_claimed_fence_is_rendered_from_the_start_of_its_line() {
+        let text = "  ```flow\n  a -> b\n  ```\n";
+        let result = plan_with_claimed_languages(text, &[], &["flow"]);
+
+        assert_eq!(result.rendered_fences.len(), 1, "got {result:?}");
+        assert_eq!(result.rendered_fences[0].range, 0..text.len() - 1);
+    }
+
+    #[test]
+    fn a_selection_touching_any_part_of_a_claimed_fence_reveals_it() {
+        let text = "```flow\na -> b\n```\n";
+        // Opening line, content, closing line, and the end of the closing line.
+        for cursor in [0, 3, 10, 15, 16, 18] {
+            let result = plan_with_claimed_languages(text, &[cursor..cursor], &["flow"]);
+            assert!(
+                result.rendered_fences.is_empty(),
+                "cursor at {cursor} should reveal the source"
+            );
+            assert_eq!(
+                result.code_fence_content.len(),
+                1,
+                "a revealed fence is planned like any other, cursor at {cursor}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_on_the_next_line_leaves_a_claimed_fence_rendered() {
+        let text = "```flow\na -> b\n```\nafter\n";
+        let result = plan_with_claimed_languages(text, &[19..19], &["flow"]);
+
+        assert_eq!(result.rendered_fences.len(), 1);
+    }
+
+    #[test]
+    fn an_unclosed_claimed_fence_is_not_rendered() {
+        let text = "```flow\na -> b\n";
+        let result = plan_with_claimed_languages(text, &[], &["flow"]);
+
+        assert!(result.rendered_fences.is_empty(), "got {result:?}");
+    }
+
+    #[test]
+    fn a_fence_with_no_language_is_never_claimed() {
+        let text = "```\na -> b\n```\n";
+        let result = plan_with_claimed_languages(text, &[], &["flow", ""]);
+
+        assert!(result.rendered_fences.is_empty());
+    }
+
+    #[test]
+    fn a_change_to_the_content_changes_the_plan_even_when_the_ranges_do_not_move() {
+        let before = plan_with_claimed_languages("```flow\na -> b\n```\n", &[], &["flow"]);
+        let after = plan_with_claimed_languages("```flow\na -> c\n```\n", &[], &["flow"]);
+
+        assert_eq!(
+            before.rendered_fences[0].range,
+            after.rendered_fences[0].range
+        );
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn claimed_fences_in_random_documents_never_overlap_anything_else_or_panic() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        for _ in 0..200 {
+            let lines = 1 + rng.below(40);
+            let text = random_document(&mut rng, lines);
+            let selections = if rng.below(2) == 0 {
+                vec![]
+            } else {
+                let start = rng.below(text.len() + 1);
+                let end = start + rng.below(text.len() + 1 - start);
+                vec![start..end]
+            };
+            let result = plan_with_claimed_languages(&text, &selections, &["rust"]);
+
+            assert_no_overlaps(&fold_inducing_ranges(&result), &text);
+            let mut previous_end = 0;
+            for fence in &result.rendered_fences {
+                assert!(
+                    fence.range.start >= previous_end && fence.range.end <= text.len(),
+                    "rendered fences overlap or run out of bounds: {:?} for {text:?}",
+                    result.rendered_fences
+                );
+                previous_end = fence.range.end;
+                assert!(text.is_char_boundary(fence.range.start));
+                assert!(text.is_char_boundary(fence.range.end));
+                assert!(
+                    !text[fence.range.clone()].ends_with('\n'),
+                    "a rendered fence must not include the closing line's newline"
+                );
+                for folded in fold_inducing_ranges(&result) {
+                    assert!(
+                        folded.end <= fence.range.start || folded.start >= fence.range.end,
+                        "fold {folded:?} inside rendered fence {:?} for {text:?}",
+                        fence.range
+                    );
+                }
+                for (border, _) in &result.code_fence_borders {
+                    assert!(border.end <= fence.range.start || border.start >= fence.range.end);
+                }
+                for image in &result.images {
+                    assert!(
+                        image.range.end <= fence.range.start
+                            || image.range.start >= fence.range.end
+                    );
+                }
+            }
+        }
     }
 
     #[test]
