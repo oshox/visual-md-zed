@@ -233,6 +233,7 @@
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+pub mod extensions;
 mod format_toggle;
 mod list_continuation;
 mod plan;
@@ -283,6 +284,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    extensions::init(cx);
     cx.observe_new(register_editor).detach();
 }
 
@@ -704,7 +706,7 @@ impl Addon for VisualMdAddon {
 
 struct VisualMdState {
     editor: WeakEntity<Editor>,
-    _subscriptions: [Subscription; 5],
+    _subscriptions: [Subscription; 6],
 }
 
 impl VisualMdState {
@@ -793,6 +795,21 @@ impl VisualMdState {
                         })
                         .log_err();
                 }),
+                // An extension registering or unregistering changes what its
+                // hooks render, which the plan does not capture.
+                cx.observe_global_in::<extensions::VisualMdExtensions>(
+                    window,
+                    |state, window, cx| {
+                        state
+                            .editor
+                            .update(cx, |editor, cx| {
+                                if is_decorating(editor) {
+                                    force_refresh(editor, window, cx)
+                                }
+                            })
+                            .log_err();
+                    },
+                ),
                 // Font settings live in `ThemeSettings`, so a change to them
                 // does not alter the buffer's own language settings.
                 cx.observe_global_in::<settings::SettingsStore>(window, |state, window, cx| {
