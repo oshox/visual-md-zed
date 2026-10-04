@@ -120,6 +120,67 @@ pub struct ExtensionManifest {
     pub debug_locators: BTreeMap<Arc<str>, DebugLocatorManifestEntry>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub language_model_providers: BTreeMap<Arc<str>, LanguageModelProviderManifestEntry>,
+    /// Hooks into Zed MD's Markdown live preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_md: Option<VisualMdManifestEntry>,
+}
+
+/// The `[visual_md]` section of `extension.toml`: what an extension hooks into
+/// in Zed MD's Markdown live preview.
+#[derive(Debug, PartialEq, Eq, Clone, Default, Serialize, Deserialize)]
+pub struct VisualMdManifestEntry {
+    /// The language tags of the fenced code blocks this extension renders, such
+    /// as `mermaid`. Matching ignores case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_renderers: Vec<String>,
+    /// The editor commands this extension provides, keyed by command id. A
+    /// command is run as `<extension id>.<command id>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub commands: BTreeMap<Arc<str>, VisualMdCommandManifestEntry>,
+}
+
+/// An editor command provided through `[visual_md.commands.<id>]`.
+#[derive(Debug, PartialEq, Eq, Clone, Default, Serialize, Deserialize)]
+pub struct VisualMdCommandManifestEntry {
+    /// The name shown in the command palette.
+    pub title: String,
+    /// What the command does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl VisualMdManifestEntry {
+    /// Checks the entry, returning one message for each problem found. The
+    /// extension's hooks should not be registered when there are any.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for language in &self.fence_renderers {
+            let is_valid = !language.is_empty()
+                && language
+                    .chars()
+                    .all(|character| !character.is_whitespace() && character != '`');
+            if !is_valid {
+                problems.push(format!(
+                    "fence renderer {language:?} is not a valid language tag"
+                ));
+            }
+        }
+        for (id, command) in &self.commands {
+            let is_valid = !id.is_empty()
+                && id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character));
+            if !is_valid {
+                problems.push(format!(
+                    "command id {id:?} may only contain letters, digits, `-` and `_`"
+                ));
+            }
+            if command.title.trim().is_empty() {
+                problems.push(format!("command {id:?} has no title"));
+            }
+        }
+        problems
+    }
 }
 
 impl ExtensionManifest {
@@ -156,6 +217,10 @@ impl ExtensionManifest {
 
         if !self.debug_adapters.is_empty() {
             provides.insert(ExtensionProvides::DebugAdapters);
+        }
+
+        if self.visual_md.is_some() {
+            provides.insert(ExtensionProvides::VisualMd);
         }
 
         provides
@@ -456,6 +521,7 @@ fn manifest_from_old_manifest(
         debug_adapters: Default::default(),
         debug_locators: Default::default(),
         language_model_providers: Default::default(),
+        visual_md: None,
     }
 }
 
@@ -490,7 +556,128 @@ mod tests {
             debug_adapters: Default::default(),
             debug_locators: Default::default(),
             language_model_providers: BTreeMap::default(),
+            visual_md: None,
         }
+    }
+
+    const VISUAL_MD_MANIFEST: &str = r#"
+id = "notes"
+name = "Notes"
+version = "1.0.0"
+schema_version = 1
+
+[visual_md]
+fence_renderers = ["mermaid", "Flow"]
+
+[visual_md.commands.uppercase]
+title = "Uppercase Selection"
+description = "Uppercases the selected text."
+
+[visual_md.commands.today]
+title = "Insert Today's Date"
+"#;
+
+    #[test]
+    fn test_visual_md_section_is_parsed() {
+        let manifest: ExtensionManifest = toml::from_str(VISUAL_MD_MANIFEST).unwrap();
+        let visual_md = manifest.visual_md.as_ref().unwrap();
+
+        assert_eq!(visual_md.fence_renderers, vec!["mermaid", "Flow"]);
+        assert_eq!(visual_md.commands.len(), 2);
+        assert_eq!(
+            visual_md.commands.get("uppercase"),
+            Some(&VisualMdCommandManifestEntry {
+                title: "Uppercase Selection".to_string(),
+                description: Some("Uppercases the selected text.".to_string()),
+            })
+        );
+        assert_eq!(visual_md.commands["today"].description, None);
+        assert_eq!(visual_md.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_visual_md_section_round_trips() {
+        let manifest: ExtensionManifest = toml::from_str(VISUAL_MD_MANIFEST).unwrap();
+
+        let serialized = toml::to_string(&manifest).unwrap();
+        let reparsed: ExtensionManifest = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(reparsed, manifest);
+    }
+
+    #[test]
+    fn test_manifest_without_a_visual_md_section_has_none() {
+        let manifest: ExtensionManifest = toml::from_str(
+            "id = \"plain\"\nname = \"Plain\"\nversion = \"1.0.0\"\nschema_version = 1\n",
+        )
+        .unwrap();
+
+        assert_eq!(manifest.visual_md, None);
+        assert!(!manifest.provides().contains(&ExtensionProvides::VisualMd));
+    }
+
+    #[test]
+    fn test_visual_md_section_is_provided_even_when_empty() {
+        let manifest = ExtensionManifest {
+            visual_md: Some(VisualMdManifestEntry::default()),
+            ..extension_manifest()
+        };
+
+        assert!(manifest.provides().contains(&ExtensionProvides::VisualMd));
+    }
+
+    #[test]
+    fn test_visual_md_validation_reports_each_problem() {
+        let entry = VisualMdManifestEntry {
+            fence_renderers: vec![
+                "mermaid".to_string(),
+                String::new(),
+                "two words".to_string(),
+                "``".to_string(),
+            ],
+            commands: BTreeMap::from([
+                (
+                    Arc::from("fine-id_1"),
+                    VisualMdCommandManifestEntry {
+                        title: "Fine".to_string(),
+                        description: None,
+                    },
+                ),
+                (
+                    Arc::from("has.dot"),
+                    VisualMdCommandManifestEntry {
+                        title: "Dotted".to_string(),
+                        description: None,
+                    },
+                ),
+                (
+                    Arc::from("untitled"),
+                    VisualMdCommandManifestEntry {
+                        title: "   ".to_string(),
+                        description: None,
+                    },
+                ),
+            ]),
+        };
+
+        let problems = entry.validate();
+
+        assert_eq!(problems.len(), 5, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("\"two words\""))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("\"has.dot\""))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("\"untitled\" has no title"))
+        );
     }
 
     #[test]

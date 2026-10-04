@@ -50,6 +50,8 @@ pub enum ExtensionProvides {
     /// Deprecated
     IndexedDocsProviders,
     Snippets,
+    /// Hooks into Zed MD's Markdown live preview.
+    VisualMd,
 }
 
 impl ExtensionProvides {

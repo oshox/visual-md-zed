@@ -434,6 +434,7 @@ pub(crate) fn extension_provides_label(provides: ExtensionProvides) -> &'static 
         ExtensionProvides::IndexedDocsProviders => "Indexed Docs Providers",
         ExtensionProvides::Snippets => "Snippets",
         ExtensionProvides::DebugAdapters => "Debug Adapters",
+        ExtensionProvides::VisualMd => "Markdown Live Preview",
     }
 }
 
@@ -506,6 +507,7 @@ impl Component for ExtensionCard {
                 debug_adapters: Default::default(),
                 debug_locators: Default::default(),
                 language_model_providers: Default::default(),
+                visual_md: None,
             })
         }
 

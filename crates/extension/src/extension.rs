@@ -149,6 +149,25 @@ pub trait Extension: Send + Sync + 'static {
         project: Arc<dyn ProjectDelegate>,
     ) -> Result<Option<ContextServerConfiguration>>;
 
+    /// Renders a fenced code block with the renderer this extension declared for
+    /// the block's language.
+    async fn visual_md_render_fence(
+        &self,
+        _renderer: String,
+        _request: VisualMdFenceRequest,
+    ) -> Result<VisualMdFenceResult> {
+        bail!("this extension does not render fenced code blocks")
+    }
+
+    /// Runs one of this extension's editor commands.
+    async fn visual_md_run_command(
+        &self,
+        _command: String,
+        _context: VisualMdCommandContext,
+    ) -> Result<VisualMdCommandResult> {
+        bail!("this extension does not provide editor commands")
+    }
+
     async fn suggest_docs_packages(&self, provider: Arc<str>) -> Result<Vec<String>>;
 
     async fn index_docs(
