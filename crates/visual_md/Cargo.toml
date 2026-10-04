@@ -13,9 +13,12 @@ path = "src/visual_md.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
+arc-swap.workspace = true
 collections.workspace = true
 editor.workspace = true
 gpui.workspace = true
+icons.workspace = true
 language.workspace = true
 multi_buffer.workspace = true
 settings.workspace = true

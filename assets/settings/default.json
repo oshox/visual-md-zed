@@ -161,8 +161,8 @@
     // Font family of inline code and fenced code blocks.
     // Default: the buffer font.
     "code_font_family": null,
-    // Font size of inline code and fenced code blocks in pixels.
-    // Default: the prose font size.
+    // Font size of inline code and fenced code blocks in pixels, following
+    // the buffer font size zoom. Default: the buffer font size.
     "code_font_size": null,
     // Heading font family. Default: the prose font.
     "heading_font_family": null,

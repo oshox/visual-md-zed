@@ -930,8 +930,9 @@ pub struct VisualMdSettingsContent {
     ///
     /// Default: null
     pub code_font_family: Option<FontFamilyName>,
-    /// The font size for inline code and fenced code blocks, in pixels. Leave
-    /// unset to use the prose font size.
+    /// The font size for inline code and fenced code blocks, in pixels. It
+    /// follows the buffer font size zoom. Leave unset to use the buffer font
+    /// size.
     ///
     /// Default: null
     pub code_font_size: Option<FontSize>,

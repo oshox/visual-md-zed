@@ -20086,10 +20086,13 @@ dependencies = [
 name = "visual_md"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "arc-swap",
  "assets",
  "collections",
  "editor",
  "gpui",
+ "icons",
  "language",
  "multi_buffer",
  "release_channel",

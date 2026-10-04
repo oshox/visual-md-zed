@@ -47,6 +47,18 @@ pub enum CalloutKind {
 }
 
 impl CalloutKind {
+    /// The name settings and theme tokens use for this kind, which also
+    /// applies to its aliases (`info` is a `Note`).
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Note => "note",
+            Self::Tip => "tip",
+            Self::Warning => "warning",
+            Self::Danger => "danger",
+            Self::Other => "other",
+        }
+    }
+
     fn from_type_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "note" | "info" => Self::Note,

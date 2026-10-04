@@ -236,12 +236,14 @@
 mod format_toggle;
 mod list_continuation;
 mod plan;
+mod style;
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use editor::actions::Newline;
 use editor::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId,
@@ -254,15 +256,15 @@ use editor::{
 use format_toggle::Emphasis;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FontFamilyName, FontStyle, FontWeight,
-    HighlightStyle, Hsla, ImageSource, InteractiveElement, IntoElement, KeyContext, ObjectFit,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    StyledImage, Subscription, Task, TextRun, WeakEntity, Window, actions, black, div, img, px,
-    rgb, svg,
+    AnyElement, App, AppContext, Context, Entity, FontWeight, HighlightStyle, Hsla, ImageSource,
+    InteractiveElement, IntoElement, KeyContext, ObjectFit, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TextRun,
+    TextStyleRefinement, WeakEntity, Window, actions, black, div, img, px, svg,
 };
 use language::{Language, Rope};
 use plan::{CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment};
 use settings::Settings;
+use style::ResolvedStyle;
 use util::ResultExt;
 
 actions!(
@@ -328,6 +330,12 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         nonempty_highlight_keys: HashSet::new(),
         last_applied: None,
         selection_refresh_queued: false,
+        style: Arc::new(ArcSwap::from_pointee(ResolvedStyle::resolve(
+            &settings::VisualMdSettingsContent::default(),
+            cx,
+        ))),
+        saved_text_style_refinement: None,
+        callout_key_count: 0,
     });
     refresh(editor, window, cx);
 
@@ -646,6 +654,17 @@ struct VisualMdAddon {
     /// Whether a selection-triggered refresh is already queued for the next
     /// frame, so a burst of selection events costs one refresh.
     selection_refresh_queued: bool,
+    /// The fonts and colors the last refresh resolved. Fold and block render
+    /// closures hold a clone of this handle and read it when they paint, so a
+    /// style change reaches them without recreating any of them.
+    style: Arc<ArcSwap<ResolvedStyle>>,
+    /// The editor's own text style refinement from before visual_md applied
+    /// the prose size and line height, restored when it stops applying them.
+    /// The outer `Option` is whether visual_md has applied anything.
+    saved_text_style_refinement: Option<Option<TextStyleRefinement>>,
+    /// How many `KEY_CALLOUT_FIRST` keys the last refresh used, so the ones a
+    /// later refresh no longer needs can be cleared.
+    callout_key_count: usize,
 }
 
 struct ParsedDocument {
@@ -685,7 +704,7 @@ impl Addon for VisualMdAddon {
 
 struct VisualMdState {
     editor: WeakEntity<Editor>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 5],
 }
 
 impl VisualMdState {
@@ -761,99 +780,98 @@ impl VisualMdState {
                         }
                     },
                 ),
+                // A theme switch changes the colors baked into highlights, and
+                // the language registry re-resolves each grammar's highlight
+                // ids against the new theme, which the plan does not capture.
+                cx.observe_global_in::<theme::GlobalTheme>(window, |state, window, cx| {
+                    state
+                        .editor
+                        .update(cx, |editor, cx| {
+                            if is_decorating(editor) {
+                                force_refresh(editor, window, cx)
+                            }
+                        })
+                        .log_err();
+                }),
+                // Font settings live in `ThemeSettings`, so a change to them
+                // does not alter the buffer's own language settings.
+                cx.observe_global_in::<settings::SettingsStore>(window, |state, window, cx| {
+                    state
+                        .editor
+                        .update(cx, |editor, cx| {
+                            if is_decorating(editor) {
+                                refresh(editor, window, cx)
+                            }
+                        })
+                        .log_err();
+                }),
+                theme_settings::observe_buffer_font_size_adjustment_in(
+                    window,
+                    cx,
+                    |state, window, cx| {
+                        state
+                            .editor
+                            .update(cx, |editor, cx| {
+                                if is_decorating(editor) {
+                                    refresh(editor, window, cx)
+                                }
+                            })
+                            .log_err();
+                    },
+                ),
             ],
         })
     }
 }
 
+/// Whether live preview is currently decorating `editor`. Global observers
+/// fire for every editor, so they use this to leave the others alone.
+fn is_decorating(editor: &Editor) -> bool {
+    editor
+        .addon::<VisualMdAddon>()
+        .is_some_and(|addon| addon.active)
+}
+
 /// Which `HighlightKey::VisualMd` sub-key each decoration category uses. The
 /// variant namespaces visual_md's own highlights from every other highlight
 /// source, and the sub-key picks the decoration family (heading, emphasis,
-/// etc.) so unrelated categories can be replaced independently. Kept
-/// disjoint by construction (the planner never emits overlapping ranges
-/// across categories) so highlight compositing never has to blend two of
-/// visual_md's own colors together.
-const KEY_DIMMED_MARKER: usize = 0;
-// Headings get one key per level (rather than sharing `KEY_HEADING` the way
-// M1-M3 did) because each level now also carries its own
-// `HighlightStyle::font_size_scale` (see `heading_style`) — keeping them
-// disjoint means changing one heading's level cleanly removes its old
-// size/color highlight instead of leaving a stale one from a different level
-// composited underneath.
-const KEY_HEADING_1: usize = 1;
-const KEY_HEADING_2: usize = 2;
-const KEY_HEADING_3: usize = 3;
-const KEY_HEADING_4: usize = 4;
-const KEY_HEADING_5: usize = 5;
-const KEY_HEADING_6: usize = 6;
-const KEY_BOLD: usize = 7;
-const KEY_ITALIC: usize = 8;
-const KEY_STRIKETHROUGH: usize = 9;
-const KEY_LINK: usize = 10;
-// Numbered higher than KEY_LINK deliberately: `CustomHighlightsChunks::next`
-// (crates/editor/src/display_map/custom_highlights.rs) folds every active
-// `HighlightKey::VisualMd` key into one `HighlightStyle` in ascending key order,
-// with each later style's set fields overriding earlier ones -- so
-// KEY_CODE_FONT (code content) needs a higher number than KEY_PROSE_FONT (as
-// close to "everything") to win a font-family conflict, even though in
-// practice inline code/fence ranges don't currently overlap prose spans.
-const KEY_PROSE_FONT: usize = 11;
-const KEY_CODE_FONT: usize = 12;
-// One key per `CalloutKind` (M11), the same reasoning the per-level heading
-// keys use: each kind sets a different `background_color`, and keeping them
-// disjoint means a callout that changes type (edited from `[!note]` to
-// `[!warning]`) cleanly drops its old tint instead of compositing two
-// backgrounds together.
-const KEY_CALLOUT_NOTE: usize = 13;
-const KEY_CALLOUT_TIP: usize = 14;
-const KEY_CALLOUT_WARNING: usize = 15;
-const KEY_CALLOUT_DANGER: usize = 16;
-const KEY_CALLOUT_OTHER: usize = 17;
-
-fn callout_key(kind: CalloutKind) -> usize {
-    match kind {
-        CalloutKind::Note => KEY_CALLOUT_NOTE,
-        CalloutKind::Tip => KEY_CALLOUT_TIP,
-        CalloutKind::Warning => KEY_CALLOUT_WARNING,
-        CalloutKind::Danger => KEY_CALLOUT_DANGER,
-        CalloutKind::Other => KEY_CALLOUT_OTHER,
-    }
-}
-
-/// The icon path (see `checkbox_placeholder`'s own `svg().path(...)` for why
-/// this crate spells these out as raw asset paths rather than depending on
-/// the `ui`/`icons` crates for a single enum) and the accent/background
-/// colors a callout of `kind` renders with, reusing Zed's existing semantic
-/// status colors (`cx.theme().status()`, the same tokens
-/// `crates/editor/src/element.rs` uses for diagnostic severities) rather
-/// than inventing new theme tokens for what is, structurally, the same
-/// note/warning/error vocabulary.
-fn callout_look(kind: CalloutKind, cx: &App) -> (&'static str, Hsla, Hsla) {
-    use theme::ActiveTheme;
-    let status = cx.theme().status();
-    match kind {
-        CalloutKind::Note => ("icons/info.svg", status.info, status.info_background),
-        CalloutKind::Tip => (
-            "icons/sparkle.svg",
-            status.success,
-            status.success_background,
-        ),
-        CalloutKind::Warning => (
-            "icons/warning.svg",
-            status.warning,
-            status.warning_background,
-        ),
-        CalloutKind::Danger => (
-            "icons/x_circle_filled.svg",
-            status.error,
-            status.error_background,
-        ),
-        // An unrecognized `[!type]` still gets a real callout box, just a
-        // neutral "additional information" treatment rather than a false
-        // severity -- `hint` is the status color already meant for that.
-        CalloutKind::Other => ("icons/quote.svg", status.hint, status.hint_background),
-    }
-}
+/// etc.) so unrelated categories can be replaced independently.
+///
+/// `CustomHighlightsChunks::next`
+/// (crates/editor/src/display_map/custom_highlights.rs) folds every active
+/// key into one `HighlightStyle` in ascending key order, each later style's
+/// set fields overriding earlier ones, so the numbering is the precedence:
+/// prose sits below everything it applies to, and the layers a user can
+/// configure for a specific construct (inline code, code blocks) sit above
+/// the layers that apply to whole categories of text.
+const KEY_PROSE_FONT: usize = 0;
+/// Restores the buffer font's weight on code when prose has its own weight,
+/// which would otherwise carry over to it.
+const KEY_CODE_WEIGHT: usize = 1;
+const KEY_DIMMED_MARKER: usize = 2;
+// Headings get one key per level because each level carries its own
+// `HighlightStyle::font_size_scale`: keeping them disjoint means changing
+// one heading's level cleanly removes its old size/color highlight instead of
+// leaving a stale one from a different level composited underneath.
+const KEY_HEADING_1: usize = 3;
+const KEY_HEADING_2: usize = 4;
+const KEY_HEADING_3: usize = 5;
+const KEY_HEADING_4: usize = 6;
+const KEY_HEADING_5: usize = 7;
+const KEY_HEADING_6: usize = 8;
+const KEY_BOLD: usize = 9;
+const KEY_ITALIC: usize = 10;
+const KEY_STRIKETHROUGH: usize = 11;
+const KEY_LINK: usize = 12;
+/// The first of the callout background keys: one per distinct callout type
+/// name in view, each setting a different `background_color`. Keeping them
+/// disjoint means a callout that changes type (edited from `[!note]` to
+/// `[!warning]`) cleanly drops its old tint instead of compositing two
+/// backgrounds together.
+const KEY_CALLOUT_FIRST: usize = 100;
+const KEY_HIGHLIGHT: usize = 1000;
+const KEY_INLINE_CODE: usize = 1001;
+const KEY_CODE_BLOCK: usize = 1002;
 
 fn heading_key(level: u8) -> usize {
     match level {
@@ -949,6 +967,9 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         return;
     }
 
+    let (style_handle, style) = current_style(editor, cx);
+    apply_text_style_refinement(editor, enabled, &style, cx);
+
     if enabled != was_active {
         // Line numbers don't fit the live-preview reading experience, and
         // "foldable" isn't meaningful there either (including the
@@ -1039,12 +1060,12 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                     GlyphKind::BlockquoteBar => (
                         range.clone(),
                         "blockquote_bar".to_string(),
-                        blockquote_bar_placeholder(),
+                        blockquote_bar_placeholder(style_handle.clone()),
                     ),
                     GlyphKind::TablePipe => (
                         range.clone(),
                         "table_pipe".to_string(),
-                        table_pipe_placeholder(),
+                        table_pipe_placeholder(style_handle.clone()),
                     ),
                 }),
         )
@@ -1053,7 +1074,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         (
             range.clone(),
             format!("checkbox:{checked}"),
-            checkbox_placeholder(editor_handle.clone(), *checked),
+            checkbox_placeholder(editor_handle.clone(), *checked, style_handle.clone()),
         )
     }));
     // An untouched callout's title (see `callout_title_placeholder`'s own
@@ -1078,6 +1099,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                         callout.raw_type_name.clone(),
                         callout.fold,
                         callout.suffix_range.clone(),
+                        style_handle.clone(),
                     ),
                 )
             }),
@@ -1099,14 +1121,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 )
             }),
     );
-    folds.extend(table_alignment_spacer_folds(&computed, &text, window, cx));
+    folds.extend(table_alignment_spacer_folds(
+        &computed, &text, &style, window, cx,
+    ));
 
     apply_folds(editor, &snapshot, folds, window, cx);
-    apply_style_highlights(editor, &snapshot, &computed, enabled, cx);
-    apply_horizontal_rules(editor, &snapshot, &computed, cx);
+    apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
+    apply_horizontal_rules(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_images(editor, &snapshot, &computed, cx);
-    apply_table_dividers(editor, &snapshot, &computed, cx);
-    apply_code_fence_borders(editor, &snapshot, &computed, cx);
+    apply_table_dividers(editor, &snapshot, &computed, style_handle.clone(), cx);
+    apply_code_fence_borders(editor, &snapshot, &computed, style_handle, cx);
     let code_languages: HashSet<String> = computed
         .code_fence_content
         .iter()
@@ -1117,6 +1141,80 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
     if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
         addon.last_applied = Some((edit_count, computed));
+    }
+}
+
+/// Resolves the style for `editor`'s buffer and returns it with the shared
+/// handle that paint-time closures read. A style that differs from the last
+/// one is published to that handle and invalidates `last_applied`, because the
+/// plan does not capture fonts and colors.
+fn current_style(
+    editor: &mut Editor,
+    cx: &App,
+) -> (Arc<ArcSwap<ResolvedStyle>>, Arc<ResolvedStyle>) {
+    let settings = editor
+        .buffer()
+        .read(cx)
+        .language_settings_at(MultiBufferOffset(0), cx);
+    let resolved = ResolvedStyle::resolve(&settings.visual_md, cx);
+    let Some(addon) = editor.addon_mut::<VisualMdAddon>() else {
+        let resolved = Arc::new(resolved);
+        return (Arc::new(ArcSwap::new(resolved.clone())), resolved);
+    };
+    if **addon.style.load() != resolved {
+        addon.style.store(Arc::new(resolved));
+        addon.last_applied = None;
+    }
+    (addon.style.clone(), addon.style.load_full())
+}
+
+/// Gives the editor the prose size and line height, which only a refinement of
+/// its base text style can do (it also makes soft wrap measure prose at the
+/// right size). The editor's own refinement is saved first and restored once
+/// live preview stops applying these, and nothing is touched while neither is
+/// configured.
+fn apply_text_style_refinement(
+    editor: &mut Editor,
+    enabled: bool,
+    style: &ResolvedStyle,
+    cx: &mut Context<Editor>,
+) {
+    let wanted = style.text_style_refinement().filter(|_| enabled);
+    let Some(ours) = wanted else {
+        let saved = editor
+            .addon_mut::<VisualMdAddon>()
+            .and_then(|addon| addon.saved_text_style_refinement.take());
+        if let Some(saved) = saved {
+            match saved {
+                Some(refinement) => editor.set_text_style_refinement(refinement),
+                None => editor.clear_text_style_refinement(),
+            }
+            cx.notify();
+        }
+        return;
+    };
+
+    let existing = editor.text_style_refinement().cloned();
+    let base = match editor.addon_mut::<VisualMdAddon>() {
+        Some(addon) => match &addon.saved_text_style_refinement {
+            Some(saved) => saved.clone(),
+            None => {
+                addon.saved_text_style_refinement = Some(existing);
+                addon.saved_text_style_refinement.clone().flatten()
+            }
+        },
+        None => existing,
+    };
+    let mut refinement = base.unwrap_or_default();
+    if ours.font_size.is_some() {
+        refinement.font_size = ours.font_size;
+    }
+    if ours.line_height.is_some() {
+        refinement.line_height = ours.line_height;
+    }
+    if editor.text_style_refinement() != Some(&refinement) {
+        editor.set_text_style_refinement(refinement);
+        cx.notify();
     }
 }
 
@@ -1232,6 +1330,13 @@ fn to_anchor_range(snapshot: &MultiBufferSnapshot, range: &Range<usize>) -> Rang
         ..snapshot.anchor_after(MultiBufferOffset(range.end))
 }
 
+fn to_anchor_ranges(snapshot: &MultiBufferSnapshot, ranges: &[Range<usize>]) -> Vec<Range<Anchor>> {
+    ranges
+        .iter()
+        .map(|range| to_anchor_range(snapshot, range))
+        .collect()
+}
+
 /// Base settings shared by every visual_md fold placeholder.
 ///
 /// A *genuinely* zero-width fold (`gpui::Empty`, or an empty `div()`)
@@ -1304,13 +1409,10 @@ fn ordinal_placeholder(text: String) -> editor::FoldPlaceholder {
 /// A blockquote/callout's left bar, drawn as a real filled rectangle rather
 /// than the Unicode block-drawing character `▎` — see `bullet_placeholder`'s
 /// doc comment for why a drawn shape is preferred over a symbol glyph here.
-fn blockquote_bar_placeholder() -> editor::FoldPlaceholder {
+fn blockquote_bar_placeholder(style: Arc<ArcSwap<ResolvedStyle>>) -> editor::FoldPlaceholder {
     editor::FoldPlaceholder {
-        render: std::sync::Arc::new(|_, _, cx| {
-            let color = {
-                use theme::ActiveTheme;
-                cx.theme().colors().border
-            };
+        render: std::sync::Arc::new(move |_, _, _| {
+            let color = style.load().blockquote_bar_color;
             div()
                 .flex()
                 .items_center()
@@ -1328,13 +1430,10 @@ fn blockquote_bar_placeholder() -> editor::FoldPlaceholder {
 /// bar -- same technique as `blockquote_bar_placeholder`, just centered in
 /// its own narrow width rather than left-anchored, since it sits *between*
 /// two cells' text instead of at the start of an indented line.
-fn table_pipe_placeholder() -> editor::FoldPlaceholder {
+fn table_pipe_placeholder(style: Arc<ArcSwap<ResolvedStyle>>) -> editor::FoldPlaceholder {
     editor::FoldPlaceholder {
-        render: std::sync::Arc::new(|_, _, cx| {
-            let color = {
-                use theme::ActiveTheme;
-                cx.theme().colors().border
-            };
+        render: std::sync::Arc::new(move |_, _, _| {
+            let color = style.load().table_border_color;
             div()
                 .flex()
                 .items_center()
@@ -1375,10 +1474,15 @@ fn table_pipe_placeholder() -> editor::FoldPlaceholder {
 /// re-entrancy failure mode described above — confirmed the checked state
 /// specifically was the one silently blank in the real app while the
 /// unchecked box rendered fine. A drawn shape has no font dependency at all.
-fn checkbox_placeholder(editor: WeakEntity<Editor>, checked: bool) -> editor::FoldPlaceholder {
+fn checkbox_placeholder(
+    editor: WeakEntity<Editor>,
+    checked: bool,
+    style: Arc<ArcSwap<ResolvedStyle>>,
+) -> editor::FoldPlaceholder {
     editor::FoldPlaceholder {
         render: std::sync::Arc::new(move |fold_id, range, cx| {
             let editor = editor.clone();
+            let checked_color = style.load().task_checked_color;
             let colors = {
                 use theme::ActiveTheme;
                 cx.theme().colors()
@@ -1400,7 +1504,7 @@ fn checkbox_placeholder(editor: WeakEntity<Editor>, checked: bool) -> editor::Fo
                         .size(box_size)
                         .rounded(px(3.))
                         .when(!checked, |el| el.border_1().border_color(colors.icon_muted))
-                        .when(checked, |el| el.bg(colors.icon_accent))
+                        .when(checked, |el| el.bg(checked_color))
                         .when(checked, |el| {
                             el.child(
                                 svg()
@@ -1441,15 +1545,18 @@ fn callout_title_placeholder(
     raw_type_name: String,
     fold: CalloutFold,
     suffix_range: Range<usize>,
+    style: Arc<ArcSwap<ResolvedStyle>>,
 ) -> editor::FoldPlaceholder {
     let collapsed = fold.is_collapsed();
     let label = SharedString::from(capitalize(&raw_type_name));
+    let collapsed_text = label.clone();
     editor::FoldPlaceholder {
-        render: std::sync::Arc::new(move |fold_id, _range, cx| {
+        render: std::sync::Arc::new(move |fold_id, _range, _| {
             let editor = editor.clone();
             let suffix_range = suffix_range.clone();
             let label = label.clone();
-            let (icon_path, color, _background) = callout_look(kind, cx);
+            let look = style.load().callout_look(kind, &raw_type_name);
+            let (icon_path, color) = (look.icon_path, look.accent);
             let chevron_path = if collapsed {
                 "icons/chevron_right.svg"
             } else {
@@ -1495,7 +1602,7 @@ fn callout_title_placeholder(
         // rendering of the same marker (which does show the literal
         // brackets), both for a real viewer scanning the buffer and for
         // tests asserting on `display_text()`.
-        collapsed_text: Some(SharedString::from(capitalize(&raw_type_name))),
+        collapsed_text: Some(collapsed_text),
         ..base_placeholder()
     }
 }
@@ -1669,6 +1776,7 @@ fn apply_horizontal_rules(
     editor: &mut Editor,
     snapshot: &MultiBufferSnapshot,
     computed: &Plan,
+    style: Arc<ArcSwap<ResolvedStyle>>,
     cx: &mut Context<Editor>,
 ) {
     let previous = editor
@@ -1706,11 +1814,15 @@ fn apply_horizontal_rules(
             .iter()
             .map(|range| {
                 let anchor_range = to_anchor_range(snapshot, range);
+                let style = style.clone();
                 BlockProperties {
                     placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
                     height: Some(1),
                     style: BlockStyle::Fixed,
-                    render: std::sync::Arc::new(render_horizontal_rule),
+                    render: std::sync::Arc::new(move |cx: &mut BlockContext| {
+                        let color = style.load().rule_color;
+                        render_horizontal_rule(cx, color)
+                    }),
                     priority: 0,
                 }
             })
@@ -1729,11 +1841,7 @@ fn apply_horizontal_rules(
 /// callback directly by the block-decoration layer) rather than a fixed
 /// pixel guess or a flex `w_full()` that can't resolve against the
 /// indeterminate width a fold placeholder would otherwise be laid out in.
-fn render_horizontal_rule(cx: &mut BlockContext) -> AnyElement {
-    let color = {
-        use theme::ActiveTheme;
-        cx.theme().colors().border
-    };
+fn render_horizontal_rule(cx: &mut BlockContext, color: Hsla) -> AnyElement {
     div()
         .w(cx.max_width)
         .h(cx.line_height)
@@ -1925,6 +2033,7 @@ fn apply_table_dividers(
     editor: &mut Editor,
     snapshot: &MultiBufferSnapshot,
     computed: &Plan,
+    style: Arc<ArcSwap<ResolvedStyle>>,
     cx: &mut Context<Editor>,
 ) {
     let wanted_ranges: Vec<Range<usize>> = computed
@@ -1963,11 +2072,15 @@ fn apply_table_dividers(
             .iter()
             .map(|range| {
                 let anchor_range = to_anchor_range(snapshot, range);
+                let style = style.clone();
                 BlockProperties {
                     placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
                     height: Some(1),
                     style: BlockStyle::Fixed,
-                    render: std::sync::Arc::new(render_horizontal_rule),
+                    render: std::sync::Arc::new(move |cx: &mut BlockContext| {
+                        let color = style.load().table_border_color;
+                        render_horizontal_rule(cx, color)
+                    }),
                     priority: 0,
                 }
             })
@@ -2001,6 +2114,7 @@ fn apply_table_dividers(
 fn table_alignment_spacer_folds(
     computed: &Plan,
     text: &str,
+    style: &ResolvedStyle,
     window: &Window,
     cx: &mut Context<Editor>,
 ) -> Vec<(Range<usize>, String, editor::FoldPlaceholder)> {
@@ -2010,7 +2124,17 @@ fn table_alignment_spacer_folds(
 
     let (font, font_size) = {
         let settings = theme_settings::ThemeSettings::get_global(cx);
-        (settings.ui_font.clone(), settings.ui_font_size(cx))
+        let mut font = settings.ui_font.clone();
+        font.family = SharedString::from(style.prose_font_family.as_str());
+        if let Some(weight) = style.prose_font_weight {
+            font.weight = weight;
+        }
+        (
+            font,
+            style
+                .prose_font_size
+                .unwrap_or_else(|| settings.ui_font_size(cx)),
+        )
     };
     let measure = |range: &Range<usize>| -> f32 {
         let Some(cell_text) = text.get(range.clone()) else {
@@ -2122,6 +2246,7 @@ fn apply_code_fence_borders(
     editor: &mut Editor,
     snapshot: &MultiBufferSnapshot,
     computed: &Plan,
+    style: Arc<ArcSwap<ResolvedStyle>>,
     cx: &mut Context<Editor>,
 ) {
     let previous = editor
@@ -2161,12 +2286,14 @@ fn apply_code_fence_borders(
             .map(|(range, language)| {
                 let anchor_range = to_anchor_range(snapshot, range);
                 let language = language.clone();
+                let style = style.clone();
                 BlockProperties {
                     placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
                     height: Some(1),
                     style: BlockStyle::Fixed,
                     render: Arc::new(move |cx: &mut BlockContext| {
-                        render_code_fence_border(cx, language.clone())
+                        let line_color = style.load().code_block_border_color;
+                        render_code_fence_border(cx, language.clone(), line_color)
                     }),
                     priority: 0,
                 }
@@ -2190,7 +2317,11 @@ fn apply_code_fence_borders(
 /// `render_horizontal_rule` renders a `---`: a full-width thin border using
 /// `BlockContext::max_width`, plus (only on the opening line, when a
 /// language was recognized in the info string) a small text chip.
-fn render_code_fence_border(cx: &mut BlockContext, language: Option<String>) -> AnyElement {
+fn render_code_fence_border(
+    cx: &mut BlockContext,
+    language: Option<String>,
+    line_color: Hsla,
+) -> AnyElement {
     let colors = {
         use theme::ActiveTheme;
         cx.theme().colors()
@@ -2212,7 +2343,7 @@ fn render_code_fence_border(cx: &mut BlockContext, language: Option<String>) -> 
                     .child(language),
             )
         })
-        .child(div().flex_1().h(px(1.)).bg(colors.border))
+        .child(div().flex_1().h(px(1.)).bg(line_color))
         .into_any_element()
 }
 
@@ -2373,162 +2504,24 @@ fn apply_style_highlights(
     snapshot: &MultiBufferSnapshot,
     computed: &Plan,
     enabled: bool,
+    style: &ResolvedStyle,
     cx: &mut Context<Editor>,
 ) {
-    let anchor_ranges = |ranges: &[Range<usize>]| -> Vec<Range<Anchor>> {
-        ranges
-            .iter()
-            .map(|range| to_anchor_range(snapshot, range))
-            .collect()
-    };
-    let spans_of = |style: SpanStyle| -> Vec<Range<usize>> {
+    let spans_of = |span_style: SpanStyle| -> Vec<Range<usize>> {
         computed
             .styled_spans
             .iter()
-            .filter(|(_, span_style)| *span_style == style)
+            .filter(|(_, candidate)| *candidate == span_style)
             .map(|(range, _)| range.clone())
             .collect()
     };
 
-    set_visual_md_highlight(
-        editor,
-        KEY_DIMMED_MARKER,
-        anchor_ranges(&computed.dimmed_markers),
-        dim_marker_style(),
-        cx,
-    );
-
-    // Zed's own tree-sitter-based Markdown syntax theme already colors
-    // headings/bold/italic/strikethrough distinctly (that's a separate
-    // layer from these `highlight_text` calls, driven by the buffer's
-    // language grammar). Per explicit product direction — "remove color
-    // customizations", matching the Obsidian live-preview reference, where
-    // these render in the same color as surrounding prose — a `None` color
-    // here would leave that underlying syntax color showing through
-    // unblended, not actually remove it. Pinning to the editor's normal
-    // foreground color is what actually cancels it out.
-    let normal_color = {
-        use theme::ActiveTheme;
-        cx.theme().colors().editor_foreground
-    };
-
-    for level in 1..=6u8 {
-        let ranges: Vec<Range<usize>> = computed
-            .styled_spans
-            .iter()
-            .filter(|(_, style)| *style == SpanStyle::Heading(level))
-            .map(|(range, _)| range.clone())
-            .collect();
-        set_visual_md_highlight(
-            editor,
-            heading_key(level),
-            anchor_ranges(&ranges),
-            heading_style(level, normal_color),
-            cx,
-        );
-    }
-
-    set_visual_md_highlight(
-        editor,
-        KEY_BOLD,
-        anchor_ranges(&spans_of(SpanStyle::Bold)),
-        bold_style(normal_color),
-        cx,
-    );
-    set_visual_md_highlight(
-        editor,
-        KEY_ITALIC,
-        anchor_ranges(&spans_of(SpanStyle::Italic)),
-        italic_style(normal_color),
-        cx,
-    );
-    set_visual_md_highlight(
-        editor,
-        KEY_STRIKETHROUGH,
-        anchor_ranges(&spans_of(SpanStyle::Strikethrough)),
-        strikethrough_style(normal_color),
-        cx,
-    );
-    // Inline code, ==highlight== marks, and callout bodies are deliberately
-    // left with no color/background styling — visual_md previously tinted
-    // all three, but per the live-preview reference (Obsidian) and explicit
-    // product direction, only structural styling (bold weight, italic
-    // style, marker hiding/dimming, heading size) survives. The `[!type]`
-    // bracket syntax on a callout is still hidden via `hidden_markers` —
-    // that's handled entirely by `apply_folds`, untouched by this. Unlike
-    // headings/bold/italic, Zed's own syntax theme doesn't tint these
-    // distinctly enough to need a counteracting color override here.
-    //
-    // Links are the one deliberate, narrow exception to "no added color"
-    // above: color is a link's only non-structural cue (no weight/slant
-    // distinguishes it the way bold/italic have their own), so per explicit
-    // product direction a real link gets colored using
-    // `link_text_hover` — the same theme token Zed's own generic cmd+hover
-    // link highlight already uses (`crates/editor/src/hover_links.rs`), so
-    // it reads as "this is a link" the same way everywhere else in the app
-    // rather than inventing a new color for the same affordance.
-    let link_color = {
-        use theme::ActiveTheme;
-        cx.theme().colors().link_text_hover
-    };
-    set_visual_md_highlight(
-        editor,
-        KEY_LINK,
-        anchor_ranges(&spans_of(SpanStyle::Link)),
-        link_style(link_color),
-        cx,
-    );
-
-    // Callout boxes (M11): a second deliberate color exception alongside
-    // links, per explicit product direction -- a callout's whole purpose is
-    // visually standing out, unlike the inline-code/highlight tints removed
-    // above. One key per kind (see `KEY_CALLOUT_NOTE`'s own comment); the
-    // background covers the callout's *whole* node range (title row
-    // included), set on `SpanStyle::Callout` by `plan_block_quote`.
-    for kind in [
-        CalloutKind::Note,
-        CalloutKind::Tip,
-        CalloutKind::Warning,
-        CalloutKind::Danger,
-        CalloutKind::Other,
-    ] {
-        let (_, _, background) = callout_look(kind, cx);
-        set_visual_md_highlight(
-            editor,
-            callout_key(kind),
-            anchor_ranges(&spans_of(SpanStyle::Callout(kind))),
-            HighlightStyle {
-                background_color: Some(background),
-                ..HighlightStyle::default()
-            },
-            cx,
-        );
-    }
-
-    // Prose/code font split (M7). visual_md doesn't otherwise touch fonts at
-    // all: every markdown buffer today renders entirely in the editor's
-    // normal `buffer_font` (headings just get bigger via `font_size_scale`
-    // above), so there is no existing proportional "reading" font to
-    // contrast code against. This gives markdown prose the same proportional
-    // font Zed's own UI chrome already uses (`ui_font` — reusing an existing
-    // theme token rather than introducing a new setting), while code (inline
-    // spans, and fenced blocks once M8 populates `code_font_ranges`) stays
-    // on `buffer_font`, i.e. exactly the font it already was.
-    //
-    // The prose layer covers the *whole buffer*, not just the viewport: it's
-    // a single O(1) highlight entry regardless of document size (unlike the
-    // tree-walked per-construct decorations above), so there's no perf
-    // reason to scope it, and doing so would risk a font flicker right at
-    // the viewport boundary while scrolling. `KEY_CODE_FONT` is numbered
-    // higher than `KEY_PROSE_FONT` specifically so it wins this conflict
-    // wherever the two overlap (see the constants' own doc comment).
-    let (ui_font_family, buffer_font_family) = {
-        let settings = theme_settings::ThemeSettings::get_global(cx);
-        (
-            settings.ui_font.family.clone(),
-            settings.buffer_font.family.clone(),
-        )
-    };
+    // Markdown prose is shown in `ui_font`, the proportional font Zed's own UI
+    // chrome uses, unless a prose font is configured. The layer covers the
+    // *whole buffer*, not just the viewport: it is a single O(1) highlight
+    // entry regardless of document size (unlike the tree-walked per-construct
+    // decorations below), so there's no perf reason to scope it, and doing so
+    // would risk a font flicker right at the viewport boundary while scrolling.
     let prose_ranges: Vec<Range<Anchor>> = if enabled {
         vec![snapshot.anchor_before(MultiBufferOffset(0))..snapshot.anchor_after(snapshot.len())]
     } else {
@@ -2539,95 +2532,184 @@ fn apply_style_highlights(
         KEY_PROSE_FONT,
         prose_ranges,
         HighlightStyle {
-            font_family: Some(FontFamilyName::new(&ui_font_family)),
+            font_family: Some(style.prose_font_family),
+            font_weight: style.prose_font_weight,
             ..Default::default()
         },
         cx,
     );
-    let mut code_font_ranges = spans_of(SpanStyle::InlineCode);
-    code_font_ranges.extend(
-        computed
-            .code_fence_content
+
+    let inline_code = spans_of(SpanStyle::InlineCode);
+    let code_block_content: Vec<Range<usize>> = computed
+        .code_fence_content
+        .iter()
+        .map(|(range, _)| range.clone())
+        .collect();
+    let code_weight_ranges = if style.code_font_weight.is_some() {
+        inline_code
             .iter()
-            .map(|(range, _)| range.clone()),
+            .chain(&code_block_content)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    set_visual_md_highlight(
+        editor,
+        KEY_CODE_WEIGHT,
+        to_anchor_ranges(snapshot, &code_weight_ranges),
+        HighlightStyle {
+            font_weight: style.code_font_weight,
+            ..Default::default()
+        },
+        cx,
+    );
+
+    set_visual_md_highlight(
+        editor,
+        KEY_DIMMED_MARKER,
+        to_anchor_ranges(snapshot, &computed.dimmed_markers),
+        style.dim_marker_style(),
+        cx,
+    );
+
+    // Zed's own tree-sitter-based Markdown syntax theme already colors
+    // headings/bold/italic/strikethrough distinctly (that's a separate layer
+    // from these `highlight_text` calls, driven by the buffer's language
+    // grammar). Per explicit product direction, matching the Obsidian
+    // live-preview reference, where these render in the same color as
+    // surrounding prose, a `None` color here would leave that underlying
+    // syntax color showing through unblended. Pinning to the editor's normal
+    // foreground color (the default for each of these) is what cancels it out.
+    for level in 1..=6u8 {
+        set_visual_md_highlight(
+            editor,
+            heading_key(level),
+            to_anchor_ranges(snapshot, &spans_of(SpanStyle::Heading(level))),
+            style.heading_style(level),
+            cx,
+        );
+    }
+
+    set_visual_md_highlight(
+        editor,
+        KEY_BOLD,
+        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Bold)),
+        style.bold_style(),
+        cx,
     );
     set_visual_md_highlight(
         editor,
-        KEY_CODE_FONT,
-        anchor_ranges(&code_font_ranges),
+        KEY_ITALIC,
+        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Italic)),
+        style.italic_style(),
+        cx,
+    );
+    set_visual_md_highlight(
+        editor,
+        KEY_STRIKETHROUGH,
+        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Strikethrough)),
+        style.strikethrough_style(),
+        cx,
+    );
+    // Links are the one deliberate, narrow exception to "no added color": color
+    // is a link's only non-structural cue (no weight/slant distinguishes it the
+    // way bold/italic have their own), so by default a real link is colored
+    // using `link_text_hover`, the same theme token Zed's own generic cmd+hover
+    // link highlight already uses (`crates/editor/src/hover_links.rs`).
+    set_visual_md_highlight(
+        editor,
+        KEY_LINK,
+        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Link)),
+        style.link_style(),
+        cx,
+    );
+
+    apply_callout_backgrounds(editor, snapshot, computed, style, cx);
+
+    // Highlights, inline code and code blocks carry no color or background
+    // unless a setting or theme token supplies one: the live-preview reference
+    // (Obsidian) leaves them untinted, so only the structural styling
+    // (the code font and size) applies by default.
+    let highlight_ranges = if style.highlight_background.is_some() {
+        spans_of(SpanStyle::Highlight)
+    } else {
+        Vec::new()
+    };
+    set_visual_md_highlight(
+        editor,
+        KEY_HIGHLIGHT,
+        to_anchor_ranges(snapshot, &highlight_ranges),
         HighlightStyle {
-            font_family: Some(FontFamilyName::new(&buffer_font_family)),
+            background_color: style.highlight_background,
             ..Default::default()
         },
         cx,
     );
+    set_visual_md_highlight(
+        editor,
+        KEY_INLINE_CODE,
+        to_anchor_ranges(snapshot, &inline_code),
+        style.inline_code_style(),
+        cx,
+    );
+    set_visual_md_highlight(
+        editor,
+        KEY_CODE_BLOCK,
+        to_anchor_ranges(snapshot, &code_block_content),
+        style.code_block_style(),
+        cx,
+    );
 }
 
-fn dim_marker_style() -> HighlightStyle {
-    HighlightStyle {
-        color: Some(rgb(0x6b7280).into()),
-        ..HighlightStyle::default()
+/// Callout boxes (M11) are a second deliberate color exception alongside
+/// links: a callout's whole purpose is visually standing out. The background
+/// covers the callout's *whole* node range (title row included). There is one
+/// key per distinct type name in view, built-in kinds first, so a callout
+/// nested in another resolves in the same order it always has.
+fn apply_callout_backgrounds(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    computed: &Plan,
+    style: &ResolvedStyle,
+    cx: &mut Context<Editor>,
+) {
+    let mut groups: BTreeMap<(usize, String), (Hsla, Vec<Range<usize>>)> = BTreeMap::new();
+    for callout in &computed.callouts {
+        let look = style.callout_look(callout.kind, &callout.raw_type_name);
+        groups
+            .entry((callout.kind as usize, callout.raw_type_name.to_lowercase()))
+            .or_insert_with(|| (look.background, Vec::new()))
+            .1
+            .push(callout.node_range.clone());
     }
-}
 
-/// Roughly matches common heading-scale conventions (Obsidian, browser
-/// default `<h1>`-`<h6>`): H1 largest, shrinking toward H6, which stays at
-/// the editor's normal text size (a size of exactly `1.0`, not slightly
-/// under, so a document with no true H6 styling convention doesn't end up
-/// with unexpectedly small "normal" text).
-fn heading_font_size_scale(level: u8) -> f32 {
-    match level {
-        1 => 1.8,
-        2 => 1.5,
-        3 => 1.3,
-        4 => 1.15,
-        5 => 1.05,
-        _ => 1.0,
+    let used_keys = groups.len();
+    for (index, (background, ranges)) in groups.into_values().enumerate() {
+        set_visual_md_highlight(
+            editor,
+            KEY_CALLOUT_FIRST + index,
+            to_anchor_ranges(snapshot, &ranges),
+            HighlightStyle {
+                background_color: Some(background),
+                ..HighlightStyle::default()
+            },
+            cx,
+        );
     }
-}
 
-fn heading_style(level: u8, normal_color: Hsla) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(normal_color),
-        font_weight: Some(FontWeight::BOLD),
-        font_size_scale: Some(heading_font_size_scale(level)),
-        ..HighlightStyle::default()
-    }
-}
-
-fn bold_style(normal_color: Hsla) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(normal_color),
-        font_weight: Some(FontWeight::BOLD),
-        ..HighlightStyle::default()
-    }
-}
-
-fn italic_style(normal_color: Hsla) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(normal_color),
-        font_style: Some(FontStyle::Italic),
-        ..HighlightStyle::default()
-    }
-}
-
-fn strikethrough_style(normal_color: Hsla) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(normal_color),
-        strikethrough: Some(StrikethroughStyle {
-            thickness: px(1.),
-            color: None,
-        }),
-        ..HighlightStyle::default()
-    }
-}
-
-/// Color only — no weight/slant/underline — per the spec's "styled as a
-/// link (color, no underline by default)".
-fn link_style(color: Hsla) -> HighlightStyle {
-    HighlightStyle {
-        color: Some(color),
-        ..HighlightStyle::default()
+    let previous_keys = editor
+        .addon_mut::<VisualMdAddon>()
+        .map(|addon| std::mem::replace(&mut addon.callout_key_count, used_keys))
+        .unwrap_or(0);
+    for index in used_keys..previous_keys {
+        set_visual_md_highlight(
+            editor,
+            KEY_CALLOUT_FIRST + index,
+            Vec::new(),
+            HighlightStyle::default(),
+            cx,
+        );
     }
 }
 
@@ -2635,7 +2717,7 @@ fn link_style(color: Hsla) -> HighlightStyle {
 mod integration_tests {
     use super::*;
     use editor::test::editor_test_context::EditorTestContext;
-    use gpui::TestAppContext;
+    use gpui::{FontStyle, StrikethroughStyle, TestAppContext, rgb};
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -4131,14 +4213,478 @@ mod integration_tests {
                 status.hint_background,
             ),
         ] {
-            let look = cx.update(|_window, cx| callout_look(kind, cx));
-            assert_eq!(look, (icon, accent, background), "{needle}");
+            let type_name = needle.split(' ').next().unwrap_or_default();
+            let look = cx.update(|_window, cx| {
+                ResolvedStyle::resolve(&Default::default(), cx).callout_look(kind, type_name)
+            });
+            assert_eq!(
+                (look.icon_path.as_ref(), look.accent, look.background),
+                (icon, accent, background),
+                "{needle}"
+            );
             assert_eq!(
                 style_at(&mut cx, needle).background_color,
                 Some(background),
                 "{needle}"
             );
         }
+    }
+
+    fn set_visual_md(cx: &mut EditorTestContext, visual_md: settings::VisualMdSettingsContent) {
+        update_user_settings(cx, |content| {
+            content.project.all_languages.defaults.visual_md = Some(visual_md);
+        });
+    }
+
+    fn hex(color: &str) -> Hsla {
+        theme::try_parse_color(color).expect("test colors are valid hex")
+    }
+
+    fn colors(colors: settings::VisualMdColorsContent) -> settings::VisualMdSettingsContent {
+        settings::VisualMdSettingsContent {
+            colors: Some(colors),
+            ..Default::default()
+        }
+    }
+
+    /// Replaces the active theme's `syntax` map with just these tokens.
+    fn set_theme_tokens(cx: &mut EditorTestContext, tokens: Vec<(&str, HighlightStyle)>) {
+        use theme::ActiveTheme as _;
+        cx.update(|_window, cx| {
+            let mut theme = (**cx.theme()).clone();
+            theme.styles.syntax = Arc::new(theme::SyntaxTheme::new(
+                tokens
+                    .into_iter()
+                    .map(|(name, style)| (name.to_string(), style)),
+            ));
+            theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        });
+        cx.run_until_parked();
+    }
+
+    fn token_color(color: &str) -> HighlightStyle {
+        HighlightStyle {
+            color: Some(hex(color)),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    async fn font_settings_restyle_a_running_editor(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        set_visual_md(
+            &mut cx,
+            settings::VisualMdSettingsContent {
+                prose_font_family: Some("Prose Font".to_string().into()),
+                prose_font_weight: Some(settings::FontWeightContent(300.)),
+                code_font_family: Some("Code Font".to_string().into()),
+                heading_font_family: Some("Heading Font".to_string().into()),
+                heading_sizes: Some(settings::VisualMdHeadingSizesContent {
+                    h1: Some(settings::HeadingScale(2.5)),
+                    ..Default::default()
+                }),
+                heading_weights: Some(settings::VisualMdHeadingWeightsContent {
+                    h2: Some(settings::FontWeightContent(500.)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let plain = style_at(&mut cx, "plain");
+        assert_eq!(family_name(&plain), Some("Prose Font".to_string()));
+        assert_eq!(plain.font_weight, Some(FontWeight(300.)));
+
+        let heading = style_at(&mut cx, "One");
+        assert_eq!(family_name(&heading), Some("Heading Font".to_string()));
+        assert_eq!(heading.font_size_scale, Some(2.5));
+        assert_eq!(heading.font_weight, Some(FontWeight::BOLD));
+        assert_eq!(style_at(&mut cx, "Two").font_weight, Some(FontWeight(500.)));
+        assert_eq!(style_at(&mut cx, "Three").font_size_scale, Some(1.3));
+
+        // Bold keeps its own weight over the prose weight, and code gets the
+        // buffer font's weight back instead of the prose weight.
+        assert_eq!(
+            style_at(&mut cx, "bold").font_weight,
+            Some(FontWeight::BOLD)
+        );
+        let buffer_weight = cx.update(|_window, cx| {
+            theme_settings::ThemeSettings::get_global(cx)
+                .buffer_font
+                .weight
+        });
+        let inline_code = style_at(&mut cx, "code");
+        assert_eq!(family_name(&inline_code), Some("Code Font".to_string()));
+        assert_eq!(inline_code.font_weight, Some(buffer_weight));
+
+        set_visual_md(&mut cx, Default::default());
+        let plain = style_at(&mut cx, "plain");
+        assert_eq!(plain.font_weight, None);
+        assert_eq!(style_at(&mut cx, "One").font_size_scale, Some(1.8));
+    }
+
+    #[gpui::test]
+    async fn color_settings_restyle_a_running_editor(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                heading: Some("#101010".into()),
+                heading_2: Some("#202020".into()),
+                bold: Some("#303030".into()),
+                italic: Some("#404040".into()),
+                strikethrough: Some("#505050".into()),
+                link: Some("#606060".into()),
+                inline_code: Some("#707070".into()),
+                inline_code_background: Some("#80808080".into()),
+                highlight_background: Some("#909090".into()),
+                code_block_background: Some("#a0a0a0".into()),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(style_at(&mut cx, "One").color, Some(hex("#101010")));
+        assert_eq!(style_at(&mut cx, "Two").color, Some(hex("#202020")));
+        assert_eq!(style_at(&mut cx, "Three").color, Some(hex("#101010")));
+        assert_eq!(style_at(&mut cx, "bold").color, Some(hex("#303030")));
+        assert_eq!(style_at(&mut cx, "italic").color, Some(hex("#404040")));
+        assert_eq!(style_at(&mut cx, "struck").color, Some(hex("#505050")));
+        assert_eq!(style_at(&mut cx, "link text").color, Some(hex("#606060")));
+        let inline_code = style_at(&mut cx, "code");
+        assert_eq!(inline_code.color, Some(hex("#707070")));
+        assert_eq!(inline_code.background_color, Some(hex("#80808080")));
+        assert_eq!(
+            style_at(&mut cx, "marked").background_color,
+            Some(hex("#909090"))
+        );
+        assert_eq!(
+            style_at(&mut cx, "fenced").background_color,
+            Some(hex("#a0a0a0"))
+        );
+
+        set_visual_md(&mut cx, Default::default());
+        assert_eq!(style_at(&mut cx, "link text").color, {
+            use theme::ActiveTheme as _;
+            Some(cx.update(|_window, cx| cx.theme().colors().link_text_hover))
+        });
+        assert_eq!(style_at(&mut cx, "code").color, None);
+        assert_eq!(style_at(&mut cx, "marked").background_color, None);
+    }
+
+    #[gpui::test]
+    async fn invalid_color_values_are_ignored(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+        let mut cx = styling_context(cx).await;
+        let link_default = cx.update(|_window, cx| cx.theme().colors().link_text_hover);
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                link: Some("not a color".into()),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(style_at(&mut cx, "link text").color, Some(link_default));
+    }
+
+    #[gpui::test]
+    async fn theme_tokens_restyle_an_editor_and_settings_beat_them(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+        let mut cx = styling_context(cx).await;
+        let link_default = cx.update(|_window, cx| cx.theme().colors().link_text_hover);
+        assert_eq!(style_at(&mut cx, "link text").color, Some(link_default));
+
+        set_theme_tokens(
+            &mut cx,
+            vec![
+                ("visual_md.link", token_color("#0000ff")),
+                ("visual_md.heading", token_color("#00ff00")),
+                ("visual_md.heading.3", token_color("#00ffff")),
+                (
+                    "visual_md.inline_code",
+                    HighlightStyle {
+                        color: Some(hex("#ff00ff")),
+                        background_color: Some(hex("#11223344")),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "visual_md.callout.note",
+                    HighlightStyle {
+                        color: Some(hex("#ff0000")),
+                        background_color: Some(hex("#ffff0055")),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(style_at(&mut cx, "link text").color, Some(hex("#0000ff")));
+        assert_eq!(style_at(&mut cx, "One").color, Some(hex("#00ff00")));
+        assert_eq!(style_at(&mut cx, "Three").color, Some(hex("#00ffff")));
+        let inline_code = style_at(&mut cx, "code");
+        assert_eq!(inline_code.color, Some(hex("#ff00ff")));
+        assert_eq!(inline_code.background_color, Some(hex("#11223344")));
+        assert_eq!(
+            style_at(&mut cx, "note body").background_color,
+            Some(hex("#ffff0055"))
+        );
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                link: Some("#abcdef".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(style_at(&mut cx, "link text").color, Some(hex("#abcdef")));
+        assert_eq!(style_at(&mut cx, "One").color, Some(hex("#00ff00")));
+    }
+
+    #[gpui::test]
+    async fn changing_font_settings_restyles_without_an_edit(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        update_user_settings(&mut cx, |content| {
+            content.theme.ui_font_family = Some("Changed UI Font".to_string().into());
+        });
+
+        assert_eq!(
+            family_name(&style_at(&mut cx, "plain")),
+            Some("Changed UI Font".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn prose_size_and_line_height_refine_the_editor_and_follow_zoom(cx: &mut TestAppContext) {
+        use gpui::{AbsoluteLength, relative};
+        let mut cx = styling_context(cx).await;
+        let refinement = |cx: &mut EditorTestContext| {
+            cx.update_editor(|editor, _window, _cx| editor.text_style_refinement().cloned())
+        };
+        assert_eq!(refinement(&mut cx), None);
+
+        set_visual_md(
+            &mut cx,
+            settings::VisualMdSettingsContent {
+                prose_font_size: Some(settings::FontSize(20.)),
+                prose_line_height: Some(settings::BufferLineHeight::Custom(1.5)),
+                ..Default::default()
+            },
+        );
+        let applied = refinement(&mut cx).expect("a prose size applies a refinement");
+        assert_eq!(applied.font_size, Some(AbsoluteLength::Pixels(px(20.))));
+        assert_eq!(applied.line_height, Some(relative(1.5)));
+
+        cx.update(|_window, cx| {
+            theme_settings::adjust_buffer_font_size(cx, |size| size + px(2.));
+        });
+        cx.run_until_parked();
+        let zoomed = refinement(&mut cx).expect("the refinement stays applied");
+        assert_eq!(zoomed.font_size, Some(AbsoluteLength::Pixels(px(22.))));
+
+        set_visual_md(&mut cx, Default::default());
+        assert_eq!(refinement(&mut cx), None);
+    }
+
+    #[gpui::test]
+    async fn zoom_leaves_the_refinement_alone_without_a_prose_size(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        cx.update(|_window, cx| {
+            theme_settings::adjust_buffer_font_size(cx, |size| size + px(2.));
+        });
+        cx.run_until_parked();
+
+        let refinement =
+            cx.update_editor(|editor, _window, _cx| editor.text_style_refinement().cloned());
+        assert_eq!(refinement, None);
+    }
+
+    #[gpui::test]
+    async fn an_existing_text_style_refinement_is_restored_when_live_preview_ends(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::AbsoluteLength;
+        let mut cx = styling_context(cx).await;
+        let original = TextStyleRefinement {
+            font_weight: Some(FontWeight(600.)),
+            ..Default::default()
+        };
+        cx.update_editor(|editor, _window, cx| {
+            editor.set_text_style_refinement(original.clone());
+            cx.notify();
+        });
+
+        set_visual_md(
+            &mut cx,
+            settings::VisualMdSettingsContent {
+                prose_font_size: Some(settings::FontSize(20.)),
+                ..Default::default()
+            },
+        );
+        let refined =
+            cx.update_editor(|editor, _window, _cx| editor.text_style_refinement().cloned());
+        let refined = refined.expect("the refinement is applied");
+        assert_eq!(refined.font_weight, Some(FontWeight(600.)));
+        assert_eq!(refined.font_size, Some(AbsoluteLength::Pixels(px(20.))));
+
+        cx.dispatch_action(ToggleLivePreview);
+        cx.run_until_parked();
+        let restored =
+            cx.update_editor(|editor, _window, _cx| editor.text_style_refinement().cloned());
+        assert_eq!(restored, Some(original));
+    }
+
+    #[gpui::test]
+    async fn code_font_size_scales_inline_code_and_code_blocks_against_prose(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = styling_context(cx).await;
+        let buffer_size = cx.update(|_window, cx| {
+            f32::from(theme_settings::ThemeSettings::get_global(cx).buffer_font_size(cx))
+        });
+
+        set_visual_md(
+            &mut cx,
+            settings::VisualMdSettingsContent {
+                prose_font_size: Some(settings::FontSize(16.)),
+                code_font_size: Some(settings::FontSize(12.)),
+                ..Default::default()
+            },
+        );
+        let expected = 12.0 / 16.0;
+        assert_eq!(
+            style_at(&mut cx, "code").run_font_size_scale,
+            Some(expected)
+        );
+        assert_eq!(style_at(&mut cx, "fenced").font_size_scale, Some(expected));
+        let plain = style_at(&mut cx, "plain");
+        assert_eq!(plain.run_font_size_scale, None);
+        assert_eq!(plain.font_size_scale, None);
+
+        // With no code size, code keeps the buffer size while prose changes.
+        set_visual_md(
+            &mut cx,
+            settings::VisualMdSettingsContent {
+                prose_font_size: Some(settings::FontSize(16.)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            style_at(&mut cx, "code").run_font_size_scale,
+            Some(buffer_size / 16.0)
+        );
+
+        set_visual_md(&mut cx, Default::default());
+        assert_eq!(style_at(&mut cx, "code").run_font_size_scale, None);
+        assert_eq!(style_at(&mut cx, "fenced").font_size_scale, None);
+    }
+
+    #[gpui::test]
+    async fn custom_callout_types_get_their_own_look(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+        let mut cx = styling_context(cx).await;
+        let hint_background = cx.update(|_window, cx| cx.theme().status().hint_background);
+        assert_eq!(
+            style_at(&mut cx, "custom body").background_color,
+            Some(hint_background)
+        );
+
+        set_visual_md(
+            &mut cx,
+            settings::VisualMdSettingsContent {
+                callouts: Some(
+                    [(
+                        "Custom".to_string(),
+                        settings::VisualMdCalloutContent {
+                            icon: Some("star".to_string()),
+                            accent: Some("#ff0000".into()),
+                            background: Some("#00ff0080".into()),
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                colors: Some(settings::VisualMdColorsContent {
+                    callout: Some(
+                        [(
+                            "note".to_string(),
+                            settings::VisualMdCalloutColorsContent {
+                                accent: None,
+                                background: Some("#0000ff80".into()),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            style_at(&mut cx, "custom body").background_color,
+            Some(hex("#00ff0080"))
+        );
+        assert_eq!(
+            style_at(&mut cx, "note body").background_color,
+            Some(hex("#0000ff80"))
+        );
+        let tip_background = cx.update(|_window, cx| cx.theme().status().success_background);
+        assert_eq!(
+            style_at(&mut cx, "tip body").background_color,
+            Some(tip_background)
+        );
+
+        let look = cx.update_editor(|editor, _window, cx| {
+            let settings = editor
+                .buffer()
+                .read(cx)
+                .language_settings_at(MultiBufferOffset(0), cx);
+            ResolvedStyle::resolve(&settings.visual_md, cx)
+                .callout_look(CalloutKind::Other, "custom")
+        });
+        assert_eq!(
+            look.icon_path.as_ref(),
+            icons::IconName::Star.path().as_ref()
+        );
+        assert_eq!(look.accent, hex("#ff0000"));
+
+        set_visual_md(&mut cx, Default::default());
+        assert_eq!(
+            style_at(&mut cx, "custom body").background_color,
+            Some(hint_background)
+        );
+    }
+
+    #[gpui::test]
+    async fn an_unknown_callout_icon_falls_back_to_the_kind_icon(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        let look = cx.update(|_window, cx| {
+            let content = settings::VisualMdSettingsContent {
+                callouts: Some(
+                    [(
+                        "note".to_string(),
+                        settings::VisualMdCalloutContent {
+                            icon: Some("definitely_not_an_icon".to_string()),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            };
+            ResolvedStyle::resolve(&content, cx).callout_look(CalloutKind::Note, "note")
+        });
+
+        assert_eq!(look.icon_path.as_ref(), "icons/info.svg");
     }
 
     /// Exercises the M11 callout title widget through a real `refresh()`,
