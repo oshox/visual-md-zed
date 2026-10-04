@@ -757,6 +757,7 @@ impl WindowTextSystem {
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let mut font_sizes = SmallVec::<[Pixels; 8]>::new();
 
         let mut lines = SmallVec::new();
         let mut max_wrap_lines = line_clamp;
@@ -764,6 +765,7 @@ impl WindowTextSystem {
 
         let mut process_line = |line_text: SharedString, line_start, line_end| {
             font_runs.clear();
+            font_sizes.clear();
 
             let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
             let mut run_start = line_start;
@@ -795,9 +797,11 @@ impl WindowTextSystem {
                 };
 
                 let font_id = self.resolve_font(&run.font);
+                let run_font_size = run.font_size.unwrap_or(font_size);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
                     && !decoration_changed
+                    && font_sizes.last() == Some(&run_font_size)
                 {
                     font_run.len += run_len_within_line;
                 } else {
@@ -805,6 +809,7 @@ impl WindowTextSystem {
                         len: run_len_within_line,
                         font_id,
                     });
+                    font_sizes.push(run_font_size);
                 }
 
                 // Preserve the remainder of the run for the next line
@@ -815,10 +820,15 @@ impl WindowTextSystem {
                 run_start += run_len_within_line;
             }
 
+            if font_sizes.iter().all(|size| *size == font_size) {
+                font_sizes.clear();
+            }
+
             let layout = self.line_layout_cache.layout_wrapped_line(
                 &line_text,
                 font_size,
                 &font_runs,
+                &font_sizes,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
             );
@@ -879,20 +889,19 @@ impl WindowTextSystem {
         self.line_layout_cache.finish_frame()
     }
 
-    /// Layout the given line of text, at the given font_size.
-    /// Subsets of the line can be styled independently with the `runs` parameter.
-    /// Generally, you should prefer to use [`Self::shape_line`] instead, which
-    /// can be painted directly.
-    pub fn layout_line(
+    /// Converts `runs` into the platform's per-font runs, merging neighbors that
+    /// share a font, decoration and size. `font_sizes` ends up parallel to
+    /// `font_runs`, or empty when every run is at `font_size`.
+    fn push_font_runs(
         &self,
-        text: &str,
-        font_size: Pixels,
         runs: &[TextRun],
-        force_width: Option<Pixels>,
-    ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        font_size: Pixels,
+        font_runs: &mut Vec<FontRun>,
+        font_sizes: &mut SmallVec<[Pixels; 8]>,
+    ) {
         font_runs.clear();
+        font_sizes.clear();
+        let mut last_run = None::<&TextRun>;
 
         for run in runs.iter() {
             let decoration_changed = if let Some(last_run) = last_run
@@ -909,9 +918,11 @@ impl WindowTextSystem {
             };
 
             let font_id = self.resolve_font(&run.font);
+            let run_font_size = run.font_size.unwrap_or(font_size);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
                 && !decoration_changed
+                && font_sizes.last() == Some(&run_font_size)
             {
                 font_run.len += run.len;
             } else {
@@ -919,13 +930,35 @@ impl WindowTextSystem {
                     len: run.len,
                     font_id,
                 });
+                font_sizes.push(run_font_size);
             }
         }
+
+        if font_sizes.iter().all(|size| *size == font_size) {
+            font_sizes.clear();
+        }
+    }
+
+    /// Layout the given line of text, at the given font_size.
+    /// Subsets of the line can be styled independently with the `runs` parameter.
+    /// Generally, you should prefer to use [`Self::shape_line`] instead, which
+    /// can be painted directly.
+    pub fn layout_line(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        force_width: Option<Pixels>,
+    ) -> Arc<LineLayout> {
+        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
+        let mut font_sizes = SmallVec::<[Pixels; 8]>::new();
+        self.push_font_runs(runs, font_size, &mut font_runs, &mut font_sizes);
 
         let layout = self.line_layout_cache.layout_line(
             &SharedString::new(text),
             font_size,
             &font_runs,
+            &font_sizes,
             force_width,
         );
 
@@ -946,6 +979,7 @@ impl WindowTextSystem {
                     len: buffer.len(),
                     font_id,
                 }],
+                &[],
                 None,
             )
             .width
@@ -972,43 +1006,16 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
-        let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        let mut font_sizes = SmallVec::<[Pixels; 8]>::new();
+        self.push_font_runs(runs, font_size, &mut font_runs, &mut font_sizes);
 
         let layout = self.line_layout_cache.try_layout_line_by_hash(
             text_hash,
             text_len,
             font_size,
             &font_runs,
+            &font_sizes,
             force_width,
         );
 
@@ -1034,43 +1041,16 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
+        let mut font_sizes = SmallVec::<[Pixels; 8]>::new();
+        self.push_font_runs(runs, font_size, &mut font_runs, &mut font_sizes);
 
         let layout = self.line_layout_cache.layout_line_by_hash(
             text_hash,
             text_len,
             font_size,
             &font_runs,
+            &font_sizes,
             force_width,
             materialize_text,
         );
@@ -1238,6 +1218,10 @@ pub struct TextRun {
     pub underline: Option<UnderlineStyle>,
     /// The strikethrough style (if any)
     pub strikethrough: Option<StrikethroughStyle>,
+    /// An absolute font size for this run. `None` uses the size the line is
+    /// shaped at. A line whose runs have different sizes is shaped in
+    /// segments, so kerning and ligatures do not span a size change.
+    pub font_size: Option<Pixels>,
 }
 
 #[cfg(all(target_os = "macos", test))]
@@ -1501,5 +1485,84 @@ mod missing_glyph_tests {
 
     fn missing_glyph(grapheme: &'static str) -> MissingGlyph {
         MissingGlyph::new(grapheme.into(), FallbackFontClass::Proportional)
+    }
+}
+
+#[cfg(test)]
+mod font_size_tests {
+    use super::*;
+    use crate::NoopTextSystem;
+
+    fn window_text_system() -> WindowTextSystem {
+        WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(NoopTextSystem::new()))))
+    }
+
+    fn run(len: usize, font_size: Option<Pixels>) -> TextRun {
+        TextRun {
+            len,
+            font_size,
+            ..Default::default()
+        }
+    }
+
+    fn font_runs_for(runs: &[TextRun], font_size: Pixels) -> (Vec<FontRun>, SmallVec<[Pixels; 8]>) {
+        let text_system = window_text_system();
+        let mut font_runs = Vec::new();
+        let mut font_sizes = SmallVec::new();
+        text_system.push_font_runs(runs, font_size, &mut font_runs, &mut font_sizes);
+        (font_runs, font_sizes)
+    }
+
+    #[test]
+    fn runs_of_different_sizes_do_not_merge() {
+        let (font_runs, font_sizes) = font_runs_for(&[run(2, None), run(2, Some(px(8.)))], px(10.));
+
+        assert_eq!(
+            font_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+        assert_eq!(font_sizes.to_vec(), vec![px(10.), px(8.)]);
+    }
+
+    #[test]
+    fn runs_of_the_same_size_still_merge() {
+        let (font_runs, font_sizes) =
+            font_runs_for(&[run(2, None), run(2, Some(px(10.)))], px(10.));
+
+        assert_eq!(
+            font_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(font_sizes.is_empty());
+    }
+
+    #[test]
+    fn lines_without_size_overrides_keep_sizes_empty() {
+        let (font_runs, font_sizes) = font_runs_for(&[run(2, None), run(3, None)], px(10.));
+
+        assert_eq!(font_runs.len(), 1);
+        assert!(font_sizes.is_empty());
+    }
+
+    #[test]
+    fn shape_text_wraps_a_mixed_size_line_by_glyph_position() {
+        let text_system = window_text_system();
+        let text: SharedString = "aaaa bbbb".into();
+
+        let uniform = text_system
+            .shape_text(text.clone(), px(10.), &[run(9, None)], Some(px(60.)), None)
+            .expect("uniform text should shape");
+        assert_eq!(uniform[0].layout.wrap_boundaries.len(), 0);
+
+        let mixed = text_system
+            .shape_text(
+                text,
+                px(10.),
+                &[run(5, None), run(4, Some(px(20.)))],
+                Some(px(60.)),
+                None,
+            )
+            .expect("mixed text should shape");
+        assert_eq!(mixed[0].layout.wrap_boundaries.len(), 1);
     }
 }

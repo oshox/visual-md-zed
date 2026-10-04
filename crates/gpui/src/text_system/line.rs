@@ -99,6 +99,7 @@ impl ShapedLine {
             ascent: layout.ascent,
             descent: layout.descent,
             runs: layout.runs.clone(),
+            run_font_sizes: layout.run_font_sizes.clone(),
             len,
         });
         self
@@ -302,6 +303,8 @@ impl<'a> ShapedLineCursor<'a> {
             return piece;
         }
         let mut runs = Vec::new();
+        let mut run_font_sizes = Vec::new();
+        let has_run_font_sizes = !self.line.layout.run_font_sizes.is_empty();
         let mut next_x = self.line.layout.width;
         while let Some(run) = self.line.layout.runs.get(self.run_index) {
             let start = self.glyph_index;
@@ -325,6 +328,9 @@ impl<'a> ShapedLineCursor<'a> {
                         })
                         .collect(),
                 });
+                if has_run_font_sizes {
+                    run_font_sizes.push(self.line.layout.run_font_size(self.run_index));
+                }
             }
             if let Some(glyph) = run.glyphs.get(self.glyph_index) {
                 next_x = glyph.position.x;
@@ -366,6 +372,7 @@ impl<'a> ShapedLineCursor<'a> {
                 ascent: self.line.layout.ascent,
                 descent: self.line.layout.descent,
                 runs,
+                run_font_sizes,
                 len: byte_index - previous_index,
             }),
             text: SharedString::new(&self.line.text[previous_index..byte_index]),
@@ -570,7 +577,8 @@ fn paint_line(
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            let run_font_size = layout.run_font_size(run_ix);
+            max_glyph_size = text_system.bounding_box(run.font_id, run_font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -736,14 +744,14 @@ fn paint_line(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run_font_size,
                         )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run_font_size,
                             color,
                         )?;
                     }
@@ -827,7 +835,8 @@ fn paint_line_background(
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
-            max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
+            let run_font_size = layout.run_font_size(run_ix);
+            max_glyph_size = text_system.bounding_box(run.font_id, run_font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
@@ -1036,6 +1045,7 @@ mod tests {
         ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
+                run_font_sizes: Vec::new(),
                 width: px(width),
                 ascent: px(12.0),
                 descent: px(4.0),
@@ -1482,6 +1492,7 @@ mod tests {
         let line = ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
+                run_font_sizes: Vec::new(),
                 width: px(60.0),
                 ascent: px(12.0),
                 descent: px(4.0),
@@ -1701,6 +1712,7 @@ mod tests {
         }
         line.layout = Arc::new(LineLayout {
             font_size: layout.font_size,
+            run_font_sizes: Vec::new(),
             width,
             ascent: layout.ascent,
             descent: layout.descent,
@@ -1728,6 +1740,7 @@ mod tests {
         let line = ShapedLine {
             layout: Arc::new(LineLayout {
                 font_size: px(16.0),
+                run_font_sizes: Vec::new(),
                 width: px(50.0),
                 ascent: px(12.0),
                 descent: px(4.0),

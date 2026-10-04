@@ -923,6 +923,7 @@ impl TerminalElement {
             },
             underline,
             strikethrough,
+            font_size: None,
         };
 
         if let Some((style, range)) = hyperlink

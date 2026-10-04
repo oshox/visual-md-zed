@@ -766,6 +766,7 @@ impl CosmicTextSystemState {
                 descent: Pixels::ZERO,
                 runs: Vec::new(),
                 len: text.len(),
+                ..Default::default()
             };
         };
 
@@ -838,6 +839,7 @@ impl CosmicTextSystemState {
             descent: layout.max_descent.into(),
             runs,
             len: text.len(),
+            ..Default::default()
         }
     }
 
@@ -1312,6 +1314,61 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1].len(), "\u{05d0}\u{001c}A".len());
         assert!(lines[1].width() > Pixels::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn shape_line_shapes_runs_of_different_sizes_at_their_own_size() -> Result<()> {
+        let platform_text_system = Arc::new(text_system()?);
+        let text_system = Arc::new(gpui::TextSystem::new(platform_text_system));
+        let window_text_system = gpui::WindowTextSystem::new(text_system);
+        let font = gpui::font("IBM Plex Sans");
+        let run = |len: usize, font_size: Option<Pixels>| gpui::TextRun {
+            len,
+            font: font.clone(),
+            font_size,
+            ..Default::default()
+        };
+
+        let mixed = window_text_system.shape_line(
+            "Hello code".into(),
+            gpui::px(14.0),
+            &[run(6, None), run(4, Some(gpui::px(11.0)))],
+            None,
+        );
+        let prefix =
+            window_text_system.shape_line("Hello ".into(), gpui::px(14.0), &[run(6, None)], None);
+        let suffix =
+            window_text_system.shape_line("code".into(), gpui::px(11.0), &[run(4, None)], None);
+        let uniform = window_text_system.shape_line(
+            "Hello code".into(),
+            gpui::px(14.0),
+            &[run(10, None)],
+            None,
+        );
+
+        assert_eq!(mixed.run_font_sizes, vec![gpui::px(14.0), gpui::px(11.0)]);
+        assert!((mixed.width() - (prefix.width() + suffix.width())).abs() < gpui::px(0.01));
+        assert!(mixed.width() < uniform.width());
+        assert_eq!(mixed.ascent, uniform.ascent);
+        assert_eq!(mixed.descent, uniform.descent);
+
+        let positions: Vec<Pixels> = mixed
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| glyph.position.x)
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(
+            mixed
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter())
+                .last()
+                .map(|glyph| glyph.index),
+            Some("Hello code".len() - 1)
+        );
         Ok(())
     }
 

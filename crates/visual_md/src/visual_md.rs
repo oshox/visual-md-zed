@@ -2025,6 +2025,7 @@ fn table_alignment_spacer_folds(
             background_color: None,
             underline: None,
             strikethrough: None,
+            font_size: None,
         };
         let shaped = window.text_system().shape_line(
             SharedString::from(cell_text.to_string()),

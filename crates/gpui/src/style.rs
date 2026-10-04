@@ -575,6 +575,9 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
+            // `font_size` is deliberately not forwarded: callers such as
+            // markdown set a style `font_size` that has never affected shaping.
+            font_size: None,
         }
     }
 }
