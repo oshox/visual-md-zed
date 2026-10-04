@@ -3932,6 +3932,208 @@ mod integration_tests {
         cx.assert_editor_state("Hello **«worldˇ»** now\n");
     }
 
+    /// The style the editor paints at `offset`: visual_md's highlight keys
+    /// merged in ascending order, a later key winning each field, exactly as
+    /// `CustomHighlightsChunks` does. Asserting on the merged result rather
+    /// than on individual keys keeps these golden tests valid when keys are
+    /// renumbered.
+    fn merged_visual_md_style(editor: &Editor, offset: usize, cx: &App) -> HighlightStyle {
+        use editor::ToOffset as _;
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        (0..2048)
+            .filter_map(|key| editor.text_highlights(HighlightKey::VisualMd(key), cx))
+            .fold(HighlightStyle::default(), |merged, (style, ranges)| {
+                let covers_offset = ranges.iter().any(|range| {
+                    range.start.to_offset(&snapshot).0 <= offset
+                        && offset < range.end.to_offset(&snapshot).0
+                });
+                if covers_offset {
+                    merged.highlight(style)
+                } else {
+                    merged
+                }
+            })
+    }
+
+    const STYLING_FIXTURE: &str = "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n\n\
+        plain **bold** *italic* ~~struck~~ [link text](https://example.com) `code` ==marked==\n\n\
+        ```rust\nlet fenced = 1;\n```\n\n\
+        > [!note]\n> note body\n\n\
+        > [!tip]\n> tip body\n\n\
+        > [!warning]\n> warning body\n\n\
+        > [!danger]\n> danger body\n\n\
+        > [!custom]\n> custom body\n\n\
+        tailˇ\n";
+
+    async fn styling_context(cx: &mut TestAppContext) -> EditorTestContext {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state(STYLING_FIXTURE);
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx
+    }
+
+    fn style_at(cx: &mut EditorTestContext, needle: &str) -> HighlightStyle {
+        let offset = cx
+            .buffer_text()
+            .find(needle)
+            .unwrap_or_else(|| panic!("fixture has no {needle:?}"));
+        cx.update_editor(|editor, _window, cx| merged_visual_md_style(editor, offset, cx))
+    }
+
+    fn family_name(style: &HighlightStyle) -> Option<String> {
+        style.font_family.map(|family| family.as_str().to_string())
+    }
+
+    #[gpui::test]
+    async fn styling_of_prose_headings_and_emphasis_is_pinned(cx: &mut TestAppContext) {
+        use theme::ActiveTheme;
+        let mut cx = styling_context(cx).await;
+        let (foreground, ui_family, buffer_family) = cx.update(|_window, cx| {
+            let settings = theme_settings::ThemeSettings::get_global(cx);
+            (
+                cx.theme().colors().editor_foreground,
+                settings.ui_font.family.to_string(),
+                settings.buffer_font.family.to_string(),
+            )
+        });
+
+        let plain = style_at(&mut cx, "plain");
+        assert_eq!(family_name(&plain), Some(ui_family.clone()));
+        assert_eq!(plain.color, None);
+        assert_eq!(plain.font_weight, None);
+        assert_eq!(plain.font_size_scale, None);
+
+        for (needle, scale) in [
+            ("One", 1.8),
+            ("Two", 1.5),
+            ("Three", 1.3),
+            ("Four", 1.15),
+            ("Five", 1.05),
+            ("Six", 1.0),
+        ] {
+            let style = style_at(&mut cx, needle);
+            assert_eq!(style.color, Some(foreground), "{needle}");
+            assert_eq!(style.font_weight, Some(FontWeight::BOLD), "{needle}");
+            assert_eq!(style.font_size_scale, Some(scale), "{needle}");
+            assert_eq!(style.background_color, None, "{needle}");
+            assert_eq!(family_name(&style), Some(ui_family.clone()), "{needle}");
+        }
+
+        let bold = style_at(&mut cx, "bold");
+        assert_eq!(bold.color, Some(foreground));
+        assert_eq!(bold.font_weight, Some(FontWeight::BOLD));
+        assert_eq!(bold.font_style, None);
+        assert_eq!(bold.font_size_scale, None);
+
+        let italic = style_at(&mut cx, "italic");
+        assert_eq!(italic.color, Some(foreground));
+        assert_eq!(italic.font_style, Some(FontStyle::Italic));
+        assert_eq!(italic.font_weight, None);
+
+        let struck = style_at(&mut cx, "struck");
+        assert_eq!(struck.color, Some(foreground));
+        assert_eq!(
+            struck.strikethrough,
+            Some(StrikethroughStyle {
+                thickness: px(1.),
+                color: None,
+            })
+        );
+
+        let link = style_at(&mut cx, "link text");
+        assert_eq!(
+            link.color,
+            Some(cx.update(|_window, cx| cx.theme().colors().link_text_hover))
+        );
+        assert_eq!(link.font_weight, None);
+
+        let inline_code = style_at(&mut cx, "code");
+        assert_eq!(family_name(&inline_code), Some(buffer_family.clone()));
+        assert_eq!(inline_code.color, None);
+        assert_eq!(inline_code.background_color, None);
+        assert_eq!(inline_code.font_size_scale, None);
+
+        let marked = style_at(&mut cx, "marked");
+        assert_eq!(marked.color, None);
+        assert_eq!(marked.background_color, None);
+
+        let fenced = style_at(&mut cx, "fenced");
+        assert_eq!(family_name(&fenced), Some(buffer_family));
+        assert_eq!(fenced.background_color, None);
+    }
+
+    #[gpui::test]
+    async fn touched_marker_dims_to_a_fixed_gray(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("# Hˇeading\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            let (style, ranges) = editor
+                .text_highlights(HighlightKey::VisualMd(KEY_DIMMED_MARKER), cx)
+                .expect("the touched heading marker should be dimmed");
+            assert_eq!(style.color, Some(rgb(0x6b7280).into()));
+            assert!(!ranges.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn callout_looks_are_pinned(cx: &mut TestAppContext) {
+        use theme::ActiveTheme;
+        let mut cx = styling_context(cx).await;
+        let status = cx.update(|_window, cx| cx.theme().status().clone());
+
+        for (needle, kind, icon, accent, background) in [
+            (
+                "note body",
+                CalloutKind::Note,
+                "icons/info.svg",
+                status.info,
+                status.info_background,
+            ),
+            (
+                "tip body",
+                CalloutKind::Tip,
+                "icons/sparkle.svg",
+                status.success,
+                status.success_background,
+            ),
+            (
+                "warning body",
+                CalloutKind::Warning,
+                "icons/warning.svg",
+                status.warning,
+                status.warning_background,
+            ),
+            (
+                "danger body",
+                CalloutKind::Danger,
+                "icons/x_circle_filled.svg",
+                status.error,
+                status.error_background,
+            ),
+            (
+                "custom body",
+                CalloutKind::Other,
+                "icons/quote.svg",
+                status.hint,
+                status.hint_background,
+            ),
+        ] {
+            let look = cx.update(|_window, cx| callout_look(kind, cx));
+            assert_eq!(look, (icon, accent, background), "{needle}");
+            assert_eq!(
+                style_at(&mut cx, needle).background_color,
+                Some(background),
+                "{needle}"
+            );
+        }
+    }
+
     /// Exercises the M11 callout title widget through a real `refresh()`,
     /// confirming an untouched callout renders its icon/chevron/label chip
     /// (`collapsed_text` is the capitalized label, e.g. "Warning" -- see
