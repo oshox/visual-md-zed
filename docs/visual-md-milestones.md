@@ -21,7 +21,7 @@ purpose even though the app is branded Zed MD.
 | M11 | Callout boxes | Done |
 | M12 | Inline images | Done |
 | M13 | Turn the editor off globally or per project, in settings.json and the settings UI | Done |
-| M14 | Full font and color customization, in settings.json, the settings UI and themes | Planned |
+| M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Planned |
 
 ## M13: On/off switch at global and project level
@@ -76,7 +76,9 @@ the user change them.
    `heading_font_family`. Leaving a key unset keeps today's behavior
    (UI font for prose, buffer font for code).
 2. **Heading scale:** `heading_sizes` (six multipliers for H1 to H6) and
-   per-level weight.
+   per-level weight. Both are objects with `h1` to `h6` keys rather than
+   arrays, because arrays overwrite as a whole when settings merge and the
+   settings UI writes one level at a time.
 3. **Colors in settings.json:** a `visual_md.colors` object with a key per
    element: `heading` (and `heading.1` to `heading.6`), `bold`, `italic`,
    `strikethrough`, `highlight.background`, `inline_code` and
@@ -100,6 +102,55 @@ the user change them.
 **Done when:** each key changes the running editor without a restart,
 unset keys match today's rendering exactly, and a theme can restyle the
 editor with no settings change.
+
+### As built
+
+**Precedence.** For every color: the `visual_md` setting (user, then project,
+then `languages.<Name>`), then the active theme's `visual_md.*` token, then
+the default live preview has always had. Fonts and sizes come from settings
+only, since a theme's `syntax` entries cannot carry them.
+
+**Theme tokens.** A setting key `x` is read from the theme as the `color` of
+the `syntax` token `visual_md.x`, and a key `x.background` as the
+`background_color` of that same token. So a theme styles inline code with one
+token, `visual_md.inline_code`, that has both. `heading.1` to `heading.6` fall
+back to `heading`. A callout type is one token too, `visual_md.callout.<type>`:
+its `color` is the accent and its `background_color` the background.
+
+**Fonts.**
+- `prose_font_family` defaults to the UI font, `code_font_family` to the
+  buffer font, and `heading_font_family` to the prose font.
+- `prose_font_size` and `prose_line_height` set the editor's own text style, so
+  soft wrap measures prose at the right size and the ctrl-scroll zoom keeps
+  working. An existing refinement of that style is saved and restored.
+- `code_font_size` sizes both inline code and fenced code blocks. Unset, code
+  keeps the buffer font size, so changing only the prose size does not change
+  code. Inline code is a different size from the prose around it through a
+  per-run font size in gpui.
+- `prose_font_weight` applies to prose only: code keeps the buffer font's
+  weight, and bold and headings keep their own.
+
+**Callout types.** The type written in `> [!name]` is matched case-insensitively.
+For the accent, background and icon, the first of these that is set wins:
+`callouts.<name>`, `colors.callout.<name>`, `colors.callout.<kind>` where the
+kind is `note`, `tip`, `warning`, `danger` or `other` (an alias such as `info`
+belongs to `note`), then the theme tokens for the name and the kind, then the
+kind's default. An icon is the snake_case name of one of Zed's icons, for
+example `check` or `star`; an unknown name keeps the kind's icon.
+
+**Limitations.**
+- `code_block.background` tints the code text, so it is ragged at the end of
+  each line, the same as a callout body. A full-width tint needs an editor API
+  that does not exist yet.
+- Kerning, ligatures and bidi reordering do not span a font size change, so a
+  line with inline code at another size is shaped in separate pieces.
+- Soft wrap measures a line at one size. Heading rows, which were already
+  wider than their measured width, and lines with inline code at another size
+  can wrap a little early or late.
+- A row of smaller text, such as code below the prose size, keeps the height
+  of a prose row, so smaller code is not denser.
+- The settings UI has no control for custom callout types, since it has no
+  editor for maps. Colors are hex text inputs with a swatch, not a picker.
 
 ## M15: Extension hooks
 
