@@ -620,6 +620,13 @@ pub struct HighlightStyle {
     /// sizing (see the editor's Zed MD heading support) reads this off any
     /// chunk on the row and picks that row's font size itself.
     pub font_size_scale: Option<f32>,
+
+    /// A multiplier applied to the font size of just the highlighted bytes,
+    /// relative to the size their row is shaped at (so it composes with
+    /// `font_size_scale`: inline code at `0.9` inside an H1 is `0.9` of the
+    /// heading size). A row's height grows to fit its largest run but never
+    /// shrinks below the editor's line height.
+    pub run_font_size_scale: Option<f32>,
 }
 
 /// An interned font family name.
@@ -665,6 +672,11 @@ impl Hash for HighlightStyle {
         ));
         state.write_u32(u32::from_be_bytes(
             self.font_size_scale
+                .map(|f| f.to_be_bytes())
+                .unwrap_or_default(),
+        ));
+        state.write_u32(u32::from_be_bytes(
+            self.run_font_size_scale
                 .map(|f| f.to_be_bytes())
                 .unwrap_or_default(),
         ));
@@ -963,6 +975,7 @@ impl From<&TextStyle> for HighlightStyle {
             strikethrough: other.strikethrough,
             fade_out: None,
             font_size_scale: None,
+            run_font_size_scale: None,
         }
     }
 }
@@ -1005,6 +1018,7 @@ impl HighlightStyle {
                 })
                 .or(self.fade_out),
             font_size_scale: other.font_size_scale.or(self.font_size_scale),
+            run_font_size_scale: other.run_font_size_scale.or(self.run_font_size_scale),
         }
     }
 }
@@ -1423,6 +1437,7 @@ mod tests {
             }),
             font_family: None,
             font_size_scale: None,
+            run_font_size_scale: None,
         };
         let expected_style = style_b;
 
@@ -1457,6 +1472,7 @@ mod tests {
             }),
             font_family: None,
             font_size_scale: None,
+            run_font_size_scale: None,
         };
 
         let expected_style = HighlightStyle {
@@ -1477,6 +1493,7 @@ mod tests {
             }),
             font_family: None,
             font_size_scale: None,
+            run_font_size_scale: None,
         };
 
         let style_c = style_c.highlight(style_d);

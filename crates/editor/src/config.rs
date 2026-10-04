@@ -29,6 +29,17 @@ impl Editor {
         self.text_style_refinement = Some(style);
     }
 
+    pub fn text_style_refinement(&self) -> Option<&TextStyleRefinement> {
+        self.text_style_refinement.as_ref()
+    }
+
+    /// Removes the refinement, so the editor renders with its base text style
+    /// again. Like [`Self::set_text_style_refinement`], this does not notify:
+    /// callers re-render the editor themselves.
+    pub fn clear_text_style_refinement(&mut self) {
+        self.text_style_refinement = None;
+    }
+
     /// called by the Element so we know what style we were most recently rendered with.
     pub fn set_style(&mut self, style: EditorStyle, window: &mut Window, cx: &mut Context<Self>) {
         // We intentionally do not inform the display map about the minimap style

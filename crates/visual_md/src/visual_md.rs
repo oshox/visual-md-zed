@@ -4063,6 +4063,10 @@ mod integration_tests {
         let fenced = style_at(&mut cx, "fenced");
         assert_eq!(family_name(&fenced), Some(buffer_family));
         assert_eq!(fenced.background_color, None);
+
+        let has_text_style_refinement =
+            cx.update_editor(|editor, _window, _cx| editor.text_style_refinement().is_some());
+        assert!(!has_text_style_refinement);
     }
 
     #[gpui::test]

@@ -490,7 +490,6 @@ impl StickyHeaderLine {
     ) -> Self {
         let mut elements = SmallVec::<[AnyElement; 1]>::new();
         line.prepaint_with_custom_offset(
-            line_height,
             scroll_pixel_position,
             content_origin,
             offset,
