@@ -183,9 +183,9 @@ pub struct LanguageSettings {
     pub word_diff_enabled: bool,
     /// Whether to use tree-sitter bracket queries to detect and colorize the brackets in the editor.
     pub colorize_brackets: bool,
-    /// Whether Markdown buffers are rendered with live preview instead of plain
-    /// source text.
-    pub visual_md_enabled: bool,
+    /// Settings for Markdown live preview. Options left unset keep the
+    /// rendering visual_md has without them.
+    pub visual_md: settings::VisualMdSettingsContent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -917,10 +917,7 @@ impl settings::Settings for AllLanguageSettings {
                 show_completions_on_input: settings.show_completions_on_input.unwrap(),
                 show_completion_documentation: settings.show_completion_documentation.unwrap(),
                 colorize_brackets: settings.colorize_brackets.unwrap(),
-                visual_md_enabled: settings
-                    .visual_md
-                    .and_then(|visual_md| visual_md.enabled)
-                    .unwrap_or(true),
+                visual_md: settings.visual_md.unwrap_or_default(),
                 completions: CompletionSettings {
                     words: completions.words.unwrap(),
                     words_min_length: completions.words_min_length.unwrap() as usize,
@@ -1320,14 +1317,122 @@ mod tests {
                 .unwrap_or(&settings.defaults);
             let case = format!("user: {user}, root: {project_root}, child: {project_child}");
             assert_eq!(
-                settings.defaults.visual_md_enabled, expected_default,
+                settings.defaults.visual_md.is_enabled(),
+                expected_default,
                 "default language, {case}"
             );
             assert_eq!(
-                markdown_settings.visual_md_enabled, expected_markdown,
+                markdown_settings.visual_md.is_enabled(),
+                expected_markdown,
                 "Markdown, {case}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn test_visual_md_style_settings_merge_per_key(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &settings::default_settings());
+        store.register_setting::<AllLanguageSettings>();
+        let worktree_id = WorktreeId::from_usize(1);
+        let markdown = LanguageName::from("Markdown");
+        let location = SettingsLocation {
+            worktree_id,
+            path: rel_path("root/child/file.md"),
+        };
+
+        let defaults = store
+            .get::<AllLanguageSettings>(None)
+            .defaults
+            .visual_md
+            .clone();
+        let heading_sizes = defaults
+            .heading_sizes
+            .as_ref()
+            .expect("default.json sets the heading sizes");
+        assert_eq!(heading_sizes.h1, Some(settings::HeadingScale(1.8)));
+        assert_eq!(heading_sizes.h6, Some(settings::HeadingScale(1.0)));
+        assert_eq!(
+            defaults
+                .heading_weights
+                .as_ref()
+                .and_then(|weights| weights.h3),
+            Some(settings::FontWeightContent(700.))
+        );
+        assert_eq!(defaults.prose_font_size, None);
+        assert_eq!(defaults.colors, Some(Default::default()));
+
+        store
+            .set_user_settings(
+                r##"{"visual_md": {
+                    "prose_font_size": 17,
+                    "colors": {"heading": "#aa0000", "inline_code.background": "#010203"},
+                    "callouts": {"todo": {"icon": "check"}}
+                }}"##,
+                cx,
+            )
+            .expect("user settings should load");
+        store
+            .set_local_settings(
+                worktree_id,
+                LocalSettingsPath::InWorktree(rel_path("root").into()),
+                LocalSettingsKind::Settings,
+                Some(
+                    r##"{
+                        "visual_md": {
+                            "heading_sizes": {"h2": 2.0},
+                            "colors": {"link": "#00aa00", "heading.1": "#ff0000"},
+                            "callouts": {"todo": {"accent": "#0000aa"}}
+                        },
+                        "languages": {"Markdown": {"visual_md": {"colors": {"heading": "#bbbbbb"}}}}
+                    }"##,
+                ),
+                cx,
+            )
+            .expect("project settings should load");
+        store
+            .set_local_settings(
+                worktree_id,
+                LocalSettingsPath::InWorktree(rel_path("root/child").into()),
+                LocalSettingsKind::Settings,
+                Some(r##"{"visual_md": {"prose_font_size": 20, "code_font_size": 12}}"##),
+                cx,
+            )
+            .expect("child settings should load");
+
+        let settings = store.get::<AllLanguageSettings>(Some(location));
+        let default_language = &settings.defaults.visual_md;
+        let markdown_settings = &settings
+            .languages
+            .get(&markdown)
+            .unwrap_or(&settings.defaults)
+            .visual_md;
+
+        for visual_md in [default_language, markdown_settings] {
+            assert_eq!(visual_md.prose_font_size, Some(settings::FontSize(20.)));
+            assert_eq!(visual_md.code_font_size, Some(settings::FontSize(12.)));
+            let heading_sizes = visual_md.heading_sizes.as_ref().expect("heading sizes");
+            assert_eq!(heading_sizes.h1, Some(settings::HeadingScale(1.8)));
+            assert_eq!(heading_sizes.h2, Some(settings::HeadingScale(2.0)));
+            let colors = visual_md.colors.as_ref().expect("colors");
+            assert_eq!(colors.link, Some("#00aa00".into()));
+            assert_eq!(colors.heading_1, Some("#ff0000".into()));
+            assert_eq!(colors.inline_code_background, Some("#010203".into()));
+            let todo = visual_md
+                .callouts
+                .as_ref()
+                .and_then(|callouts| callouts.get("todo"))
+                .expect("the todo callout");
+            assert_eq!(todo.icon.as_deref(), Some("check"));
+            assert_eq!(todo.accent, Some("#0000aa".into()));
+        }
+        let heading_color = |visual_md: &settings::VisualMdSettingsContent| {
+            visual_md
+                .colors
+                .as_ref()
+                .and_then(|colors| colors.heading.clone())
+        };
+        assert_eq!(heading_color(default_language), Some("#aa0000".into()));
+        assert_eq!(heading_color(markdown_settings), Some("#bbbbbb".into()));
     }
 
     #[gpui::test]

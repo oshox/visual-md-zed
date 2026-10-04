@@ -504,7 +504,7 @@ fn is_markdown_editor(editor: &Editor, cx: &App) -> bool {
         .is_some_and(|language| language.name().as_ref() == "Markdown")
 }
 
-/// The `visual_md_enabled` language setting for this editor's buffer, which
+/// The `visual_md.enabled` language setting for this editor's buffer, which
 /// resolves default, user, project and per-language settings in that order.
 /// Read at offset 0, the same place `is_markdown_editor` checks the language.
 fn live_preview_setting(editor: &Editor, cx: &App) -> bool {
@@ -512,7 +512,8 @@ fn live_preview_setting(editor: &Editor, cx: &App) -> bool {
         .buffer()
         .read(cx)
         .language_settings_at(MultiBufferOffset(0), cx)
-        .visual_md_enabled
+        .visual_md
+        .is_enabled()
 }
 
 /// Whether live preview should currently decorate this editor: it must be a
@@ -3764,6 +3765,7 @@ mod integration_tests {
     fn visual_md_setting(enabled: bool) -> Option<settings::VisualMdSettingsContent> {
         Some(settings::VisualMdSettingsContent {
             enabled: Some(enabled),
+            ..Default::default()
         })
     }
 

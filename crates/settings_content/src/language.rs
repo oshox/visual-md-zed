@@ -7,8 +7,9 @@ use settings_macros::{MergeFrom, with_fallible_options};
 use std::sync::Arc;
 
 use crate::{
-    DelayMs, DocumentFoldingRanges, DocumentSymbols, ExtendingSet, SemanticTokens, SplicingVec,
-    merge_from,
+    BufferLineHeight, DelayMs, DocumentFoldingRanges, DocumentSymbols, ExtendingSet,
+    FontFamilyName, FontSize, FontWeightContent, HeadingScale, SemanticTokens, SplicingVec,
+    ThemeColor, merge_from,
 };
 
 /// The state of the modifier keys at some point in time
@@ -900,13 +901,191 @@ pub struct JsxTagAutoCloseSettingsContent {
 /// Like other language settings, this can be set in the user settings, in a
 /// project's `.zed/settings.json`, and per language under `languages`.
 #[with_fallible_options]
-#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, Debug, JsonSchema, MergeFrom)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
 pub struct VisualMdSettingsContent {
     /// Whether to render Markdown buffers with live preview instead of plain
     /// source text.
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// The font family for prose. Leave unset to use the UI font.
+    ///
+    /// Default: null
+    pub prose_font_family: Option<FontFamilyName>,
+    /// The font size for prose, in pixels. It follows the buffer font size
+    /// zoom. Leave unset to use the buffer font size.
+    ///
+    /// Default: null
+    pub prose_font_size: Option<FontSize>,
+    /// The font weight for prose. Leave unset to use the buffer font weight.
+    ///
+    /// Default: null
+    pub prose_font_weight: Option<FontWeightContent>,
+    /// The line height for prose. Leave unset to use the buffer line height.
+    ///
+    /// Default: null
+    pub prose_line_height: Option<BufferLineHeight>,
+    /// The font family for inline code and fenced code blocks. Leave unset to
+    /// use the buffer font.
+    ///
+    /// Default: null
+    pub code_font_family: Option<FontFamilyName>,
+    /// The font size for inline code and fenced code blocks, in pixels. Leave
+    /// unset to use the prose font size.
+    ///
+    /// Default: null
+    pub code_font_size: Option<FontSize>,
+    /// The font family for headings. Leave unset to use the prose font.
+    ///
+    /// Default: null
+    pub heading_font_family: Option<FontFamilyName>,
+    /// Font size multipliers for H1 to H6, relative to the prose font size.
+    pub heading_sizes: Option<VisualMdHeadingSizesContent>,
+    /// Font weights for H1 to H6.
+    pub heading_weights: Option<VisualMdHeadingWeightsContent>,
+    /// Colors for the elements of rendered Markdown. A color left unset falls
+    /// back to the matching `visual_md.*` token in the active theme's `syntax`
+    /// map, and then to a default derived from the theme.
+    pub colors: Option<VisualMdColorsContent>,
+    /// Custom callout types, keyed by the type name written in `> [!name]`.
+    /// This can also restyle the built-in types and their aliases.
+    pub callouts: Option<HashMap<String, VisualMdCalloutContent>>,
+}
+
+impl VisualMdSettingsContent {
+    /// Live preview is on unless a settings file turns it off.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+}
+
+/// Font size multipliers for headings, relative to the prose font size.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdHeadingSizesContent {
+    /// Default: 1.8
+    pub h1: Option<HeadingScale>,
+    /// Default: 1.5
+    pub h2: Option<HeadingScale>,
+    /// Default: 1.3
+    pub h3: Option<HeadingScale>,
+    /// Default: 1.15
+    pub h4: Option<HeadingScale>,
+    /// Default: 1.05
+    pub h5: Option<HeadingScale>,
+    /// Default: 1.0
+    pub h6: Option<HeadingScale>,
+}
+
+/// Font weights for headings.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdHeadingWeightsContent {
+    /// Default: 700
+    pub h1: Option<FontWeightContent>,
+    /// Default: 700
+    pub h2: Option<FontWeightContent>,
+    /// Default: 700
+    pub h3: Option<FontWeightContent>,
+    /// Default: 700
+    pub h4: Option<FontWeightContent>,
+    /// Default: 700
+    pub h5: Option<FontWeightContent>,
+    /// Default: 700
+    pub h6: Option<FontWeightContent>,
+}
+
+/// Colors for the elements of rendered Markdown.
+///
+/// Each key `x` is also read from the active theme as the `color` of the
+/// `visual_md.x` syntax token, and each key `x.background` as the
+/// `background_color` of that same token.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdColorsContent {
+    /// Text color for every heading level.
+    pub heading: Option<ThemeColor>,
+    /// Text color for H1, overriding `heading`.
+    #[serde(rename = "heading.1")]
+    pub heading_1: Option<ThemeColor>,
+    /// Text color for H2, overriding `heading`.
+    #[serde(rename = "heading.2")]
+    pub heading_2: Option<ThemeColor>,
+    /// Text color for H3, overriding `heading`.
+    #[serde(rename = "heading.3")]
+    pub heading_3: Option<ThemeColor>,
+    /// Text color for H4, overriding `heading`.
+    #[serde(rename = "heading.4")]
+    pub heading_4: Option<ThemeColor>,
+    /// Text color for H5, overriding `heading`.
+    #[serde(rename = "heading.5")]
+    pub heading_5: Option<ThemeColor>,
+    /// Text color for H6, overriding `heading`.
+    #[serde(rename = "heading.6")]
+    pub heading_6: Option<ThemeColor>,
+    /// Text color of bold text.
+    pub bold: Option<ThemeColor>,
+    /// Text color of italic text.
+    pub italic: Option<ThemeColor>,
+    /// Text color of strikethrough text.
+    pub strikethrough: Option<ThemeColor>,
+    /// Background color of `==highlighted==` text.
+    #[serde(rename = "highlight.background")]
+    pub highlight_background: Option<ThemeColor>,
+    /// Text color of inline code.
+    pub inline_code: Option<ThemeColor>,
+    /// Background color of inline code.
+    #[serde(rename = "inline_code.background")]
+    pub inline_code_background: Option<ThemeColor>,
+    /// Text color of links.
+    pub link: Option<ThemeColor>,
+    /// Color of the dimmed Markdown syntax shown on the line the cursor is on.
+    pub marker: Option<ThemeColor>,
+    /// Color of the bar beside a blockquote.
+    #[serde(rename = "blockquote.bar")]
+    pub blockquote_bar: Option<ThemeColor>,
+    /// Color of horizontal rules.
+    pub rule: Option<ThemeColor>,
+    /// Color of table borders and the header divider.
+    #[serde(rename = "table.border")]
+    pub table_border: Option<ThemeColor>,
+    /// Color of the border around fenced code blocks.
+    #[serde(rename = "code_block.border")]
+    pub code_block_border: Option<ThemeColor>,
+    /// Background color of fenced code blocks.
+    #[serde(rename = "code_block.background")]
+    pub code_block_background: Option<ThemeColor>,
+    /// Color of a checked task checkbox.
+    #[serde(rename = "task.checked")]
+    pub task_checked: Option<ThemeColor>,
+    /// Accent and background colors per callout type, keyed by the type name
+    /// written in `> [!name]`. The built-in names are `note`, `tip`,
+    /// `warning` and `danger`; they also apply to their aliases.
+    pub callout: Option<HashMap<String, VisualMdCalloutColorsContent>>,
+}
+
+/// The colors of one callout type.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdCalloutColorsContent {
+    /// The color of the callout's icon, chevron and title.
+    pub accent: Option<ThemeColor>,
+    /// The background color of the whole callout.
+    pub background: Option<ThemeColor>,
+}
+
+/// A callout type, including its colors.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdCalloutContent {
+    /// The name of the icon shown in the callout's title, for example
+    /// `info`, `warning` or `star`. An unknown name falls back to the icon of
+    /// the callout's built-in kind.
+    pub icon: Option<String>,
+    /// The color of the callout's icon, chevron and title.
+    pub accent: Option<ThemeColor>,
+    /// The background color of the whole callout.
+    pub background: Option<ThemeColor>,
 }
 
 /// The settings for inlay hints.

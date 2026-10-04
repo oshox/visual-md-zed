@@ -551,6 +551,15 @@ pub fn observe_buffer_font_size_adjustment<V: 'static>(
     cx.observe_global::<BufferFontSize>(f)
 }
 
+/// Like [`observe_buffer_font_size_adjustment`], for a callback that needs the window.
+pub fn observe_buffer_font_size_adjustment_in<V: 'static>(
+    window: &Window,
+    cx: &mut Context<V>,
+    f: impl 'static + FnMut(&mut V, &mut Window, &mut Context<V>),
+) -> Subscription {
+    cx.observe_global_in::<BufferFontSize>(window, f)
+}
+
 /// Gets the font size, adjusted by the difference between the current buffer font size and the one set in the settings.
 pub fn adjusted_font_size(size: Pixels, cx: &App) -> Pixels {
     let adjusted_font_size =
