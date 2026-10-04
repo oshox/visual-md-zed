@@ -9,6 +9,7 @@ use extension::{
     CodeLabel, Command, Completion, ContextServerConfiguration, DebugAdapterBinary,
     DebugTaskDefinition, ExtensionCapability, ExtensionHostProxy, KeyValueStoreDelegate,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput, Symbol,
+    VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
     WorktreeDelegate,
 };
 use fs::Fs;
@@ -397,6 +398,40 @@ impl extension::Extension for WasmExtension {
                 };
 
                 Ok(Some(configuration.try_into()?))
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn visual_md_render_fence(
+        &self,
+        renderer: String,
+        request: VisualMdFenceRequest,
+    ) -> Result<VisualMdFenceResult> {
+        self.call(|extension, store| {
+            async move {
+                extension
+                    .call_visual_md_render_fence(store, &renderer, request)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn visual_md_run_command(
+        &self,
+        command: String,
+        context: VisualMdCommandContext,
+    ) -> Result<VisualMdCommandResult> {
+        self.call(|extension, store| {
+            async move {
+                extension
+                    .call_visual_md_run_command(store, &command, context)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))
             }
             .boxed()
         })

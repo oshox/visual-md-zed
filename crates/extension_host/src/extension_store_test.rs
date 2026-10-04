@@ -16,9 +16,9 @@ use collections::{BTreeMap, HashMap, HashSet};
 use extension::{
     BuildTaskTemplate, CodeLabel, Command, Completion, ContextServerConfiguration,
     DebugAdapterBinary, DebugRequest, DebugScenario, DebugTaskDefinition, Extension,
-    ExtensionHostProxy, KeyValueStoreDelegate, LibManifestEntry, ProjectDelegate, SlashCommand,
-    SlashCommandArgumentCompletion, SlashCommandOutput, StartDebuggingRequestArgumentsRequest,
-    Symbol, WorktreeDelegate,
+    ExtensionHostProxy, ExtensionVisualMdProxy, KeyValueStoreDelegate, LibManifestEntry,
+    ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput,
+    StartDebuggingRequestArgumentsRequest, Symbol, WorktreeDelegate,
 };
 use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use futures::{AsyncReadExt, FutureExt, StreamExt, io::BufReader};
@@ -772,6 +772,123 @@ async fn test_extension_store(cx: &mut TestAppContext) {
         );
         assert_eq!(language_registry.grammar_names(), []);
     });
+}
+
+#[derive(Clone, Default)]
+struct RecordingVisualMdProxy {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl ExtensionVisualMdProxy for RecordingVisualMdProxy {
+    fn register_visual_md_extension(
+        &self,
+        manifest: Arc<ExtensionManifest>,
+        extension: Option<Arc<dyn Extension>>,
+        _cx: &mut gpui::App,
+    ) {
+        self.events.lock().push(format!(
+            "register {} (wasm: {})",
+            manifest.id,
+            extension.is_some()
+        ));
+    }
+
+    fn unregister_visual_md_extension(&self, extension_id: Arc<str>, _cx: &mut gpui::App) {
+        self.events
+            .lock()
+            .push(format!("unregister {extension_id}"));
+    }
+}
+
+#[gpui::test]
+async fn test_visual_md_extensions_are_registered_and_unregistered_with_the_store(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    let http_client = FakeHttpClient::with_200_response();
+    fs.insert_tree(
+        "/the-extension-dir",
+        json!({
+            "installed": {
+                "notes": {
+                    "extension.toml": r#"
+                        id = "notes"
+                        name = "Notes"
+                        version = "1.0.0"
+                        schema_version = 1
+
+                        [visual_md]
+                        fence_renderers = ["flow"]
+                    "#,
+                },
+                "plain": {
+                    "extension.toml": r#"
+                        id = "plain"
+                        name = "Plain"
+                        version = "1.0.0"
+                        schema_version = 1
+                    "#,
+                },
+            }
+        }),
+    )
+    .await;
+
+    let proxy = Arc::new(ExtensionHostProxy::new());
+    let recording = RecordingVisualMdProxy::default();
+    proxy.register_visual_md_proxy(recording.clone());
+
+    let store = cx.new(|cx| {
+        ExtensionStore::new(
+            PathBuf::from("/the-extension-dir"),
+            None,
+            proxy,
+            fs.clone(),
+            http_client.clone(),
+            http_client.clone(),
+            None,
+            NodeRuntime::unavailable(),
+            cx,
+        )
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE_DURATION);
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        *recording.events.lock(),
+        vec!["register notes (wasm: false)".to_string()],
+        "only extensions with a visual_md section are registered, and without wasm they have no hooks"
+    );
+
+    store.update(cx, |store, cx| {
+        store
+            .uninstall_extension("plain".into(), cx)
+            .detach_and_log_err(cx);
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE_DURATION);
+    cx.executor().run_until_parked();
+    assert_eq!(
+        recording.events.lock().len(),
+        1,
+        "removing an extension without a visual_md section must not unregister anything"
+    );
+
+    store.update(cx, |store, cx| {
+        store
+            .uninstall_extension("notes".into(), cx)
+            .detach_and_log_err(cx);
+    });
+    cx.executor().advance_clock(RELOAD_DEBOUNCE_DURATION);
+    cx.executor().run_until_parked();
+    assert_eq!(
+        *recording.events.lock(),
+        vec![
+            "register notes (wasm: false)".to_string(),
+            "unregister notes".to_string(),
+        ]
+    );
 }
 
 #[gpui::test]
