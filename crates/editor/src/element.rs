@@ -8499,7 +8499,11 @@ impl LineWithInvisibles {
                     fragment_start_index = fragment_end_index;
                 }
                 LineFragment::Element { len, .. } => {
-                    fragment_start_index += len;
+                    let fragment_end_index = fragment_start_index + len;
+                    if index < fragment_end_index {
+                        return self.font_size;
+                    }
+                    fragment_start_index = fragment_end_index;
                 }
             }
         }
@@ -13425,6 +13429,68 @@ mod tests {
 
         assert_eq!(layout.font_size_for_index(0), font_size);
         assert_eq!(layout.font_size_for_index(2), font_size * 0.5);
+    }
+
+    #[gpui::test]
+    fn test_font_size_for_index_inside_a_replacement_element(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+
+        window
+            .update(cx, |_, window, _| {
+                let font_size = px(16.);
+                let shape = |text: &'static str, run_font_size: Option<Pixels>| {
+                    window.text_system().shape_line(
+                        text.into(),
+                        font_size,
+                        &[TextRun {
+                            len: text.len(),
+                            font_size: run_font_size,
+                            ..Default::default()
+                        }],
+                        None,
+                    )
+                };
+                // "ab", a two-byte replacement element (a fold placeholder),
+                // then "cd" at half size.
+                let line = LineWithInvisibles {
+                    fragments: SmallVec::from_vec(vec![
+                        LineFragment::Text(shape("ab", None)),
+                        LineFragment::Element {
+                            id: crate::display_map::ChunkRendererId::Inlay(project::InlayId::Hint(
+                                0,
+                            )),
+                            element: None,
+                            size: size(px(10.), px(10.)),
+                            len: 2,
+                        },
+                        LineFragment::Text(shape("cd", Some(font_size * 0.5))),
+                    ]),
+                    invisibles: Vec::new(),
+                    diagnostic_underline_severity_ranges: Vec::new(),
+                    point_diagnostics: Vec::new(),
+                    len: 6,
+                    width: px(40.),
+                    font_size,
+                    row_height: px(20.),
+                    row_top: Pixels::ZERO,
+                };
+
+                assert_eq!(line.font_size_for_index(0), font_size);
+                // At the element's first byte and inside it, the cursor is not
+                // on a shaped glyph, and the offset into the next text
+                // fragment must not underflow.
+                assert_eq!(line.font_size_for_index(2), font_size);
+                assert_eq!(line.font_size_for_index(3), font_size);
+                assert_eq!(line.font_size_for_index(4), font_size * 0.5);
+                assert_eq!(line.font_size_for_index(5), font_size * 0.5);
+                assert_eq!(line.font_size_for_index(100), font_size);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
