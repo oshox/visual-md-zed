@@ -233,6 +233,7 @@
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+mod commands;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
@@ -246,6 +247,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+pub use commands::RunExtensionCommand;
 use editor::actions::Newline;
 use editor::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId,
@@ -287,6 +289,7 @@ actions!(
 pub fn init(cx: &mut App) {
     extensions::init(cx);
     fence_render::init(cx);
+    commands::init(cx);
     cx.observe_new(register_editor).detach();
 }
 
@@ -313,12 +316,15 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let toggle_bold_action = editor.register_action(cx.listener(intercept_toggle_bold));
     let toggle_italic_action = editor.register_action(cx.listener(intercept_toggle_italic));
     let toggle_live_preview_action = editor.register_action(cx.listener(toggle_live_preview));
+    let run_extension_command_action =
+        editor.register_action(cx.listener(commands::run_extension_command));
     editor.register_addon(VisualMdAddon {
         _state: state,
         _newline_action: newline_action,
         _toggle_bold_action: toggle_bold_action,
         _toggle_italic_action: toggle_italic_action,
         _toggle_live_preview_action: toggle_live_preview_action,
+        _run_extension_command_action: run_extension_command_action,
         enabled_override: None,
         active: false,
         folded_markers: Vec::new(),
@@ -593,6 +599,8 @@ struct VisualMdAddon {
     _toggle_bold_action: Subscription,
     _toggle_italic_action: Subscription,
     _toggle_live_preview_action: Subscription,
+    /// Keeps the handler for extension commands (see `commands`) alive.
+    _run_extension_command_action: Subscription,
     /// What `ToggleLivePreview` last forced for this editor, taking priority
     /// over the settings. `None` once the toggle lands back on the setting's
     /// own value.

@@ -420,6 +420,7 @@ pub(crate) mod test_support {
         command_result: Mutex<VisualMdCommandResult>,
         calls: AtomicUsize,
         fence_requests: Mutex<Vec<VisualMdFenceRequest>>,
+        command_contexts: Mutex<Vec<VisualMdCommandContext>>,
     }
 
     impl FakeHooks {
@@ -431,6 +432,7 @@ pub(crate) mod test_support {
                 command_result: Mutex::new(VisualMdCommandResult::default()),
                 calls: AtomicUsize::new(0),
                 fence_requests: Mutex::new(Vec::new()),
+                command_contexts: Mutex::new(Vec::new()),
             })
         }
 
@@ -443,6 +445,20 @@ pub(crate) mod test_support {
                 .fence_output
                 .lock()
                 .expect("the test lock is not poisoned") = output;
+        }
+
+        pub(crate) fn set_command_result(&self, result: VisualMdCommandResult) {
+            *self
+                .command_result
+                .lock()
+                .expect("the test lock is not poisoned") = result;
+        }
+
+        pub(crate) fn command_contexts(&self) -> Vec<VisualMdCommandContext> {
+            self.command_contexts
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
         }
 
         pub(crate) fn calls(&self) -> usize {
@@ -502,8 +518,12 @@ pub(crate) mod test_support {
         fn run_command(
             &self,
             _command: String,
-            _context: VisualMdCommandContext,
+            context: VisualMdCommandContext,
         ) -> BoxFuture<'static, Result<VisualMdCommandResult>> {
+            self.command_contexts
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(context);
             let result = self
                 .command_result
                 .lock()

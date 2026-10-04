@@ -293,7 +293,7 @@ struct WantedFence {
     entry: Arc<FenceEntry>,
 }
 
-fn note_path(editor: &Editor, cx: &App) -> Option<String> {
+pub(crate) fn note_path(editor: &Editor, cx: &App) -> Option<String> {
     let buffer = editor.buffer().read(cx).as_singleton()?;
     let file = buffer.read(cx).file()?.as_local()?;
     Some(file.abs_path(cx).to_string_lossy().into_owned())

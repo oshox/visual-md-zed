@@ -20090,8 +20090,10 @@ dependencies = [
  "arc-swap",
  "assets",
  "collections",
+ "command_palette_hooks",
  "editor",
  "extension",
+ "fs",
  "futures 0.3.34",
  "gpui",
  "icons",
@@ -20100,8 +20102,12 @@ dependencies = [
  "markdown",
  "multi_buffer",
  "parking_lot",
+ "project",
  "release_channel",
+ "schemars 1.0.4",
  "semver",
+ "serde",
+ "serde_json",
  "settings",
  "syntax_theme",
  "theme",
@@ -20111,6 +20117,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-md",
  "util",
+ "workspace",
 ]
 
 [[package]]
