@@ -63,8 +63,15 @@ Extensions created using newer versions of the Zed extension API won't be compat
 
 Here is the compatibility of the `zed_extension_api` with versions of Zed:
 
+`0.9.0` is specific to Zed MD, the Markdown editor fork of Zed, which loads it
+on every release channel. It adds the `visual-md` exports (see
+`docs/visual-md-extensions.md`) and is unstable until Zed MD's milestone M15
+is complete. Upstream's `0.8.0` is not loaded on the stable and preview
+channels.
+
 | Zed version | `zed_extension_api` version |
 | ----------- | --------------------------- |
+| Zed MD      | `0.0.1` - `0.6.0`, `0.9.0`  |
 | `0.192.x`   | `0.0.1` - `0.6.0`           |
 | `0.186.x`   | `0.0.1` - `0.5.0`           |
 | `0.184.x`   | `0.0.1` - `0.4.0`           |
