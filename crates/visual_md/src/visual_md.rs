@@ -234,6 +234,7 @@
 //! single keystroke or cursor move touches only what changed.
 
 mod commands;
+pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
@@ -290,6 +291,7 @@ actions!(
 pub fn init(cx: &mut App) {
     extensions::init(cx);
     fence_render::init(cx);
+    dynamic_rules::init(cx);
     commands::init(cx);
     cx.observe_new(register_editor).detach();
 }
@@ -725,7 +727,7 @@ impl Addon for VisualMdAddon {
 
 struct VisualMdState {
     editor: WeakEntity<Editor>,
-    _subscriptions: [Subscription; 6],
+    _subscriptions: [Subscription; 7],
 }
 
 impl VisualMdState {
@@ -829,6 +831,22 @@ impl VisualMdState {
                             .log_err();
                     },
                 ),
+                // An extension answering about the matches of a dynamic rule
+                // changes what those matches look like, which the plan holds
+                // only as a list of what was still waiting.
+                cx.observe_global_in::<dynamic_rules::DynamicRuleResults>(
+                    window,
+                    |state, window, cx| {
+                        state
+                            .editor
+                            .update(cx, |editor, cx| {
+                                if is_waiting_for_rule_answers(editor) {
+                                    force_refresh(editor, window, cx)
+                                }
+                            })
+                            .log_err();
+                    },
+                ),
                 // Font settings live in `ThemeSettings`, so a change to them
                 // does not alter the buffer's own language settings.
                 cx.observe_global_in::<settings::SettingsStore>(window, |state, window, cx| {
@@ -858,6 +876,15 @@ impl VisualMdState {
             ],
         })
     }
+}
+
+/// Whether the plan `editor` last applied had matches of dynamic rules that no
+/// extension had answered for yet.
+fn is_waiting_for_rule_answers(editor: &Editor) -> bool {
+    editor
+        .addon::<VisualMdAddon>()
+        .and_then(|addon| addon.last_applied.as_ref())
+        .is_some_and(|(_, plan)| !plan.missing_rule_inputs.is_empty())
 }
 
 /// Whether live preview is currently decorating `editor`. Global observers
@@ -1073,6 +1100,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     if unchanged {
         return;
     }
+    dynamic_rules::request_missing(computed.missing_rule_inputs.clone(), cx);
 
     let editor_handle = cx.weak_entity();
     // The `String` alongside each range is a content key, not just an
@@ -1203,7 +1231,10 @@ fn plan_extensions(cx: &App) -> plan::PlanExtensions {
         rendered_fence_languages: registry.fence_languages().into_iter().collect(),
         rules: rules::RuleSet {
             rules: registry.syntax_rules().into(),
-            results: Arc::default(),
+            results: cx
+                .try_global::<dynamic_rules::DynamicRuleResults>()
+                .map(|results| results.answers())
+                .unwrap_or_default(),
         },
     }
 }

@@ -10,7 +10,6 @@ use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use editor::display_map::{
@@ -37,7 +36,7 @@ use theme::ActiveTheme as _;
 use util::ResultExt as _;
 
 use crate::VisualMdAddon;
-use crate::extensions::{FenceRenderer, HookError, VisualMdExtensions};
+use crate::extensions::{FenceRenderer, HookError, VisualMdExtensions, when_not_busy};
 use crate::plan::{Plan, RenderedFence};
 
 const FENCE_CACHE_CAPACITY: usize = 256;
@@ -45,12 +44,6 @@ const FENCE_CACHE_CAPACITY: usize = 256;
 pub const MAX_TEXT_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_IMAGE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HEIGHT_ROWS: u32 = 200;
-
-/// An extension answers "busy" while it has several requests running, which
-/// happens when a document shows more fences than it may render at once. The
-/// request waits its turn instead of failing.
-const BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
-const BUSY_RETRIES: usize = 100;
 
 /// Everything a rendering depends on. Two fences with the same key look the
 /// same, so they share one request and one result, across editors too.
@@ -325,7 +318,7 @@ fn wanted_fences(
         return Vec::new();
     }
 
-    let cache = cx.default_global::<FenceCache>().clone();
+    let cache = cx.try_global::<FenceCache>().cloned().unwrap_or_default();
     let appearance = appearance(cx);
     let path = note_path(editor, cx);
     let language_registry = editor
@@ -422,29 +415,16 @@ async fn render_when_not_busy(
     request: &VisualMdFenceRequest,
     cx: &mut AsyncApp,
 ) -> Result<VisualMdFenceResult, HookError> {
-    let mut retries = 0;
-    loop {
-        let call = cx.update(|cx| {
-            cx.try_global::<VisualMdExtensions>().map(|registry| {
-                registry.render_fence(
-                    &renderer.extension_id,
-                    renderer.renderer.clone(),
-                    request.clone(),
-                    cx,
-                )
-            })
-        });
-        let Some(call) = call else {
-            return Err(HookError::NotRegistered(renderer.extension_id.clone()));
-        };
-        match call.await {
-            Err(HookError::Busy(_)) if retries < BUSY_RETRIES => {
-                retries += 1;
-                cx.background_executor().timer(BUSY_RETRY_DELAY).await;
-            }
-            result => return result,
-        }
-    }
+    when_not_busy(cx, |cx| match cx.try_global::<VisualMdExtensions>() {
+        Some(registry) => registry.render_fence(
+            &renderer.extension_id,
+            renderer.renderer.clone(),
+            request.clone(),
+            cx,
+        ),
+        None => Task::ready(Err(HookError::NotRegistered(renderer.extension_id.clone()))),
+    })
+    .await
 }
 
 fn build_state(
@@ -879,6 +859,7 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     use editor::test::editor_test_context::EditorTestContext;
     use gpui::TestAppContext;

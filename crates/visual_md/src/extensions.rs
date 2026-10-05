@@ -14,16 +14,23 @@ use anyhow::Result;
 use extension::{
     Extension, ExtensionHostProxy, ExtensionManifest, ExtensionVisualMdProxy,
     VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
-    VisualMdManifestEntry,
+    VisualMdManifestEntry, VisualMdRuleMatch, VisualMdRuleOutput,
 };
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Either, select};
-use gpui::{App, AppContext as _, BorrowAppContext as _, Global, Task};
+use gpui::{App, AppContext as _, AsyncApp, BorrowAppContext as _, Global, Task};
 
 use crate::rules::CompiledRule;
 
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RULE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// An extension answers "busy" while it has several requests running, which
+/// happens when a document needs more of them at once than it may have. A
+/// request waits its turn instead of failing.
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
+const BUSY_RETRIES: usize = 100;
 
 const MAX_IN_FLIGHT_CALLS_PER_EXTENSION: usize = 4;
 const FAILURES_BEFORE_DISABLING: usize = 3;
@@ -42,6 +49,12 @@ pub trait VisualMdHooks: Send + Sync + 'static {
         command: String,
         context: VisualMdCommandContext,
     ) -> BoxFuture<'static, Result<VisualMdCommandResult>>;
+
+    fn apply_rule(
+        &self,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+    ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>>;
 }
 
 struct ExtensionHooks(Arc<dyn Extension>);
@@ -63,6 +76,15 @@ impl VisualMdHooks for ExtensionHooks {
     ) -> BoxFuture<'static, Result<VisualMdCommandResult>> {
         let extension = self.0.clone();
         async move { extension.visual_md_run_command(command, context).await }.boxed()
+    }
+
+    fn apply_rule(
+        &self,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+    ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_apply_rule(rule, matches).await }.boxed()
     }
 }
 
@@ -375,6 +397,18 @@ impl VisualMdExtensions {
         })
     }
 
+    pub fn apply_rule(
+        &self,
+        extension_id: &str,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+        cx: &App,
+    ) -> Task<Result<Vec<VisualMdRuleOutput>, HookError>> {
+        self.call(extension_id, RULE_TIMEOUT, cx, move |hooks| {
+            hooks.apply_rule(rule, matches)
+        })
+    }
+
     /// Calls into an extension with the limits every hook shares: a timeout, at
     /// most a few requests in flight, and no calls at all once the extension
     /// has failed several times in a row.
@@ -424,6 +458,25 @@ impl VisualMdExtensions {
     }
 }
 
+/// Makes a call into an extension, starting it again for as long as the
+/// extension refuses it as busy, for a bounded time.
+pub(crate) async fn when_not_busy<T: Send + 'static>(
+    cx: &mut AsyncApp,
+    mut start: impl FnMut(&App) -> Task<Result<T, HookError>>,
+) -> Result<T, HookError> {
+    let mut retries = 0;
+    loop {
+        let call = cx.update(|cx| start(cx));
+        match call.await {
+            Err(HookError::Busy(_)) if retries < BUSY_RETRIES => {
+                retries += 1;
+                cx.background_executor().timer(BUSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Mutex;
@@ -433,6 +486,8 @@ pub(crate) mod test_support {
     use gpui::BackgroundExecutor;
 
     use super::*;
+
+    type RuleResponder = Box<dyn Fn(&VisualMdRuleMatch) -> VisualMdRuleOutput + Send + Sync>;
 
     #[derive(Clone)]
     pub(crate) enum Behavior {
@@ -451,6 +506,10 @@ pub(crate) mod test_support {
         calls: AtomicUsize,
         fence_requests: Mutex<Vec<VisualMdFenceRequest>>,
         command_contexts: Mutex<Vec<VisualMdCommandContext>>,
+        rule_responder: Mutex<RuleResponder>,
+        rule_requests: Mutex<Vec<(String, Vec<VisualMdRuleMatch>)>>,
+        /// How many outputs to leave off an answer, to test a short one.
+        rule_outputs_to_drop: AtomicUsize,
     }
 
     impl FakeHooks {
@@ -463,6 +522,9 @@ pub(crate) mod test_support {
                 calls: AtomicUsize::new(0),
                 fence_requests: Mutex::new(Vec::new()),
                 command_contexts: Mutex::new(Vec::new()),
+                rule_responder: Mutex::new(Box::new(|_| VisualMdRuleOutput::default())),
+                rule_requests: Mutex::new(Vec::new()),
+                rule_outputs_to_drop: AtomicUsize::new(0),
             })
         }
 
@@ -482,6 +544,27 @@ pub(crate) mod test_support {
                 .command_result
                 .lock()
                 .expect("the test lock is not poisoned") = result;
+        }
+
+        pub(crate) fn set_rule_responder(
+            &self,
+            responder: impl Fn(&VisualMdRuleMatch) -> VisualMdRuleOutput + Send + Sync + 'static,
+        ) {
+            *self
+                .rule_responder
+                .lock()
+                .expect("the test lock is not poisoned") = Box::new(responder);
+        }
+
+        pub(crate) fn drop_rule_outputs(&self, count: usize) {
+            self.rule_outputs_to_drop.store(count, Ordering::Relaxed);
+        }
+
+        pub(crate) fn rule_requests(&self) -> Vec<(String, Vec<VisualMdRuleMatch>)> {
+            self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
         }
 
         pub(crate) fn command_contexts(&self) -> Vec<VisualMdCommandContext> {
@@ -560,6 +643,33 @@ pub(crate) mod test_support {
                 .expect("the test lock is not poisoned")
                 .clone();
             self.respond(result)
+        }
+
+        fn apply_rule(
+            &self,
+            rule: String,
+            matches: Vec<VisualMdRuleMatch>,
+        ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>> {
+            let mut outputs: Vec<VisualMdRuleOutput> = {
+                let responder = self
+                    .rule_responder
+                    .lock()
+                    .expect("the test lock is not poisoned");
+                matches
+                    .iter()
+                    .map(|rule_match| responder(rule_match))
+                    .collect()
+            };
+            outputs.truncate(
+                outputs
+                    .len()
+                    .saturating_sub(self.rule_outputs_to_drop.load(Ordering::Relaxed)),
+            );
+            self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push((rule, matches));
+            self.respond(outputs)
         }
     }
 

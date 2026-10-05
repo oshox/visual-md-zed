@@ -232,13 +232,22 @@ pub struct Plan {
     pub extension_replacements: Vec<(Range<usize>, String)>,
     /// Matches of dynamic rules that no extension has answered for yet, once
     /// each, for the caller to ask about.
-    pub missing_rule_inputs: Vec<DynamicKey>,
+    pub missing_rule_inputs: Vec<MissingRuleInput>,
     /// Scratch for the three lists below: what extensions' rules want hidden,
     /// dimmed and replaced, filled in while walking and resolved against Zed
     /// MD's own decorations before the plan is returned, which leaves them empty.
     candidate_hidden: Vec<Range<usize>>,
     candidate_dimmed: Vec<Range<usize>>,
     candidate_replacements: Vec<(Range<usize>, String)>,
+}
+
+/// A match of a dynamic rule waiting for an extension's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingRuleInput {
+    pub key: DynamicKey,
+    /// The capture groups as they were where the match was first found. An
+    /// answer is filed under the match's text alone, so the first one wins.
+    pub captures: Vec<Option<Range<usize>>>,
 }
 
 /// A fenced code block that an extension renders, see `Plan::rendered_fences`.
@@ -460,7 +469,7 @@ pub fn plan_viewport_with_extensions(
 
     let mut seen_inputs = HashSet::new();
     plan.missing_rule_inputs
-        .retain(|input| seen_inputs.insert(input.clone()));
+        .retain(|input| seen_inputs.insert(input.key.clone()));
 
     plan
 }
@@ -658,7 +667,10 @@ fn plan_rule_hit(hit: RuleHit, selections: &[Range<usize>], rule_set: &RuleSet, 
             }
         }
         Some(DynamicResult::Failed) => {}
-        None => plan.missing_rule_inputs.push(key),
+        None => plan.missing_rule_inputs.push(MissingRuleInput {
+            key,
+            captures: hit.captures.clone(),
+        }),
     }
 }
 
@@ -3196,6 +3208,13 @@ mod tests {
                 .collect()
         }
 
+        fn missing_keys(plan: &Plan) -> Vec<DynamicKey> {
+            plan.missing_rule_inputs
+                .iter()
+                .map(|input| input.key.clone())
+                .collect()
+        }
+
         fn key(rule: &str, text: &str) -> DynamicKey {
             DynamicKey {
                 extension_id: "notes".into(),
@@ -3354,7 +3373,7 @@ mod tests {
             let result = plan_with(":a: :b: :a:\n", &[], rules);
 
             assert_eq!(
-                result.missing_rule_inputs,
+                missing_keys(&result),
                 vec![key("emoji", ":a:"), key("emoji", ":b:")]
             );
         }
@@ -3440,7 +3459,7 @@ mod tests {
 
             assert!(result.hidden_markers.is_empty());
             assert_eq!(result.missing_rule_inputs.len(), 1);
-            assert_eq!(result.missing_rule_inputs[0].generation, 2);
+            assert_eq!(result.missing_rule_inputs[0].key.generation, 2);
         }
 
         #[test]
