@@ -1,6 +1,11 @@
 use super::*;
 
 impl Editor {
+    /// The provider the editor gets its completions from.
+    pub fn completion_provider(&self) -> Option<Rc<dyn CompletionProvider>> {
+        self.completion_provider.clone()
+    }
+
     pub fn set_completion_provider(&mut self, provider: Option<Rc<dyn CompletionProvider>>) {
         self.completion_provider = provider;
     }
@@ -1120,10 +1125,6 @@ impl Editor {
 
 #[cfg(any(test, feature = "test-support"))]
 impl Editor {
-    pub fn completion_provider(&self) -> Option<Rc<dyn CompletionProvider>> {
-        self.completion_provider.clone()
-    }
-
     pub fn current_completions(&self) -> Option<Vec<project::Completion>> {
         let menu = self.context_menu.borrow();
         if let CodeContextMenu::Completions(menu) = menu.as_ref()? {

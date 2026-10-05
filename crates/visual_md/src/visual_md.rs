@@ -234,6 +234,7 @@
 //! single keystroke or cursor move touches only what changed.
 
 mod commands;
+mod completions;
 mod document_events;
 pub mod dynamic_rules;
 pub mod extensions;
@@ -356,6 +357,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         extension_key_count: 0,
         opened_event_sent: false,
         changed_events: HashMap::new(),
+        completion_provider: None,
     });
     refresh(editor, window, cx);
 
@@ -699,6 +701,9 @@ struct VisualMdAddon {
     /// The wait before each extension is told the document changed, by
     /// extension. Starting one again, on the next edit, drops the one before.
     changed_events: HashMap<Arc<str>, Task<()>>,
+    /// The completion provider Zed MD put in the editor while live preview
+    /// shows, which wraps the one the editor had.
+    completion_provider: Option<std::rc::Rc<completions::VisualMdCompletionProvider>>,
 }
 
 struct ParsedDocument {
@@ -1081,6 +1086,11 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             .is_some_and(|addon| !std::mem::replace(&mut addon.opened_event_sent, true))
     {
         document_events::send_opened(editor, cx);
+    }
+    if enabled && !was_active {
+        completions::install(editor);
+    } else if !enabled && was_active {
+        completions::uninstall(editor);
     }
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
