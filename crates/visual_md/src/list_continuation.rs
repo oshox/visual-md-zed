@@ -29,6 +29,50 @@ pub struct ListNewline {
     pub cursor_after: usize,
 }
 
+/// What pressing Enter does with several cursors at once: every cursor's
+/// edit, and where every cursor ends up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewlineBatch {
+    /// The edits to apply together in one buffer edit. Every range is in the
+    /// coordinates of the original text, not shifted by the edits before it:
+    /// the buffer walks the original text once and combines the batch itself,
+    /// so shifting a range here would count that edit's length change twice.
+    pub edits: Vec<(Range<usize>, String)>,
+    /// Where each cursor lands, as a byte offset into the text *after* the
+    /// whole batch. Unlike the edit ranges, these do need every earlier edit's
+    /// length change, since that is a real shift in the final text.
+    pub cursors: Vec<usize>,
+}
+
+/// Computes the Enter-key edits for collapsed cursors at the byte offsets
+/// `cursors`, which must be in document order. Returns `None` if any cursor is
+/// not on a list item's own marker line (so the caller should insert a plain
+/// newline for all of them), or if two edits would overlap, which no single
+/// buffer edit can express.
+pub fn newline_batch(text: &str, cursors: &[usize]) -> Option<NewlineBatch> {
+    let mut batch = NewlineBatch {
+        edits: Vec::with_capacity(cursors.len()),
+        cursors: Vec::with_capacity(cursors.len()),
+    };
+    let mut delta: isize = 0;
+    let mut previous_end = 0;
+    for &cursor in cursors {
+        let edit = newline_edit(text, cursor)?;
+        if edit.replace.start < previous_end {
+            return None;
+        }
+        previous_end = edit.replace.end;
+
+        let cursor_after =
+            usize::try_from(isize::try_from(edit.cursor_after).ok()? + delta).ok()?;
+        delta +=
+            isize::try_from(edit.insert.len()).ok()? - isize::try_from(edit.replace.len()).ok()?;
+        batch.edits.push((edit.replace, edit.insert));
+        batch.cursors.push(cursor_after);
+    }
+    Some(batch)
+}
+
 /// A list item's own marker, as found among its *direct* children (so a
 /// nested list's markers, being children of a nested `list_item` several
 /// levels down, are never picked up here).
@@ -241,6 +285,16 @@ fn line_end(text: &str, offset: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// Applies a batch the way the buffer does: every range is in the
+    /// coordinates of `text`, so working back to front keeps them valid.
+    fn apply_batch(text: &str, batch: &NewlineBatch) -> String {
+        let mut new_text = text.to_string();
+        for (range, insert) in batch.edits.iter().rev() {
+            new_text.replace_range(range.clone(), insert);
+        }
+        new_text
+    }
+
     fn apply(text: &str, cursor: usize) -> Option<(String, usize)> {
         let edit = newline_edit(text, cursor)?;
         let mut new_text = String::with_capacity(text.len() + edit.insert.len());
@@ -420,5 +474,80 @@ mod tests {
         let cursor = text.len() - 1;
         let (new_text, _) = apply(text, cursor).unwrap();
         assert_eq!(new_text, "- one\n  - [ ] nested\n- \n");
+    }
+
+    #[test]
+    fn a_batch_keeps_edits_in_original_coordinates_and_shifts_cursors() {
+        let text = "- one\n- two\n";
+        let batch = newline_batch(text, &[5, 11]).expect("both cursors are on list items");
+
+        assert_eq!(
+            batch.edits,
+            vec![(5..5, "\n- ".to_string()), (11..11, "\n- ".to_string())],
+            "the second edit is not moved by the first one's length"
+        );
+        assert_eq!(batch.cursors, vec![8, 17]);
+        let new_text = apply_batch(text, &batch);
+        assert_eq!(new_text, "- one\n- \n- two\n- \n");
+        assert_eq!(&new_text[..batch.cursors[0]], "- one\n- ");
+        assert_eq!(&new_text[..batch.cursors[1]], "- one\n- \n- two\n- ");
+    }
+
+    #[test]
+    fn a_batch_mixes_edits_that_grow_and_shrink_the_text() {
+        let text = "- one\n- \n- three\n";
+        let batch = newline_batch(text, &[5, 8, 16]).expect("every cursor is on a list item");
+
+        assert_eq!(
+            batch.edits,
+            vec![
+                (5..5, "\n- ".to_string()),
+                (6..8, String::new()),
+                (16..16, "\n- ".to_string()),
+            ]
+        );
+        let new_text = apply_batch(text, &batch);
+        assert_eq!(new_text, "- one\n- \n\n- three\n- \n");
+        assert_eq!(batch.cursors, vec![8, 9, 20]);
+        assert_eq!(&new_text[..batch.cursors[0]], "- one\n- ");
+        assert_eq!(&new_text[..batch.cursors[1]], "- one\n- \n");
+        assert_eq!(&new_text[..batch.cursors[2]], "- one\n- \n\n- three\n- ");
+    }
+
+    #[test]
+    fn a_batch_of_one_matches_the_single_cursor_edit() {
+        let text = "1. one\n";
+        let batch = newline_batch(text, &[6]).expect("the cursor is on a list item");
+        let edit = newline_edit(text, 6).expect("the cursor is on a list item");
+
+        assert_eq!(batch.edits, vec![(edit.replace, edit.insert)]);
+        assert_eq!(batch.cursors, vec![edit.cursor_after]);
+    }
+
+    #[test]
+    fn a_batch_is_nothing_when_any_cursor_is_off_a_list_item() {
+        assert_eq!(newline_batch("- one\n\nplain\n", &[5, 13]), None);
+    }
+
+    #[test]
+    fn a_batch_for_no_cursors_has_no_edits() {
+        assert_eq!(
+            newline_batch("- one\n", &[]),
+            Some(NewlineBatch {
+                edits: Vec::new(),
+                cursors: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_batch_refuses_edits_that_overlap() {
+        // Both cursors would clear the same empty item, and out-of-order
+        // cursors would give edits in the wrong order. The editor never
+        // reports either, but one buffer edit could not express them.
+        let text = "- a\n-   \n";
+        assert!(newline_batch(text, &[8]).is_some());
+        assert_eq!(newline_batch(text, &[8, 8]), None);
+        assert_eq!(newline_batch(text, &[8, 2]), None);
     }
 }

@@ -401,38 +401,31 @@ fn intercept_newline(
     }
 
     let text = editor.buffer().read(cx).snapshot(cx).text();
-    let Some(edits) = selections
+    let cursors: Vec<usize> = selections
         .iter()
-        .map(|selection| list_continuation::newline_edit(&text, selection.head().0))
-        .collect::<Option<Vec<_>>>()
-    else {
+        .map(|selection| selection.head().0)
+        .collect();
+    // Selections are reported in document order, as `newline_batch` needs.
+    let Some(batch) = list_continuation::newline_batch(&text, &cursors) else {
         cx.propagate();
         return;
     };
 
-    // Multiple cursors can each produce their own edit; apply them together
-    // in one buffer edit (in ascending order, since selections are already
-    // reported in document order) and track the running length delta so
-    // each cursor's `cursor_after` -- computed independently against the
-    // *original* text -- lands at the right offset once every earlier
-    // edit's own length change has shifted things.
-    let mut buffer_edits = Vec::with_capacity(edits.len());
-    let mut new_cursors = Vec::with_capacity(edits.len());
-    let mut delta: isize = 0;
-    for edit in &edits {
-        let start = (edit.replace.start as isize + delta) as usize;
-        let end = (edit.replace.end as isize + delta) as usize;
-        buffer_edits.push((
-            MultiBufferOffset(start)..MultiBufferOffset(end),
-            edit.insert.clone(),
-        ));
-        let cursor_after = (edit.cursor_after as isize + delta) as usize;
-        new_cursors.push(MultiBufferOffset(cursor_after)..MultiBufferOffset(cursor_after));
-        delta += edit.insert.len() as isize - edit.replace.len() as isize;
-    }
-
+    let new_cursors: Vec<_> = batch
+        .cursors
+        .iter()
+        .map(|&cursor| MultiBufferOffset(cursor)..MultiBufferOffset(cursor))
+        .collect();
     editor.transact(window, cx, |editor, window, cx| {
-        editor.edit(buffer_edits, cx);
+        editor.edit(
+            batch.edits.into_iter().map(|(range, insert)| {
+                (
+                    MultiBufferOffset(range.start)..MultiBufferOffset(range.end),
+                    insert,
+                )
+            }),
+            cx,
+        );
         editor.change_selections(SelectionEffects::default(), window, cx, |s| {
             s.select_ranges(new_cursors);
         });
@@ -3666,6 +3659,62 @@ mod integration_tests {
 
         cx.dispatch_action(editor::actions::Newline);
         cx.assert_editor_state("- one\n  - nested\n- ˇ\n");
+    }
+
+    /// Regression test: with several cursors, each cursor's edit used to be
+    /// shifted by the earlier ones' length changes even though the buffer takes
+    /// every edit range in the coordinates of the original text, so the second
+    /// edit landed past the end of the buffer and panicked.
+    #[gpui::test]
+    async fn newline_continues_every_cursor_of_a_multi_cursor_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- oneˇ\n- twoˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\n- ˇ\n- two\n- ˇ\n");
+    }
+
+    #[gpui::test]
+    async fn newline_continues_three_cursors_in_mixed_lists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- aˇ\n1. bˇ\n- [x] cˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- a\n- ˇ\n1. b\n2. ˇ\n- [x] c\n- [ ] ˇ\n");
+    }
+
+    /// Edits that shrink the text (clearing an empty item) and edits that grow
+    /// it (continuing a filled one) in one batch.
+    #[gpui::test]
+    async fn newline_handles_growing_and_shrinking_edits_together(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- oneˇ\n- ˇ\n- threeˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\n- ˇ\nˇ\n- three\n- ˇ\n");
+    }
+
+    /// One cursor that is not on a list item makes the whole batch fall back
+    /// to a plain newline, as it always did.
+    #[gpui::test]
+    async fn newline_with_one_cursor_outside_a_list_is_a_plain_newline(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- oneˇ\n\nparagraphˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+
+        cx.dispatch_action(editor::actions::Newline);
+        cx.assert_editor_state("- one\nˇ\n\nparagraph\nˇ\n");
     }
 
     /// Outside a list -- and in a non-Markdown buffer -- a plain `Enter`
