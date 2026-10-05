@@ -195,6 +195,10 @@ pub enum HighlightKey {
     /// Zed MD's syntax highlighting inside fenced code blocks, one sub-key
     /// per highlight id.
     VisualMdCodeSyntax(usize),
+    /// Styles that Zed MD extensions give to text through their syntax rules,
+    /// one sub-key per distinct style. It sorts after Zed MD's own keys, so an
+    /// extension's colors win over the built-in ones where it sets them.
+    VisualMdExtension(usize),
 }
 
 pub trait ToDisplayPoint {
