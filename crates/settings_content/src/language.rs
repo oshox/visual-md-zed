@@ -951,6 +951,11 @@ pub struct VisualMdSettingsContent {
     /// Custom callout types, keyed by the type name written in `> [!name]`.
     /// This can also restyle the built-in types and their aliases.
     pub callouts: Option<HashMap<String, VisualMdCalloutContent>>,
+    /// Settings for Zed MD extensions, keyed by extension id. An extension reads
+    /// only its own entry, whose shape it defines.
+    ///
+    /// Default: {}
+    pub extensions: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl VisualMdSettingsContent {

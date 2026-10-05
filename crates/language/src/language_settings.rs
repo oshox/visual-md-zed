@@ -1330,6 +1330,83 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_visual_md_extension_settings_merge_deeply(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &settings::default_settings());
+        store.register_setting::<AllLanguageSettings>();
+        let worktree_id = WorktreeId::from_usize(1);
+        let markdown = LanguageName::from("Markdown");
+        let location = SettingsLocation {
+            worktree_id,
+            path: rel_path("root/file.md"),
+        };
+
+        assert_eq!(
+            store
+                .get::<AllLanguageSettings>(None)
+                .defaults
+                .visual_md
+                .extensions,
+            Some(Default::default()),
+            "default.json declares no extension settings"
+        );
+
+        store
+            .set_user_settings(
+                r#"{"visual_md": {"extensions": {
+                    "a": {"x": 1, "nested": {"p": 1}},
+                    "b": {"only": "b"}
+                }}}"#,
+                cx,
+            )
+            .expect("user settings should load");
+        store
+            .set_local_settings(
+                worktree_id,
+                LocalSettingsPath::InWorktree(rel_path("root").into()),
+                LocalSettingsKind::Settings,
+                Some(
+                    r#"{
+                        "visual_md": {"extensions": {"a": {"nested": {"q": 2}, "y": 3}}},
+                        "languages": {"Markdown": {"visual_md": {"extensions": {"a": {"x": 9}}}}}
+                    }"#,
+                ),
+                cx,
+            )
+            .expect("project settings should load");
+
+        let settings = store.get::<AllLanguageSettings>(Some(location));
+        let entry = |visual_md: &settings::VisualMdSettingsContent, id: &str| {
+            visual_md
+                .extensions
+                .as_ref()
+                .and_then(|extensions| extensions.get(id))
+                .cloned()
+        };
+        let default_language = &settings.defaults.visual_md;
+        let markdown_settings = &settings
+            .languages
+            .get(&markdown)
+            .unwrap_or(&settings.defaults)
+            .visual_md;
+
+        assert_eq!(
+            entry(default_language, "a"),
+            Some(serde_json::json!({"x": 1, "nested": {"p": 1, "q": 2}, "y": 3}))
+        );
+        assert_eq!(
+            entry(markdown_settings, "a"),
+            Some(serde_json::json!({"x": 9, "nested": {"p": 1, "q": 2}, "y": 3}))
+        );
+        for visual_md in [default_language, markdown_settings] {
+            assert_eq!(
+                entry(visual_md, "b"),
+                Some(serde_json::json!({"only": "b"}))
+            );
+            assert_eq!(entry(visual_md, "c"), None);
+        }
+    }
+
+    #[gpui::test]
     fn test_visual_md_style_settings_merge_per_key(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &settings::default_settings());
         store.register_setting::<AllLanguageSettings>();

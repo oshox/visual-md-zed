@@ -4,12 +4,17 @@
 //! onto it instead of generated again. That keeps this file small and keeps it
 //! from conflicting with upstream's edits to 0.8.0.
 
-use crate::wasm_host::WasmState;
+use crate::wasm_host::{WasmState, wit::ToWasmtimeResult};
+use ::settings::{Settings as _, WorktreeId};
 use anyhow::Result;
 use extension::{KeyValueStoreDelegate, ProjectDelegate, WorktreeDelegate};
+use futures::FutureExt as _;
 use gpui::BackgroundExecutor;
+use language::{LanguageName, language_settings::AllLanguageSettings};
 use semver::Version;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use util::{paths::PathStyle, rel_path::RelPath};
 use wasmtime::component::{Linker, Resource};
 
 use super::latest;
@@ -191,6 +196,26 @@ impl HostWorktree for WasmState {
     }
 }
 
+/// What an extension reads for the `visual_md` settings category: its own entry
+/// under `visual_md.extensions`, or `null` when it has none, and when `key` is
+/// given, that key of the entry. An extension is only ever handed its own entry.
+fn extension_settings_json(
+    settings: &::settings::VisualMdSettingsContent,
+    extension_id: &str,
+    key: Option<&str>,
+) -> Result<String> {
+    let entry = settings
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(extension_id))
+        .unwrap_or(&serde_json::Value::Null);
+    let value = match key {
+        Some(key) => entry.get(key).unwrap_or(&serde_json::Value::Null),
+        None => entry,
+    };
+    Ok(serde_json::to_string(value)?)
+}
+
 impl ExtensionImports for WasmState {
     async fn get_settings(
         &mut self,
@@ -198,6 +223,41 @@ impl ExtensionImports for WasmState {
         category: String,
         key: Option<String>,
     ) -> wasmtime::Result<Result<String, String>> {
+        if category == "visual_md" {
+            let extension_id = self.manifest.id.clone();
+            return self
+                .on_main_thread(move |cx| {
+                    async move {
+                        let path = location.as_ref().and_then(|location| {
+                            RelPath::new(Path::new(&location.path), PathStyle::Unix).ok()
+                        });
+                        let location =
+                            path.as_ref()
+                                .zip(location.as_ref())
+                                .map(|(path, location)| ::settings::SettingsLocation {
+                                    worktree_id: WorktreeId::from_proto(location.worktree_id),
+                                    path,
+                                });
+                        cx.update(|cx| {
+                            let markdown = LanguageName::new("Markdown");
+                            let settings = AllLanguageSettings::get(location, cx).language(
+                                location,
+                                Some(&markdown),
+                                cx,
+                            );
+                            extension_settings_json(
+                                &settings.visual_md,
+                                &extension_id,
+                                key.as_deref(),
+                            )
+                        })
+                    }
+                    .boxed_local()
+                })
+                .await
+                .to_wasmtime_result();
+        }
+
         latest::ExtensionImports::get_settings(
             self,
             location.map(|location| location.into()),
@@ -737,6 +797,57 @@ mod tests {
                 detail: Some("a.md".to_string()),
                 insert_text: "alpha".to_string(),
             }
+        );
+    }
+
+    fn settings_with_extensions(
+        extensions: serde_json::Value,
+    ) -> ::settings::VisualMdSettingsContent {
+        ::settings::VisualMdSettingsContent {
+            extensions: serde_json::from_value(extensions).ok(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_an_extension_is_given_only_its_own_settings() {
+        let settings = settings_with_extensions(serde_json::json!({
+            "mine": { "notes": ["a", "b"], "limit": 3 },
+            "theirs": { "secret": "token" },
+        }));
+
+        let json = |id: &str, key: Option<&str>| {
+            extension_settings_json(&settings, id, key).expect("the settings serialize")
+        };
+
+        assert_eq!(json("mine", None), r#"{"notes":["a","b"],"limit":3}"#);
+        assert_eq!(json("theirs", None), r#"{"secret":"token"}"#);
+        assert_eq!(json("mine", Some("notes")), r#"["a","b"]"#);
+        assert!(!json("mine", None).contains("token"));
+        assert!(!json("mine", Some("secret")).contains("token"));
+    }
+
+    #[test]
+    fn test_missing_settings_are_null() {
+        let settings = settings_with_extensions(serde_json::json!({ "mine": { "a": 1 } }));
+
+        assert_eq!(
+            extension_settings_json(&settings, "other", None)
+                .ok()
+                .as_deref(),
+            Some("null")
+        );
+        assert_eq!(
+            extension_settings_json(&settings, "mine", Some("missing"))
+                .ok()
+                .as_deref(),
+            Some("null")
+        );
+        assert_eq!(
+            extension_settings_json(&Default::default(), "mine", None)
+                .ok()
+                .as_deref(),
+            Some("null")
         );
     }
 
