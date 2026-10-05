@@ -297,6 +297,35 @@ impl From<f32> for CodeFade {
     }
 }
 
+/// A multiplier of the base font size, wrapping around `f32` for custom
+/// settings UI rendering.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    PartialOrd,
+    derive_more::FromStr,
+)]
+#[serde(transparent)]
+pub struct HeadingScale(#[serde(serialize_with = "serialize_f32_with_two_decimal_places")] pub f32);
+
+impl Display for HeadingScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:.2}", self.0)
+    }
+}
+
+impl From<f32> for HeadingScale {
+    fn from(x: f32) -> Self {
+        Self(x)
+    }
+}
+
 fn default_font_features() -> Option<FontFeaturesContent> {
     Some(FontFeaturesContent::default())
 }

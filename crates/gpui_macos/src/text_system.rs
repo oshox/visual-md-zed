@@ -624,6 +624,7 @@ impl MacTextSystemState {
             ascent: max_ascent.into(),
             descent: max_descent.into(),
             len: text.len(),
+            ..Default::default()
         }
     }
 }

@@ -1692,6 +1692,152 @@ fn keymap_page() -> SettingsPage {
     }
 }
 
+fn visual_md_settings(
+    settings_content: &SettingsContent,
+) -> Option<&settings::VisualMdSettingsContent> {
+    settings_content
+        .project
+        .all_languages
+        .defaults
+        .visual_md
+        .as_ref()
+}
+
+fn visual_md_settings_mut(
+    settings_content: &mut SettingsContent,
+) -> &mut settings::VisualMdSettingsContent {
+    settings_content
+        .project
+        .all_languages
+        .defaults
+        .visual_md
+        .get_or_insert_default()
+}
+
+/// For a setting that has no default in `default.json` because leaving it unset
+/// is what keeps the rendering live preview has without it.
+fn allow_unset() -> Option<Box<SettingsFieldMetadata>> {
+    Some(Box::new(SettingsFieldMetadata {
+        allow_unset: true,
+        ..Default::default()
+    }))
+}
+
+fn ui_font_family(settings_content: &SettingsContent) -> Option<&settings::FontFamilyName> {
+    settings_content.theme.ui_font_family.as_ref()
+}
+
+fn buffer_font_family(settings_content: &SettingsContent) -> Option<&settings::FontFamilyName> {
+    settings_content.theme.buffer_font_family.as_ref()
+}
+
+fn buffer_font_size(settings_content: &SettingsContent) -> Option<&settings::FontSize> {
+    settings_content.theme.buffer_font_size.as_ref()
+}
+
+fn buffer_font_weight(settings_content: &SettingsContent) -> Option<&settings::FontWeightContent> {
+    settings_content.theme.buffer_font_weight.as_ref()
+}
+
+/// The font headings use when `heading_font_family` is unset: the prose font.
+fn prose_font_family(settings_content: &SettingsContent) -> Option<&settings::FontFamilyName> {
+    visual_md_settings(settings_content)
+        .and_then(|visual_md| visual_md.prose_font_family.as_ref())
+        .or_else(|| ui_font_family(settings_content))
+}
+
+/// A Markdown live preview setting that is a direct field of `visual_md`.
+/// `$fallback` names a function giving the value that applies while the setting
+/// is unset, shown instead of an empty control.
+macro_rules! visual_md_item {
+    ($title:expr, $description:expr, $path:expr, $field:ident, $fallback:path) => {
+        SettingsPageItem::SettingItem(SettingItem {
+            title: $title,
+            description: $description,
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some($path),
+                pick: |settings_content| {
+                    visual_md_settings(settings_content)
+                        .and_then(|visual_md| visual_md.$field.as_ref())
+                        .or($fallback(settings_content))
+                },
+                write: |settings_content, value, _| {
+                    visual_md_settings_mut(settings_content).$field = value;
+                },
+            }),
+            metadata: allow_unset(),
+            files: USER | PROJECT,
+        })
+    };
+}
+
+/// A Markdown live preview setting inside one of `visual_md`'s objects, such as
+/// `colors` or `heading_sizes`.
+macro_rules! visual_md_nested_item {
+    ($title:expr, $description:expr, $path:expr, $outer:ident, $field:ident, $metadata:expr) => {
+        SettingsPageItem::SettingItem(SettingItem {
+            title: $title,
+            description: $description,
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some($path),
+                pick: |settings_content| {
+                    visual_md_settings(settings_content)?
+                        .$outer
+                        .as_ref()?
+                        .$field
+                        .as_ref()
+                },
+                write: |settings_content, value, _| {
+                    visual_md_settings_mut(settings_content)
+                        .$outer
+                        .get_or_insert_default()
+                        .$field = value;
+                },
+            }),
+            metadata: $metadata,
+            files: USER | PROJECT,
+        })
+    };
+}
+
+/// A color setting of one callout type, which lives in the `colors.callout` map.
+macro_rules! visual_md_callout_color_item {
+    ($title:expr, $description:expr, $path:expr, $name:literal, $field:ident) => {
+        SettingsPageItem::SettingItem(SettingItem {
+            title: $title,
+            description: $description,
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some($path),
+                pick: |settings_content| {
+                    visual_md_settings(settings_content)?
+                        .colors
+                        .as_ref()?
+                        .callout
+                        .as_ref()?
+                        .get($name)?
+                        .$field
+                        .as_ref()
+                },
+                write: |settings_content, value, _| {
+                    visual_md_settings_mut(settings_content)
+                        .colors
+                        .get_or_insert_default()
+                        .callout
+                        .get_or_insert_default()
+                        .entry($name.to_string())
+                        .or_default()
+                        .$field = value;
+                },
+            }),
+            metadata: allow_unset(),
+            files: USER | PROJECT,
+        })
+    };
+}
+
 fn editor_page() -> SettingsPage {
     fn auto_save_section() -> [SettingsPageItem; 2] {
         [
@@ -1867,6 +2013,499 @@ fn editor_page() -> SettingsPage {
                     },
                 }),
                 metadata: None,
+                files: USER | PROJECT,
+            }),
+        ]
+    }
+
+    fn markdown_live_preview_fonts_section() -> Vec<SettingsPageItem> {
+        vec![
+            SettingsPageItem::SectionHeader("Markdown Live Preview Fonts"),
+            visual_md_item!(
+                "Prose Font Family",
+                "Font family for Markdown prose. Falls back to the UI font family.",
+                "visual_md.prose_font_family",
+                prose_font_family,
+                ui_font_family
+            ),
+            visual_md_item!(
+                "Prose Font Size",
+                "Font size for Markdown prose, following the editor font size zoom. Falls back to the editor font size.",
+                "visual_md.prose_font_size",
+                prose_font_size,
+                buffer_font_size
+            ),
+            visual_md_item!(
+                "Prose Font Weight",
+                "Font weight for Markdown prose (100-900). Falls back to the editor font weight.",
+                "visual_md.prose_font_weight",
+                prose_font_weight,
+                buffer_font_weight
+            ),
+            SettingsPageItem::DynamicItem(DynamicItem {
+                discriminant: SettingItem {
+                    files: USER | PROJECT,
+                    title: "Prose Line Height",
+                    description: "Line height for Markdown prose. Falls back to the editor line height.",
+                    field: Box::new(SettingField {
+                        organization_override: None,
+                        json_path: Some("visual_md.prose_line_height$"),
+                        pick: |settings_content| {
+                            let line_height = visual_md_settings(settings_content)?
+                                .prose_line_height
+                                .as_ref()
+                                .or(settings_content.theme.buffer_line_height.as_ref())?;
+                            dynamic_variants::<settings::BufferLineHeight>()
+                                .get(line_height.discriminant() as usize)
+                        },
+                        write: |settings_content, value, _| {
+                            let Some(value) = value else {
+                                visual_md_settings_mut(settings_content).prose_line_height = None;
+                                return;
+                            };
+                            let settings_value = visual_md_settings_mut(settings_content)
+                                .prose_line_height
+                                .get_or_insert_with(settings::BufferLineHeight::default);
+                            *settings_value = match value {
+                                settings::BufferLineHeightDiscriminants::Comfortable => {
+                                    settings::BufferLineHeight::Comfortable
+                                }
+                                settings::BufferLineHeightDiscriminants::Standard => {
+                                    settings::BufferLineHeight::Standard
+                                }
+                                settings::BufferLineHeightDiscriminants::Custom => {
+                                    let custom_value =
+                                        theme_settings::buffer_line_height_from_settings(
+                                            *settings_value,
+                                        )
+                                        .value();
+                                    settings::BufferLineHeight::Custom(custom_value)
+                                }
+                            };
+                        },
+                    }),
+                    metadata: allow_unset(),
+                },
+                pick_discriminant: |settings_content| {
+                    let line_height = visual_md_settings(settings_content)?
+                        .prose_line_height
+                        .as_ref()
+                        .or(settings_content.theme.buffer_line_height.as_ref())?;
+                    Some(line_height.discriminant() as usize)
+                },
+                fields: dynamic_variants::<settings::BufferLineHeight>()
+                    .iter()
+                    .map(|variant| match variant {
+                        settings::BufferLineHeightDiscriminants::Comfortable => vec![],
+                        settings::BufferLineHeightDiscriminants::Standard => vec![],
+                        settings::BufferLineHeightDiscriminants::Custom => vec![SettingItem {
+                            files: USER | PROJECT,
+                            title: "Custom Prose Line Height",
+                            description: "Custom line height value (must be at least 1.0).",
+                            field: Box::new(SettingField {
+                                organization_override: None,
+                                json_path: Some("visual_md.prose_line_height"),
+                                pick: |settings_content| match visual_md_settings(settings_content)?
+                                    .prose_line_height
+                                    .as_ref()
+                                {
+                                    Some(settings::BufferLineHeight::Custom(value)) => Some(value),
+                                    _ => None,
+                                },
+                                write: |settings_content, value, _| {
+                                    let Some(value) = value else {
+                                        return;
+                                    };
+                                    if let Some(settings::BufferLineHeight::Custom(line_height)) =
+                                        visual_md_settings_mut(settings_content)
+                                            .prose_line_height
+                                            .as_mut()
+                                    {
+                                        *line_height = f32::max(value, 1.0);
+                                    }
+                                },
+                            }),
+                            metadata: allow_unset(),
+                        }],
+                    })
+                    .collect(),
+            }),
+            visual_md_item!(
+                "Code Font Family",
+                "Font family for inline code and code blocks. Falls back to the editor font family.",
+                "visual_md.code_font_family",
+                code_font_family,
+                buffer_font_family
+            ),
+            visual_md_item!(
+                "Code Font Size",
+                "Font size for inline code and code blocks, following the editor font size zoom. Falls back to the editor font size.",
+                "visual_md.code_font_size",
+                code_font_size,
+                buffer_font_size
+            ),
+            visual_md_item!(
+                "Heading Font Family",
+                "Font family for headings. Falls back to the prose font family.",
+                "visual_md.heading_font_family",
+                heading_font_family,
+                prose_font_family
+            ),
+        ]
+    }
+
+    fn markdown_live_preview_headings_section() -> Vec<SettingsPageItem> {
+        vec![
+            SettingsPageItem::SectionHeader("Markdown Live Preview Headings"),
+            visual_md_nested_item!(
+                "Heading 1 Size",
+                "Font size of H1 headings as a multiple of the prose font size.",
+                "visual_md.heading_sizes.h1",
+                heading_sizes,
+                h1,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 2 Size",
+                "Font size of H2 headings as a multiple of the prose font size.",
+                "visual_md.heading_sizes.h2",
+                heading_sizes,
+                h2,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 3 Size",
+                "Font size of H3 headings as a multiple of the prose font size.",
+                "visual_md.heading_sizes.h3",
+                heading_sizes,
+                h3,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 4 Size",
+                "Font size of H4 headings as a multiple of the prose font size.",
+                "visual_md.heading_sizes.h4",
+                heading_sizes,
+                h4,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 5 Size",
+                "Font size of H5 headings as a multiple of the prose font size.",
+                "visual_md.heading_sizes.h5",
+                heading_sizes,
+                h5,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 6 Size",
+                "Font size of H6 headings as a multiple of the prose font size.",
+                "visual_md.heading_sizes.h6",
+                heading_sizes,
+                h6,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 1 Weight",
+                "Font weight of H1 headings (100-900).",
+                "visual_md.heading_weights.h1",
+                heading_weights,
+                h1,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 2 Weight",
+                "Font weight of H2 headings (100-900).",
+                "visual_md.heading_weights.h2",
+                heading_weights,
+                h2,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 3 Weight",
+                "Font weight of H3 headings (100-900).",
+                "visual_md.heading_weights.h3",
+                heading_weights,
+                h3,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 4 Weight",
+                "Font weight of H4 headings (100-900).",
+                "visual_md.heading_weights.h4",
+                heading_weights,
+                h4,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 5 Weight",
+                "Font weight of H5 headings (100-900).",
+                "visual_md.heading_weights.h5",
+                heading_weights,
+                h5,
+                None
+            ),
+            visual_md_nested_item!(
+                "Heading 6 Weight",
+                "Font weight of H6 headings (100-900).",
+                "visual_md.heading_weights.h6",
+                heading_weights,
+                h6,
+                None
+            ),
+        ]
+    }
+
+    fn markdown_live_preview_colors_section() -> Vec<SettingsPageItem> {
+        vec![
+            SettingsPageItem::SectionHeader("Markdown Live Preview Colors"),
+            visual_md_nested_item!(
+                "Heading Color",
+                "Text color of every heading level, as a hex color. Falls back to the theme's `visual_md.heading` token.",
+                "visual_md.colors.heading",
+                colors,
+                heading,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Heading 1 Color",
+                "Text color of H1 headings, overriding the heading color.",
+                "visual_md.colors.heading.1",
+                colors,
+                heading_1,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Heading 2 Color",
+                "Text color of H2 headings, overriding the heading color.",
+                "visual_md.colors.heading.2",
+                colors,
+                heading_2,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Heading 3 Color",
+                "Text color of H3 headings, overriding the heading color.",
+                "visual_md.colors.heading.3",
+                colors,
+                heading_3,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Heading 4 Color",
+                "Text color of H4 headings, overriding the heading color.",
+                "visual_md.colors.heading.4",
+                colors,
+                heading_4,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Heading 5 Color",
+                "Text color of H5 headings, overriding the heading color.",
+                "visual_md.colors.heading.5",
+                colors,
+                heading_5,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Heading 6 Color",
+                "Text color of H6 headings, overriding the heading color.",
+                "visual_md.colors.heading.6",
+                colors,
+                heading_6,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Bold Color",
+                "Text color of bold text. Falls back to the theme's `visual_md.bold` token.",
+                "visual_md.colors.bold",
+                colors,
+                bold,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Italic Color",
+                "Text color of italic text. Falls back to the theme's `visual_md.italic` token.",
+                "visual_md.colors.italic",
+                colors,
+                italic,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Strikethrough Color",
+                "Text color of struck-through text. Falls back to the theme's `visual_md.strikethrough` token.",
+                "visual_md.colors.strikethrough",
+                colors,
+                strikethrough,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Highlight Background",
+                "Background color of ==highlighted== text. Highlights have no background by default.",
+                "visual_md.colors.highlight.background",
+                colors,
+                highlight_background,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Inline Code Color",
+                "Text color of inline code. By default it keeps the color the editor's syntax theme gives it.",
+                "visual_md.colors.inline_code",
+                colors,
+                inline_code,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Inline Code Background",
+                "Background color of inline code. Inline code has no background by default.",
+                "visual_md.colors.inline_code.background",
+                colors,
+                inline_code_background,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Link Color",
+                "Text color of links. Falls back to the theme's `visual_md.link` token.",
+                "visual_md.colors.link",
+                colors,
+                link,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Marker Color",
+                "Color of the dimmed Markdown syntax shown on the line the cursor is on.",
+                "visual_md.colors.marker",
+                colors,
+                marker,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Blockquote Bar Color",
+                "Color of the bar beside blockquotes. Falls back to the theme's border color.",
+                "visual_md.colors.blockquote.bar",
+                colors,
+                blockquote_bar,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Horizontal Rule Color",
+                "Color of horizontal rules. Falls back to the theme's border color.",
+                "visual_md.colors.rule",
+                colors,
+                rule,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Table Border Color",
+                "Color of table borders and the header divider. Falls back to the theme's border color.",
+                "visual_md.colors.table.border",
+                colors,
+                table_border,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Code Block Border Color",
+                "Color of the border around fenced code blocks. Falls back to the theme's border color.",
+                "visual_md.colors.code_block.border",
+                colors,
+                code_block_border,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Code Block Background",
+                "Background color of fenced code blocks. Code blocks have no background by default.",
+                "visual_md.colors.code_block.background",
+                colors,
+                code_block_background,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Checked Task Color",
+                "Color of a checked task checkbox. Falls back to the theme's accent icon color.",
+                "visual_md.colors.task.checked",
+                colors,
+                task_checked,
+                allow_unset()
+            ),
+            visual_md_callout_color_item!(
+                "Note Callout Accent",
+                "Color of the icon and title of `[!note]` callouts, which also covers `[!info]`.",
+                "visual_md.colors.callout.note.accent",
+                "note",
+                accent
+            ),
+            visual_md_callout_color_item!(
+                "Note Callout Background",
+                "Background color of `[!note]` callouts.",
+                "visual_md.colors.callout.note.background",
+                "note",
+                background
+            ),
+            visual_md_callout_color_item!(
+                "Tip Callout Accent",
+                "Color of the icon and title of `[!tip]` callouts, which also covers `[!hint]` and `[!success]`.",
+                "visual_md.colors.callout.tip.accent",
+                "tip",
+                accent
+            ),
+            visual_md_callout_color_item!(
+                "Tip Callout Background",
+                "Background color of `[!tip]` callouts.",
+                "visual_md.colors.callout.tip.background",
+                "tip",
+                background
+            ),
+            visual_md_callout_color_item!(
+                "Warning Callout Accent",
+                "Color of the icon and title of `[!warning]` callouts, which also covers `[!caution]`.",
+                "visual_md.colors.callout.warning.accent",
+                "warning",
+                accent
+            ),
+            visual_md_callout_color_item!(
+                "Warning Callout Background",
+                "Background color of `[!warning]` callouts.",
+                "visual_md.colors.callout.warning.background",
+                "warning",
+                background
+            ),
+            visual_md_callout_color_item!(
+                "Danger Callout Accent",
+                "Color of the icon and title of `[!danger]` callouts, which also covers `[!error]`, `[!bug]` and `[!failure]`.",
+                "visual_md.colors.callout.danger.accent",
+                "danger",
+                accent
+            ),
+            visual_md_callout_color_item!(
+                "Danger Callout Background",
+                "Background color of `[!danger]` callouts.",
+                "visual_md.colors.callout.danger.background",
+                "danger",
+                background
+            ),
+        ]
+    }
+
+    fn markdown_live_preview_callouts_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Markdown Live Preview Callouts"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Custom Callout Types",
+                description: "Callout types with their own icon and colors, keyed by the name written in `> [!name]`.",
+                field: Box::new(
+                    SettingField {
+                        organization_override: None,
+                        json_path: Some("visual_md.callouts"),
+                        pick: |settings_content| {
+                            visual_md_settings(settings_content)?.callouts.as_ref()
+                        },
+                        write: |settings_content, value, _| {
+                            visual_md_settings_mut(settings_content).callouts = value;
+                        },
+                    }
+                    .unimplemented(),
+                ),
+                metadata: allow_unset(),
                 files: USER | PROJECT,
             }),
         ]
@@ -3343,6 +3982,10 @@ fn editor_page() -> SettingsPage {
         auto_save_section(),
         which_key_section(),
         markdown_live_preview_section(),
+        markdown_live_preview_fonts_section(),
+        markdown_live_preview_headings_section(),
+        markdown_live_preview_colors_section(),
+        markdown_live_preview_callouts_section(),
         multibuffer_section(),
         scrolling_section(),
         signature_help_section(),

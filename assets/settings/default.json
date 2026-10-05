@@ -147,6 +147,55 @@
     // Whether to render Markdown buffers with live preview instead of plain
     // source text.
     "enabled": true,
+    // Fonts. A font left null keeps the default noted on each line.
+    // Prose font family. Default: the UI font.
+    "prose_font_family": null,
+    // Prose font size in pixels, following the buffer font size zoom.
+    // Default: the buffer font size.
+    "prose_font_size": null,
+    // Prose font weight. Default: the buffer font weight.
+    "prose_font_weight": null,
+    // Prose line height: "comfortable", "standard" or { "custom": 1.5 }.
+    // Default: the buffer line height.
+    "prose_line_height": null,
+    // Font family of inline code and fenced code blocks.
+    // Default: the buffer font.
+    "code_font_family": null,
+    // Font size of inline code and fenced code blocks in pixels, following
+    // the buffer font size zoom. Default: the buffer font size.
+    "code_font_size": null,
+    // Heading font family. Default: the prose font.
+    "heading_font_family": null,
+    // Heading font size multipliers, relative to the prose font size.
+    "heading_sizes": {
+      "h1": 1.8,
+      "h2": 1.5,
+      "h3": 1.3,
+      "h4": 1.15,
+      "h5": 1.05,
+      "h6": 1.0,
+    },
+    // Heading font weights.
+    "heading_weights": {
+      "h1": 700,
+      "h2": 700,
+      "h3": 700,
+      "h4": 700,
+      "h5": 700,
+      "h6": 700,
+    },
+    // Colors as hex strings, for example `"heading.1": "#ff8800"`. Keys:
+    // heading, heading.1 to heading.6, bold, italic, strikethrough,
+    // highlight.background, inline_code, inline_code.background, link, marker,
+    // blockquote.bar, rule, table.border, code_block.border,
+    // code_block.background, task.checked, and callout.<type> with accent and
+    // background. A color left unset falls back to the `visual_md.*` token of
+    // the same name in the active theme's `syntax` map, then to a default
+    // derived from the theme.
+    "colors": {},
+    // Custom callout types, for example
+    // `"todo": { "icon": "check", "accent": "#3b82f6", "background": "#3b82f622" }`.
+    "callouts": {},
   },
   // Whether to show the informational hover box when moving the mouse
   // over symbols in the editor.

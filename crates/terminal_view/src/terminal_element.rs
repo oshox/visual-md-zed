@@ -923,6 +923,7 @@ impl TerminalElement {
             },
             underline,
             strikethrough,
+            font_size: None,
         };
 
         if let Some((style, range)) = hyperlink
@@ -1233,6 +1234,7 @@ impl Element for TerminalElement {
                     fade_out: None,
                     font_family: None,
                     font_size_scale: None,
+                    run_font_size_scale: None,
                 };
 
                 let text_style = TextStyle {

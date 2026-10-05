@@ -445,6 +445,9 @@ struct SettingsFieldMetadata {
     display_clear_button: bool,
     confirm_on_focus_out: bool,
     treat_missing_text_as_empty: bool,
+    /// The setting has no value in any file, including the defaults, and
+    /// leaving it unset is its normal state rather than a missing default.
+    allow_unset: bool,
 }
 
 pub fn init(cx: &mut App) {
@@ -620,6 +623,8 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<NonZero<usize>>(render_editable_number_field)
         .add_basic_renderer::<NonZeroU32>(render_editable_number_field)
         .add_basic_renderer::<settings::CodeFade>(render_editable_number_field)
+        .add_basic_renderer::<settings::HeadingScale>(render_editable_number_field)
+        .add_basic_renderer::<settings::ThemeColor>(render_color_field)
         .add_basic_renderer::<settings::DelayMs>(render_editable_number_field)
         .add_basic_renderer::<settings::FontWeightContent>(render_editable_number_field)
         .add_basic_renderer::<settings::PixelSetting>(render_editable_number_field)
@@ -1151,7 +1156,11 @@ impl SettingsPageItem {
                     renderers.get(&AnySettingField::type_id(setting_item.field.as_ref()));
                 let field_renderer_or_warning =
                     field_renderer.ok_or("NO RENDERER").and_then(|renderer| {
-                        if cfg!(debug_assertions) && !found {
+                        let allow_unset = setting_item
+                            .metadata
+                            .as_deref()
+                            .is_some_and(|metadata| metadata.allow_unset);
+                        if cfg!(debug_assertions) && !found && !allow_unset {
                             Err("NO DEFAULT")
                         } else {
                             Ok(renderer)
@@ -4975,6 +4984,78 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
         .into_any_element()
 }
 
+/// A hex color: a swatch of the current value next to a text input. Empty text
+/// clears the setting, and text that is not a color is not written.
+fn render_color_field(
+    field: SettingField<settings::ThemeColor>,
+    file: SettingsUiFile,
+    metadata: Option<&SettingsFieldMetadata>,
+    title: &'static str,
+    description: &'static str,
+    _window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    use theme::ActiveTheme as _;
+
+    let (_, initial) =
+        SettingsStore::global(cx).get_value_from_file(file.to_settings(), field.pick);
+    let initial_text = initial
+        .map(|color| color.to_string())
+        .filter(|text| !text.is_empty());
+    let swatch_color = initial_text
+        .as_deref()
+        .and_then(|text| theme::try_parse_color(text).ok());
+    let border = cx.theme().colors().border;
+    let placeholder = metadata
+        .and_then(|metadata| metadata.placeholder)
+        .unwrap_or("Theme default");
+
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .size_5()
+                .flex_none()
+                .rounded_sm()
+                .border_1()
+                .border_color(border)
+                .when_some(swatch_color, |swatch, color| swatch.bg(color)),
+        )
+        .child(
+            SettingsInputField::new(field.json_path.unwrap_or("settings-color-field"))
+                .tab_index(0)
+                .aria_label(title)
+                .when(!description.is_empty(), |editor| {
+                    editor.aria_description(description)
+                })
+                .when_some(initial_text, |editor, text| editor.with_initial_text(text))
+                .with_placeholder(placeholder)
+                .display_clear_button()
+                .confirm_on_focus_out()
+                .on_confirm(move |new_text, window, cx| {
+                    let new_text = new_text.filter(|text| !text.is_empty());
+                    if new_text
+                        .as_deref()
+                        .is_some_and(|text| theme::try_parse_color(text).is_err())
+                    {
+                        return;
+                    }
+                    update_settings_file(
+                        file.clone(),
+                        field.json_path,
+                        window,
+                        cx,
+                        move |settings, app| {
+                            (field.write)(settings, new_text.map(Into::into), app);
+                        },
+                    )
+                    .log_err(); // todo(settings_ui) don't log err
+                }),
+        )
+        .into_any_element()
+}
+
 fn render_toggle_button<B: Into<bool> + From<bool> + Copy>(
     field: SettingField<B>,
     file: SettingsUiFile,
@@ -5410,6 +5491,146 @@ pub mod test {
         editor::init(cx);
         menu::init();
         language_model::init(cx);
+    }
+
+    /// Every `SettingItem` on the Editor page whose JSON path is under
+    /// `visual_md.`, including the sub-fields of dynamic items.
+    fn visual_md_items(pages: &[SettingsPage]) -> Vec<&SettingItem> {
+        let mut items = Vec::new();
+        for page in pages {
+            for page_item in page.items.iter() {
+                match page_item {
+                    SettingsPageItem::SettingItem(item) => items.push(item),
+                    SettingsPageItem::DynamicItem(dynamic) => {
+                        items.push(&dynamic.discriminant);
+                        items.extend(dynamic.fields.iter().flatten());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        items.retain(|item| {
+            item.field
+                .json_path()
+                .is_some_and(|path| path.starts_with("visual_md."))
+        });
+        items
+    }
+
+    #[gpui::test]
+    fn test_markdown_live_preview_items_have_renderers_and_defaults(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            register_settings(cx);
+            init_renderers(cx);
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state, cx);
+            let renderers = cx
+                .default_global::<SettingFieldRenderer>()
+                .renderers
+                .clone();
+            let pages = page_data::settings_data(cx);
+            let items = visual_md_items(&pages);
+
+            // Fonts, headings, colors, callouts and the enabled switch.
+            assert!(items.len() > 40, "found only {} items", items.len());
+            for item in items {
+                let path = item.field.json_path().unwrap_or_default();
+                assert!(
+                    renderers
+                        .borrow()
+                        .contains_key(&AnySettingField::type_id(item.field.as_ref())),
+                    "{path} has no renderer"
+                );
+                let (_, found) = item.field.file_set_in(SettingsUiFile::User, cx);
+                let allow_unset = item
+                    .metadata
+                    .as_deref()
+                    .is_some_and(|metadata| metadata.allow_unset);
+                assert!(
+                    found || allow_unset,
+                    "{path} has no default and does not allow being unset"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn test_markdown_live_preview_items_write_and_clear(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            register_settings(cx);
+            let app_state = AppState::test(cx);
+            AppState::set_global(app_state, cx);
+            let pages = page_data::settings_data(cx);
+            let items = visual_md_items(&pages);
+            let field_for = |path: &str| {
+                items
+                    .iter()
+                    .find(|item| item.field.json_path() == Some(path))
+                    .unwrap_or_else(|| panic!("no item for {path}"))
+            };
+
+            let mut content = SettingsContent::default();
+
+            let link = field_for("visual_md.colors.link")
+                .field
+                .as_any()
+                .downcast_ref::<SettingField<settings::ThemeColor>>()
+                .expect("the link color is a color field");
+            (link.write)(&mut content, Some("#ff0000".into()), cx);
+            assert_eq!((link.pick)(&content), Some(&"#ff0000".into()));
+            (link.write)(&mut content, None, cx);
+            assert_eq!((link.pick)(&content), None);
+
+            let heading_size = field_for("visual_md.heading_sizes.h2")
+                .field
+                .as_any()
+                .downcast_ref::<SettingField<settings::HeadingScale>>()
+                .expect("a heading size is a scale field");
+            (heading_size.write)(&mut content, Some(settings::HeadingScale(2.0)), cx);
+            assert_eq!(
+                (heading_size.pick)(&content),
+                Some(&settings::HeadingScale(2.0))
+            );
+            (heading_size.write)(&mut content, None, cx);
+            assert_eq!((heading_size.pick)(&content), None);
+
+            let note_accent = field_for("visual_md.colors.callout.note.accent")
+                .field
+                .as_any()
+                .downcast_ref::<SettingField<settings::ThemeColor>>()
+                .expect("a callout accent is a color field");
+            let note_background = field_for("visual_md.colors.callout.note.background")
+                .field
+                .as_any()
+                .downcast_ref::<SettingField<settings::ThemeColor>>()
+                .expect("a callout background is a color field");
+            (note_accent.write)(&mut content, Some("#00ff00".into()), cx);
+            (note_background.write)(&mut content, Some("#0000ff".into()), cx);
+            assert_eq!((note_accent.pick)(&content), Some(&"#00ff00".into()));
+            assert_eq!((note_background.pick)(&content), Some(&"#0000ff".into()));
+            (note_accent.write)(&mut content, None, cx);
+            assert_eq!((note_accent.pick)(&content), None);
+            assert_eq!((note_background.pick)(&content), Some(&"#0000ff".into()));
+
+            let prose_family = field_for("visual_md.prose_font_family")
+                .field
+                .as_any()
+                .downcast_ref::<SettingField<settings::FontFamilyName>>()
+                .expect("the prose font family is a font field");
+            (prose_family.write)(&mut content, Some("Some Font".to_string().into()), cx);
+            assert_eq!(
+                (prose_family.pick)(&content).map(AsRef::<str>::as_ref),
+                Some("Some Font")
+            );
+            (prose_family.write)(&mut content, None, cx);
+            // Unset, the item shows the font that applies instead.
+            assert_eq!((prose_family.pick)(&content), None);
+            content.theme.ui_font_family = Some("UI Font".to_string().into());
+            assert_eq!(
+                (prose_family.pick)(&content).map(AsRef::<str>::as_ref),
+                Some("UI Font")
+            );
+        });
     }
 
     fn parse(input: &'static str, window: &mut Window, cx: &mut App) -> SettingsWindow {

@@ -1263,7 +1263,7 @@ impl EditorElement {
 
                             let shaped = window.text_system().shape_line(
                                 text,
-                                cursor_row_layout.font_size,
+                                cursor_row_layout.font_size_for_index(cursor_column),
                                 &[TextRun {
                                     len,
                                     font,
@@ -3316,7 +3316,6 @@ impl EditorElement {
         let mut line_elements = SmallVec::new();
         for (ix, line) in line_layouts.iter_mut().enumerate() {
             line.prepaint_with_custom_offset(
-                line_height,
                 scroll_pixel_position,
                 content_origin,
                 line_ys[ix],
@@ -7476,6 +7475,11 @@ impl LineWithInvisibles {
         let mut width = Pixels::ZERO;
         let mut len = 0;
         let mut styles = Vec::new();
+        // `HighlightStyle::run_font_size_scale` of each entry in `styles`. It
+        // can only be turned into an absolute size once the whole row has been
+        // seen, because a later chunk may still set the row's own size.
+        let mut run_scales: Vec<Option<f32>> = Vec::new();
+        let mut tallest_run_scale = 1.0f32;
         let mut non_whitespace_added = false;
         let mut row = 0;
         let mut line_exceeded_max_len = false;
@@ -7516,6 +7520,7 @@ impl LineWithInvisibles {
                 }
 
                 if !line.is_empty() {
+                    Self::resolve_run_font_sizes(&mut styles, &run_scales, current_row_font_size);
                     let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
                     let text_runs: &[TextRun] = if segments.is_empty() {
                         &styles
@@ -7534,6 +7539,7 @@ impl LineWithInvisibles {
                     fragments.push(LineFragment::Text(shaped_line));
                     line.clear();
                     styles.clear();
+                    run_scales.clear();
                 }
 
                 match replacement {
@@ -7564,7 +7570,11 @@ impl LineWithInvisibles {
                         // replacement element sized for this row (e.g. a hidden
                         // heading marker) isn't shorter than the row's text.
                         let line_height = uniform_line_height
-                            * (f32::from(current_row_font_size) / f32::from(font_size));
+                            * Self::row_height_scale(
+                                current_row_font_size,
+                                font_size,
+                                tallest_run_scale,
+                            );
                         let size = element.layout_as_root(
                             size(available_width, AvailableSpace::Definite(line_height)),
                             window,
@@ -7588,6 +7598,12 @@ impl LineWithInvisibles {
                             Cow::Borrowed(text_style)
                         };
 
+                        let run_scale = highlighted_chunk
+                            .style
+                            .and_then(|style| style.run_font_size_scale);
+                        if let Some(scale) = run_scale {
+                            tallest_run_scale = tallest_run_scale.max(scale);
+                        }
                         let run = TextRun {
                             len: x.len(),
                             font: text_style.font(),
@@ -7595,6 +7611,7 @@ impl LineWithInvisibles {
                             background_color: text_style.background_color,
                             underline: text_style.underline,
                             strikethrough: text_style.strikethrough,
+                            font_size: run_scale.map(|scale| current_row_font_size * scale),
                         };
 
                         let line_layout = window
@@ -7617,6 +7634,11 @@ impl LineWithInvisibles {
             } else {
                 for (ix, mut line_chunk) in highlighted_chunk.text.split('\n').enumerate() {
                     if ix > 0 {
+                        Self::resolve_run_font_sizes(
+                            &mut styles,
+                            &run_scales,
+                            current_row_font_size,
+                        );
                         let segments = bg_segments_per_row.get(row).map(|v| &v[..]).unwrap_or(&[]);
                         let text_runs = if segments.is_empty() {
                             &styles
@@ -7644,13 +7666,19 @@ impl LineWithInvisibles {
                             point_diagnostics: Vec::new(),
                             font_size: current_row_font_size,
                             row_height: uniform_line_height
-                                * (f32::from(current_row_font_size) / f32::from(font_size)),
+                                * Self::row_height_scale(
+                                    current_row_font_size,
+                                    font_size,
+                                    tallest_run_scale,
+                                ),
                             row_top: Pixels::ZERO,
                         });
 
                         line.clear();
                         line_byte_offset = 0;
                         styles.clear();
+                        run_scales.clear();
+                        tallest_run_scale = 1.0;
                         row += 1;
                         // The next row starts back at the uniform size unless a
                         // later chunk on it declares its own `font_size_scale`.
@@ -7683,6 +7711,13 @@ impl LineWithInvisibles {
                             continue;
                         }
 
+                        let run_scale = highlighted_chunk
+                            .style
+                            .and_then(|style| style.run_font_size_scale);
+                        if let Some(scale) = run_scale {
+                            tallest_run_scale = tallest_run_scale.max(scale);
+                        }
+                        run_scales.push(run_scale);
                         styles.push(TextRun {
                             len: line_chunk.len(),
                             font: text_style.font(),
@@ -7690,6 +7725,7 @@ impl LineWithInvisibles {
                             background_color: text_style.background_color,
                             underline: text_style.underline,
                             strikethrough: text_style.strikethrough,
+                            font_size: None,
                         });
 
                         if let Some(severity) = highlighted_chunk.diagnostic_underline_severity {
@@ -7740,6 +7776,27 @@ impl LineWithInvisibles {
         }
 
         layouts
+    }
+
+    /// Gives each run in `runs` its absolute font size, from the row's size and
+    /// the run's own `run_font_size_scale`. A run without a scale keeps `None`,
+    /// which shapes at the row's size.
+    fn resolve_run_font_sizes(
+        runs: &mut [TextRun],
+        run_scales: &[Option<f32>],
+        row_font_size: Pixels,
+    ) {
+        for (run, scale) in runs.iter_mut().zip(run_scales) {
+            run.font_size = scale.map(|scale| row_font_size * scale);
+        }
+    }
+
+    /// How many uniform line heights a row occupies. A row grows to fit a
+    /// larger row font size or its tallest run but never shrinks below one
+    /// uniform line height, so smaller code rows cannot leave the visible row
+    /// range under-filled.
+    fn row_height_scale(row_font_size: Pixels, font_size: Pixels, tallest_run_scale: f32) -> f32 {
+        (f32::from(row_font_size) / f32::from(font_size) * tallest_run_scale).max(1.0)
     }
 
     fn add_point_diagnostic(&mut self, point_diagnostic: PointDiagnostic) {
@@ -7794,6 +7851,7 @@ impl LineWithInvisibles {
                         background_color: text_run.background_color,
                         underline: text_run.underline,
                         strikethrough: text_run.strikethrough,
+                        font_size: text_run.font_size,
                     });
                     cursor_col = segment_start_col;
                 }
@@ -7808,6 +7866,7 @@ impl LineWithInvisibles {
                         background_color: text_run.background_color,
                         underline: text_run.underline,
                         strikethrough: text_run.strikethrough,
+                        font_size: text_run.font_size,
                     });
                     cursor_col = segment_slice_end_col;
                 }
@@ -7824,6 +7883,7 @@ impl LineWithInvisibles {
                     background_color: text_run.background_color,
                     underline: text_run.underline,
                     strikethrough: text_run.strikethrough,
+                    font_size: text_run.font_size,
                 });
             }
             line_col = run_end_col;
@@ -7920,7 +7980,6 @@ impl LineWithInvisibles {
 
     fn prepaint_with_custom_offset(
         &mut self,
-        line_height: Pixels,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         content_origin: gpui::Point<Pixels>,
         line_y: Pixels,
@@ -7930,6 +7989,7 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let row_height = self.row_height;
         let mut fragment_origin = content_origin
             + point(
                 self.alignment_offset(text_align, content_width)
@@ -7946,9 +8006,10 @@ impl LineWithInvisibles {
                         .take()
                         .expect("you can't prepaint LineWithInvisibles twice");
 
-                    // Center the element vertically within the line.
+                    // Center the element vertically within this row, whose height
+                    // differs from the uniform line height on a resized row.
                     let mut element_origin = fragment_origin;
-                    element_origin.y += (line_height - size.height) / 2.;
+                    element_origin.y += (row_height - size.height) / 2.;
                     element.prepaint_at(element_origin, window, cx);
                     line_elements.push(element);
 
@@ -8421,6 +8482,33 @@ impl LineWithInvisibles {
         }
 
         None
+    }
+
+    /// The font size of the text at `index`, which differs from `font_size`
+    /// inside a run that carries `HighlightStyle::run_font_size_scale`.
+    pub fn font_size_for_index(&self, index: usize) -> Pixels {
+        let mut fragment_start_index = 0;
+
+        for fragment in &self.fragments {
+            match fragment {
+                LineFragment::Text(shaped_line) => {
+                    let fragment_end_index = fragment_start_index + shaped_line.len;
+                    if index < fragment_end_index {
+                        return shaped_line.font_size_for_index(index - fragment_start_index);
+                    }
+                    fragment_start_index = fragment_end_index;
+                }
+                LineFragment::Element { len, .. } => {
+                    let fragment_end_index = fragment_start_index + len;
+                    if index < fragment_end_index {
+                        return self.font_size;
+                    }
+                    fragment_start_index = fragment_end_index;
+                }
+            }
+        }
+
+        self.font_size
     }
 
     pub fn alignment_offset(&self, text_align: TextAlign, content_width: Pixels) -> Pixels {
@@ -11502,7 +11590,8 @@ mod tests {
     };
     use buffer_diff::BufferDiff;
     use gpui::{
-        Render, TestAppContext, Underline, UpdateGlobal, VisualTestContext, WindowHandle, font,
+        HighlightStyle, Render, TestAppContext, Underline, UpdateGlobal, VisualTestContext,
+        WindowHandle, font,
     };
     use language::{
         Buffer, Capability, Diagnostic, DiagnosticEntry, DiagnosticSet, SelectionGoal,
@@ -13204,6 +13293,278 @@ mod tests {
                 assert!(layouts[0].fragments.len() <= max_line_len);
             })
             .unwrap();
+    }
+
+    fn highlighted_chunk(
+        text: &str,
+        style: Option<HighlightStyle>,
+        replacement: Option<ChunkReplacement>,
+    ) -> HighlightedChunk<'_> {
+        HighlightedChunk {
+            text,
+            style,
+            diagnostic_underline_severity: None,
+            is_tab: false,
+            is_inlay: false,
+            replacement,
+        }
+    }
+
+    /// Lays out one row of `chunks` and returns it with the editor's base font
+    /// size and uniform line height.
+    fn layout_single_row(
+        cx: &mut TestAppContext,
+        chunks: impl FnOnce() -> Vec<(
+            &'static str,
+            Option<HighlightStyle>,
+            Option<ChunkReplacement>,
+        )>,
+    ) -> (LineWithInvisibles, Pixels, Pixels) {
+        init_test(cx, |_| {});
+
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+        let editor_mode = EditorMode::full();
+
+        window
+            .update(cx, |_, window, cx| {
+                let font_size = style.text.font_size.to_pixels(window.rem_size());
+                let uniform_line_height = style.text.line_height_in_pixels(window.rem_size());
+                let chunks = chunks();
+                let mut layouts = LineWithInvisibles::from_chunks(
+                    chunks.iter().map(|(text, style, replacement)| {
+                        highlighted_chunk(text, *style, replacement.clone())
+                    }),
+                    &style,
+                    1000,
+                    1,
+                    &editor_mode,
+                    px(500.),
+                    |_| false,
+                    &[],
+                    window,
+                    cx,
+                );
+                assert_eq!(layouts.len(), 1);
+                (layouts.remove(0), font_size, uniform_line_height)
+            })
+            .unwrap()
+    }
+
+    fn run_scale(scale: f32) -> Option<HighlightStyle> {
+        Some(HighlightStyle {
+            run_font_size_scale: Some(scale),
+            ..Default::default()
+        })
+    }
+
+    fn assert_pixels_close(actual: Pixels, expected: Pixels) {
+        assert!(
+            (actual - expected).abs() < px(0.01),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_run_font_size_scale_sizes_only_the_highlighted_run(cx: &mut TestAppContext) {
+        let (layout, font_size, uniform_line_height) = layout_single_row(cx, || {
+            vec![("ab", None, None), ("cd", run_scale(0.5), None)]
+        });
+
+        assert_eq!(layout.font_size, font_size);
+        assert_eq!(layout.font_size_for_index(0), font_size);
+        assert_eq!(layout.font_size_for_index(2), font_size * 0.5);
+        // The test text system is 0.6em wide per character.
+        assert_pixels_close(layout.width, font_size * 1.8);
+        // A row of smaller runs never shrinks below the uniform line height.
+        assert_eq!(layout.row_height, uniform_line_height);
+    }
+
+    #[gpui::test]
+    fn test_larger_run_font_size_scale_grows_the_row(cx: &mut TestAppContext) {
+        let (layout, font_size, uniform_line_height) = layout_single_row(cx, || {
+            vec![("ab", None, None), ("cd", run_scale(1.5), None)]
+        });
+
+        assert_eq!(layout.font_size_for_index(3), font_size * 1.5);
+        assert_pixels_close(layout.row_height, uniform_line_height * 1.5);
+    }
+
+    #[gpui::test]
+    fn test_run_font_size_scale_composes_with_the_row_font_size_scale(cx: &mut TestAppContext) {
+        let (layout, font_size, uniform_line_height) = layout_single_row(cx, || {
+            vec![
+                (
+                    "ab",
+                    Some(HighlightStyle {
+                        font_size_scale: Some(2.0),
+                        ..Default::default()
+                    }),
+                    None,
+                ),
+                ("cd", run_scale(0.5), None),
+            ]
+        });
+
+        assert_eq!(layout.font_size, font_size * 2.0);
+        assert_eq!(layout.font_size_for_index(0), font_size * 2.0);
+        // Half of the row's size, whichever chunk declared the row size first.
+        assert_eq!(layout.font_size_for_index(2), font_size);
+        assert_pixels_close(layout.row_height, uniform_line_height * 2.0);
+    }
+
+    #[gpui::test]
+    fn test_string_replacements_honor_the_run_font_size_scale(cx: &mut TestAppContext) {
+        let (layout, font_size, _) = layout_single_row(cx, || {
+            vec![
+                ("ab", None, None),
+                ("x", run_scale(0.5), Some(ChunkReplacement::Str("y".into()))),
+            ]
+        });
+
+        assert_eq!(layout.font_size_for_index(0), font_size);
+        assert_eq!(layout.font_size_for_index(2), font_size * 0.5);
+    }
+
+    #[gpui::test]
+    fn test_font_size_for_index_inside_a_replacement_element(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+
+        window
+            .update(cx, |_, window, _| {
+                let font_size = px(16.);
+                let shape = |text: &'static str, run_font_size: Option<Pixels>| {
+                    window.text_system().shape_line(
+                        text.into(),
+                        font_size,
+                        &[TextRun {
+                            len: text.len(),
+                            font_size: run_font_size,
+                            ..Default::default()
+                        }],
+                        None,
+                    )
+                };
+                // "ab", a two-byte replacement element (a fold placeholder),
+                // then "cd" at half size.
+                let line = LineWithInvisibles {
+                    fragments: SmallVec::from_vec(vec![
+                        LineFragment::Text(shape("ab", None)),
+                        LineFragment::Element {
+                            id: crate::display_map::ChunkRendererId::Inlay(project::InlayId::Hint(
+                                0,
+                            )),
+                            element: None,
+                            size: size(px(10.), px(10.)),
+                            len: 2,
+                        },
+                        LineFragment::Text(shape("cd", Some(font_size * 0.5))),
+                    ]),
+                    invisibles: Vec::new(),
+                    diagnostic_underline_severity_ranges: Vec::new(),
+                    point_diagnostics: Vec::new(),
+                    len: 6,
+                    width: px(40.),
+                    font_size,
+                    row_height: px(20.),
+                    row_top: Pixels::ZERO,
+                };
+
+                assert_eq!(line.font_size_for_index(0), font_size);
+                // At the element's first byte and inside it, the cursor is not
+                // on a shaped glyph, and the offset into the next text
+                // fragment must not underflow.
+                assert_eq!(line.font_size_for_index(2), font_size);
+                assert_eq!(line.font_size_for_index(3), font_size);
+                assert_eq!(line.font_size_for_index(4), font_size * 0.5);
+                assert_eq!(line.font_size_for_index(5), font_size * 0.5);
+                assert_eq!(line.font_size_for_index(100), font_size);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_rows_without_run_scales_are_unchanged(cx: &mut TestAppContext) {
+        let (layout, font_size, uniform_line_height) =
+            layout_single_row(cx, || vec![("abcd", None, None)]);
+
+        assert_eq!(layout.font_size_for_index(0), font_size);
+        assert_eq!(layout.font_size_for_index(3), font_size);
+        assert_eq!(layout.row_height, uniform_line_height);
+        assert_pixels_close(layout.width, font_size * 2.4);
+    }
+
+    #[test]
+    fn test_row_height_scale_never_shrinks_below_one_line() {
+        let scale =
+            |row: f32, run: f32| LineWithInvisibles::row_height_scale(px(row), px(10.), run);
+
+        assert_eq!(scale(10., 1.), 1.);
+        assert_eq!(scale(10., 0.5), 1.);
+        assert_eq!(scale(9., 1.), 1.);
+        assert_eq!(scale(18., 1.), 1.8);
+        assert_eq!(scale(10., 1.5), 1.5);
+        assert_eq!(scale(20., 0.75), 1.5);
+    }
+
+    #[gpui::test]
+    fn test_split_runs_by_bg_segments_keeps_run_font_sizes(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let dx = |start: u32, end: u32| {
+            DisplayPoint::new(DisplayRow(0), start)..DisplayPoint::new(DisplayRow(0), end)
+        };
+        let color = Hsla {
+            h: 210.0,
+            s: 0.1,
+            l: 0.4,
+            a: 1.0,
+        };
+        let background = Hsla {
+            h: 30.0,
+            s: 0.6,
+            l: 0.8,
+            a: 1.0,
+        };
+        let runs = vec![
+            TextRun {
+                len: 4,
+                color,
+                ..Default::default()
+            },
+            TextRun {
+                len: 10,
+                color,
+                font_size: Some(px(8.)),
+                ..Default::default()
+            },
+        ];
+
+        let output = LineWithInvisibles::split_runs_by_bg_segments(
+            &runs,
+            &[(dx(6, 9), background)],
+            45.0,
+            0,
+        );
+
+        assert_eq!(
+            output.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 2, 3, 5]
+        );
+        assert_eq!(
+            output.iter().map(|run| run.font_size).collect::<Vec<_>>(),
+            vec![None, Some(px(8.)), Some(px(8.)), Some(px(8.))]
+        );
     }
 
     #[gpui::test]
