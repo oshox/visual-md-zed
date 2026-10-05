@@ -808,6 +808,21 @@ pub trait Addon: 'static {
         None
     }
 
+    /// Resolves the link at `position` for an addon that knows more about the
+    /// text than the editor's own link detection does. A link it returns is used
+    /// instead of one found by detecting a URL or a file name, though not
+    /// instead of one a language server declares. The range is the text the
+    /// link covers, which is underlined while it is hovered.
+    fn link_at(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: text::Anchor,
+        _project: Option<&Entity<Project>>,
+        _cx: &mut App,
+    ) -> Option<Task<Option<(Range<text::Anchor>, HoverLink)>>> {
+        None
+    }
+
     fn to_any(&self) -> &dyn std::any::Any;
 
     fn to_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -11165,6 +11180,18 @@ impl Editor {
         self.addons
             .get(&type_id)
             .and_then(|item| item.to_any().downcast_ref::<T>())
+    }
+
+    /// The link at `position` that one of the addons resolves, if any does.
+    pub(crate) fn addon_link_at(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<(Range<text::Anchor>, HoverLink)>>> {
+        self.addons
+            .values()
+            .find_map(|addon| addon.link_at(buffer, position, self.project.as_ref(), cx))
     }
 
     pub fn addon_mut<T: Addon>(&mut self) -> Option<&mut T> {
