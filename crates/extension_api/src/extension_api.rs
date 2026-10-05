@@ -59,7 +59,8 @@ pub mod lsp {
 pub mod visual_md {
     pub use crate::wit::zed::extension::visual_md::{
         Appearance, CommandContext, CommandResult, FenceOutput, FenceRequest, FenceResult, Image,
-        ImageFormat, SpanStyle, StyledSpan, StyledText, TextEdit,
+        ImageFormat, Replacement, RuleMatch, RuleOutput, SpanStyle, StyledSpan, StyledText,
+        TextEdit,
     };
 }
 
@@ -207,6 +208,17 @@ pub trait Extension: Send + Sync {
         _context: visual_md::CommandContext,
     ) -> Result<visual_md::CommandResult, String> {
         Err("`visual_md_run_command` not implemented".to_string())
+    }
+
+    /// Applies a syntax rule declared with `dynamic = true` under
+    /// `[[visual_md.syntax_rules]]` to the pieces of text that matched it, and
+    /// returns what to do with each, in the order of `matches`.
+    fn visual_md_apply_rule(
+        &self,
+        _rule: String,
+        _matches: Vec<visual_md::RuleMatch>,
+    ) -> Result<Vec<visual_md::RuleOutput>, String> {
+        Err("`visual_md_apply_rule` not implemented".to_string())
     }
 
     /// Returns the command used to start a context server.
@@ -533,6 +545,13 @@ impl wit::Guest for Component {
         context: visual_md::CommandContext,
     ) -> Result<visual_md::CommandResult, String> {
         extension().visual_md_run_command(command, context)
+    }
+
+    fn visual_md_apply_rule(
+        rule: String,
+        matches: Vec<visual_md::RuleMatch>,
+    ) -> Result<Vec<visual_md::RuleOutput>, String> {
+        extension().visual_md_apply_rule(rule, matches)
     }
 
     fn context_server_command(
