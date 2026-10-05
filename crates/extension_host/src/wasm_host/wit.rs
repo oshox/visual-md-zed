@@ -1169,6 +1169,39 @@ impl Extension {
         }
     }
 
+    pub async fn call_visual_md_apply_rule(
+        &self,
+        store: &mut Store<WasmState>,
+        rule: &str,
+        matches: Vec<extension::VisualMdRuleMatch>,
+    ) -> wasmtime::Result<Result<Vec<extension::VisualMdRuleOutput>, String>> {
+        match self {
+            Extension::V0_9_0(ext) => {
+                let matches = matches
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>>>()
+                    .into_wasmtime_result()?;
+                Ok(ext
+                    .call_visual_md_apply_rule(store, rule, &matches)
+                    .await?
+                    .map(|outputs| outputs.into_iter().map(Into::into).collect()))
+            }
+            Extension::V0_8_0(_)
+            | Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => Err(wasmtime::Error::msg(
+                "`visual_md_apply_rule` not available prior to v0.9.0",
+            )),
+        }
+    }
+
     pub async fn call_suggest_docs_packages(
         &self,
         store: &mut Store<WasmState>,

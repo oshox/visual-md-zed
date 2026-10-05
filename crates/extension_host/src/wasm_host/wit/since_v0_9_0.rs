@@ -344,6 +344,40 @@ impl From<extension::VisualMdFenceRequest> for visual_md::FenceRequest {
     }
 }
 
+impl From<visual_md::Replacement> for extension::VisualMdReplacement {
+    fn from(value: visual_md::Replacement) -> Self {
+        Self {
+            range: value.range.into(),
+            text: value.text,
+        }
+    }
+}
+
+impl From<visual_md::RuleOutput> for extension::VisualMdRuleOutput {
+    fn from(value: visual_md::RuleOutput) -> Self {
+        Self {
+            spans: value.spans.into_iter().map(Into::into).collect(),
+            hidden: value.hidden.into_iter().map(Into::into).collect(),
+            replacements: value.replacements.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<extension::VisualMdRuleMatch> for visual_md::RuleMatch {
+    type Error = anyhow::Error;
+
+    fn try_from(value: extension::VisualMdRuleMatch) -> Result<Self> {
+        Ok(Self {
+            text: value.text,
+            captures: value
+                .captures
+                .into_iter()
+                .map(|capture| capture.map(range_to_wit).transpose())
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
 fn range_to_wit(range: std::ops::Range<usize>) -> Result<Range> {
     Ok(Range {
         start: u32::try_from(range.start)?,
@@ -392,6 +426,66 @@ mod tests {
 
         assert!(visual_md::CommandContext::try_from(context(0..4)).is_ok());
         assert!(visual_md::CommandContext::try_from(context(0..u32::MAX as usize + 1)).is_err());
+    }
+
+    #[test]
+    fn test_rule_matches_convert_with_their_optional_captures() {
+        let converted = visual_md::RuleMatch::try_from(extension::VisualMdRuleMatch {
+            text: ":smile:".to_string(),
+            captures: vec![Some(0..7), None, Some(1..6)],
+        })
+        .expect("the ranges fit");
+
+        assert_eq!(converted.text, ":smile:");
+        assert_eq!(
+            converted
+                .captures
+                .iter()
+                .map(|capture| capture.as_ref().map(|range| (range.start, range.end)))
+                .collect::<Vec<_>>(),
+            vec![Some((0, 7)), None, Some((1, 6))]
+        );
+        assert!(
+            visual_md::RuleMatch::try_from(extension::VisualMdRuleMatch {
+                text: String::new(),
+                captures: vec![Some(0..u32::MAX as usize + 1)],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_rule_outputs_convert_spans_hidden_ranges_and_replacements() {
+        let output = extension::VisualMdRuleOutput::from(visual_md::RuleOutput {
+            spans: vec![visual_md::StyledSpan {
+                range: Range { start: 1, end: 3 },
+                style: visual_md::SpanStyle {
+                    color: Some("#fff".into()),
+                    background_color: None,
+                    theme_token: None,
+                    font_weight: None,
+                    italic: Some(true),
+                    underline: None,
+                    strikethrough: None,
+                },
+            }],
+            hidden: vec![Range { start: 0, end: 1 }],
+            replacements: vec![visual_md::Replacement {
+                range: Range { start: 1, end: 6 },
+                text: "😀".into(),
+            }],
+        });
+
+        assert_eq!(output.spans.len(), 1);
+        assert_eq!(output.spans[0].range, 1..3);
+        assert_eq!(output.hidden, vec![0..1]);
+        assert_eq!(
+            output.replacements,
+            vec![extension::VisualMdReplacement {
+                range: 1..6,
+                text: "😀".to_string(),
+            }]
+        );
     }
 
     #[test]

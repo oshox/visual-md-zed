@@ -943,7 +943,7 @@ async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
     let extension = wasm_host
         .load_extension(wasm_bytes, &manifest, &cx.to_async())
         .await
-        .expect("the sample loads");
+        .expect("the sample loads; if the extension API changed, rebuild it with script/visual-md-wasm build-sample");
     assert_eq!(
         extension.zed_api_version,
         semver::Version::new(0, 9, 0),

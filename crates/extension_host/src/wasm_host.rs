@@ -10,7 +10,7 @@ use extension::{
     DebugTaskDefinition, ExtensionCapability, ExtensionHostProxy, KeyValueStoreDelegate,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput, Symbol,
     VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
-    WorktreeDelegate,
+    VisualMdRuleMatch, VisualMdRuleOutput, WorktreeDelegate,
 };
 use fs::Fs;
 use futures::future::LocalBoxFuture;
@@ -430,6 +430,23 @@ impl extension::Extension for WasmExtension {
             async move {
                 extension
                     .call_visual_md_run_command(store, &command, context)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn visual_md_apply_rule(
+        &self,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+    ) -> Result<Vec<VisualMdRuleOutput>> {
+        self.call(|extension, store| {
+            async move {
+                extension
+                    .call_visual_md_apply_rule(store, &rule, matches)
                     .await?
                     .map_err(|err| store.data().extension_error(err))
             }
