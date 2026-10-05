@@ -378,6 +378,132 @@ impl TryFrom<extension::VisualMdRuleMatch> for visual_md::RuleMatch {
     }
 }
 
+impl From<visual_md::LinkTarget> for extension::VisualMdLinkTarget {
+    fn from(value: visual_md::LinkTarget) -> Self {
+        match value {
+            visual_md::LinkTarget::Url(url) => Self::Url(url),
+            visual_md::LinkTarget::File(path) => Self::File(path),
+        }
+    }
+}
+
+impl From<visual_md::CompletionItem> for extension::VisualMdCompletionItem {
+    fn from(value: visual_md::CompletionItem) -> Self {
+        Self {
+            label: value.label,
+            detail: value.detail,
+            insert_text: value.insert_text,
+        }
+    }
+}
+
+impl From<extension::VisualMdLinkRequest> for visual_md::LinkRequest {
+    fn from(value: extension::VisualMdLinkRequest) -> Self {
+        Self {
+            scheme: value.scheme,
+            target: value.target,
+            wikilink: value.wikilink,
+            path: value.path,
+        }
+    }
+}
+
+impl From<extension::VisualMdCompletionRequest> for visual_md::CompletionRequest {
+    fn from(value: extension::VisualMdCompletionRequest) -> Self {
+        Self {
+            query: value.query,
+            path: value.path,
+            files: value.files,
+        }
+    }
+}
+
+impl From<extension::VisualMdLinkStyle> for visual_md::LinkStyle {
+    fn from(value: extension::VisualMdLinkStyle) -> Self {
+        match value {
+            extension::VisualMdLinkStyle::Inline => Self::Inline,
+            extension::VisualMdLinkStyle::Wikilink => Self::Wikilink,
+            extension::VisualMdLinkStyle::Embed => Self::Embed,
+        }
+    }
+}
+
+impl From<extension::VisualMdDocumentEventKind> for visual_md::DocumentEventKind {
+    fn from(value: extension::VisualMdDocumentEventKind) -> Self {
+        match value {
+            extension::VisualMdDocumentEventKind::Opened => Self::Opened,
+            extension::VisualMdDocumentEventKind::Saved => Self::Saved,
+            extension::VisualMdDocumentEventKind::Changed => Self::Changed,
+        }
+    }
+}
+
+impl TryFrom<extension::VisualMdOutline> for visual_md::Outline {
+    type Error = anyhow::Error;
+
+    fn try_from(value: extension::VisualMdOutline) -> Result<Self> {
+        Ok(Self {
+            headings: value
+                .headings
+                .into_iter()
+                .map(|heading| {
+                    Ok(visual_md::OutlineHeading {
+                        level: heading.level,
+                        text: heading.text,
+                        range: range_to_wit(heading.range)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            links: value
+                .links
+                .into_iter()
+                .map(|link| {
+                    Ok(visual_md::OutlineLink {
+                        style: link.style.into(),
+                        target: link.target,
+                        text: link.text,
+                        range: range_to_wit(link.range)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            tags: value
+                .tags
+                .into_iter()
+                .map(|tag| {
+                    Ok(visual_md::OutlineTag {
+                        name: tag.name,
+                        range: range_to_wit(tag.range)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            tasks: value
+                .tasks
+                .into_iter()
+                .map(|task| {
+                    Ok(visual_md::OutlineTask {
+                        text: task.text,
+                        checked: task.checked,
+                        range: range_to_wit(task.range)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            frontmatter: value.frontmatter,
+        })
+    }
+}
+
+impl TryFrom<extension::VisualMdDocumentEvent> for visual_md::DocumentEvent {
+    type Error = anyhow::Error;
+
+    fn try_from(value: extension::VisualMdDocumentEvent) -> Result<Self> {
+        Ok(Self {
+            kind: value.kind.into(),
+            path: value.path,
+            outline: value.outline.try_into()?,
+        })
+    }
+}
+
 fn range_to_wit(range: std::ops::Range<usize>) -> Result<Range> {
     Ok(Range {
         start: u32::try_from(range.start)?,
@@ -485,6 +611,132 @@ mod tests {
                 range: 1..6,
                 text: "😀".to_string(),
             }]
+        );
+    }
+
+    fn outline() -> extension::VisualMdOutline {
+        extension::VisualMdOutline {
+            headings: vec![extension::VisualMdOutlineHeading {
+                level: 2,
+                text: "Title".to_string(),
+                range: 0..8,
+            }],
+            links: vec![
+                extension::VisualMdOutlineLink {
+                    style: extension::VisualMdLinkStyle::Inline,
+                    target: "https://x.org".to_string(),
+                    text: Some("x".to_string()),
+                    range: 10..30,
+                },
+                extension::VisualMdOutlineLink {
+                    style: extension::VisualMdLinkStyle::Embed,
+                    target: "pic".to_string(),
+                    text: None,
+                    range: 31..38,
+                },
+            ],
+            tags: vec![extension::VisualMdOutlineTag {
+                name: "idea".to_string(),
+                range: 40..45,
+            }],
+            tasks: vec![extension::VisualMdOutlineTask {
+                text: "do it".to_string(),
+                checked: true,
+                range: 50..53,
+            }],
+            frontmatter: Some("title: x".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_a_document_event_converts_with_its_whole_outline() {
+        let event = visual_md::DocumentEvent::try_from(extension::VisualMdDocumentEvent {
+            kind: extension::VisualMdDocumentEventKind::Saved,
+            path: Some("/notes/a.md".to_string()),
+            outline: outline(),
+        })
+        .expect("the ranges fit");
+
+        assert!(matches!(event.kind, visual_md::DocumentEventKind::Saved));
+        assert_eq!(event.path.as_deref(), Some("/notes/a.md"));
+        assert_eq!(event.outline.headings.len(), 1);
+        assert_eq!(event.outline.headings[0].level, 2);
+        assert_eq!(
+            (
+                event.outline.headings[0].range.start,
+                event.outline.headings[0].range.end
+            ),
+            (0, 8)
+        );
+        assert!(matches!(
+            event.outline.links[0].style,
+            visual_md::LinkStyle::Inline
+        ));
+        assert!(matches!(
+            event.outline.links[1].style,
+            visual_md::LinkStyle::Embed
+        ));
+        assert_eq!(event.outline.links[1].text, None);
+        assert_eq!(event.outline.tags[0].name, "idea");
+        assert!(event.outline.tasks[0].checked);
+        assert_eq!(event.outline.frontmatter.as_deref(), Some("title: x"));
+    }
+
+    #[test]
+    fn test_a_document_event_with_a_range_past_u32_fails_to_convert() {
+        let mut huge = outline();
+        huge.tags[0].range = 0..u32::MAX as usize + 1;
+
+        assert!(
+            visual_md::DocumentEvent::try_from(extension::VisualMdDocumentEvent {
+                kind: extension::VisualMdDocumentEventKind::Changed,
+                path: None,
+                outline: huge,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_links_and_completions_convert_both_ways() {
+        let request = visual_md::LinkRequest::from(extension::VisualMdLinkRequest {
+            scheme: Some("notes".to_string()),
+            target: "notes://a".to_string(),
+            wikilink: false,
+            path: None,
+        });
+        assert_eq!(request.scheme.as_deref(), Some("notes"));
+        assert_eq!(request.target, "notes://a");
+        assert!(!request.wikilink);
+
+        assert_eq!(
+            extension::VisualMdLinkTarget::from(visual_md::LinkTarget::Url("https://x.org".into())),
+            extension::VisualMdLinkTarget::Url("https://x.org".to_string())
+        );
+        assert_eq!(
+            extension::VisualMdLinkTarget::from(visual_md::LinkTarget::File("a.md".into())),
+            extension::VisualMdLinkTarget::File("a.md".to_string())
+        );
+
+        let completion = visual_md::CompletionRequest::from(extension::VisualMdCompletionRequest {
+            query: "ab".to_string(),
+            path: Some("/n/a.md".to_string()),
+            files: vec!["a.md".to_string(), "b/c.md".to_string()],
+        });
+        assert_eq!(completion.query, "ab");
+        assert_eq!(completion.files, vec!["a.md", "b/c.md"]);
+
+        assert_eq!(
+            extension::VisualMdCompletionItem::from(visual_md::CompletionItem {
+                label: "Alpha".into(),
+                detail: Some("a.md".into()),
+                insert_text: "alpha".into(),
+            }),
+            extension::VisualMdCompletionItem {
+                label: "Alpha".to_string(),
+                detail: Some("a.md".to_string()),
+                insert_text: "alpha".to_string(),
+            }
         );
     }
 

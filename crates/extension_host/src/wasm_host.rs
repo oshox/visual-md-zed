@@ -9,8 +9,10 @@ use extension::{
     CodeLabel, Command, Completion, ContextServerConfiguration, DebugAdapterBinary,
     DebugTaskDefinition, ExtensionCapability, ExtensionHostProxy, KeyValueStoreDelegate,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput, Symbol,
-    VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
-    VisualMdRuleMatch, VisualMdRuleOutput, WorktreeDelegate,
+    VisualMdCommandContext, VisualMdCommandResult, VisualMdCompletionItem,
+    VisualMdCompletionRequest, VisualMdDocumentEvent, VisualMdFenceRequest, VisualMdFenceResult,
+    VisualMdLinkRequest, VisualMdLinkTarget, VisualMdRuleMatch, VisualMdRuleOutput,
+    WorktreeDelegate,
 };
 use fs::Fs;
 use futures::future::LocalBoxFuture;
@@ -447,6 +449,51 @@ impl extension::Extension for WasmExtension {
             async move {
                 extension
                     .call_visual_md_apply_rule(store, &rule, matches)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn visual_md_document_event(&self, event: VisualMdDocumentEvent) -> Result<()> {
+        self.call(|extension, store| {
+            async move {
+                extension
+                    .call_visual_md_document_event(store, event)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn visual_md_resolve_link(
+        &self,
+        request: VisualMdLinkRequest,
+    ) -> Result<Option<VisualMdLinkTarget>> {
+        self.call(|extension, store| {
+            async move {
+                extension
+                    .call_visual_md_resolve_link(store, request)
+                    .await?
+                    .map_err(|err| store.data().extension_error(err))
+            }
+            .boxed()
+        })
+        .await?
+    }
+
+    async fn visual_md_complete(
+        &self,
+        request: VisualMdCompletionRequest,
+    ) -> Result<Vec<VisualMdCompletionItem>> {
+        self.call(|extension, store| {
+            async move {
+                extension
+                    .call_visual_md_complete(store, request)
                     .await?
                     .map_err(|err| store.data().extension_error(err))
             }

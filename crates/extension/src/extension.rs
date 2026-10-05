@@ -178,6 +178,27 @@ pub trait Extension: Send + Sync + 'static {
         bail!("this extension does not apply syntax rules")
     }
 
+    /// Tells this extension that something happened to a document.
+    async fn visual_md_document_event(&self, _event: VisualMdDocumentEvent) -> Result<()> {
+        bail!("this extension does not handle document events")
+    }
+
+    /// Says where a link leads, or `None` when this extension does not know.
+    async fn visual_md_resolve_link(
+        &self,
+        _request: VisualMdLinkRequest,
+    ) -> Result<Option<VisualMdLinkTarget>> {
+        bail!("this extension does not resolve links")
+    }
+
+    /// Suggests completions for the name of a wikilink being typed.
+    async fn visual_md_complete(
+        &self,
+        _request: VisualMdCompletionRequest,
+    ) -> Result<Vec<VisualMdCompletionItem>> {
+        bail!("this extension does not complete wikilinks")
+    }
+
     async fn suggest_docs_packages(&self, provider: Arc<str>) -> Result<Vec<String>>;
 
     async fn index_docs(

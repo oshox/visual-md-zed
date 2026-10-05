@@ -182,3 +182,109 @@ pub struct VisualMdRuleOutput {
     pub hidden: Vec<Range<usize>>,
     pub replacements: Vec<VisualMdReplacement>,
 }
+
+/// A heading of a document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdOutlineHeading {
+    /// From 1 to 6.
+    pub level: u8,
+    pub text: String,
+    pub range: Range<usize>,
+}
+
+/// How a link was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualMdLinkStyle {
+    /// `[text](destination)`.
+    Inline,
+    /// `[[name]]`.
+    Wikilink,
+    /// `![[name]]`.
+    Embed,
+}
+
+/// A link or an embed in a document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdOutlineLink {
+    pub style: VisualMdLinkStyle,
+    pub target: String,
+    pub text: Option<String>,
+    pub range: Range<usize>,
+}
+
+/// A `#tag` in a document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdOutlineTag {
+    pub name: String,
+    pub range: Range<usize>,
+}
+
+/// A task list item of a document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdOutlineTask {
+    pub text: String,
+    pub checked: bool,
+    pub range: Range<usize>,
+}
+
+/// The structure of a document. Every range is in UTF-8 bytes of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VisualMdOutline {
+    pub headings: Vec<VisualMdOutlineHeading>,
+    pub links: Vec<VisualMdOutlineLink>,
+    pub tags: Vec<VisualMdOutlineTag>,
+    pub tasks: Vec<VisualMdOutlineTask>,
+    /// The front matter between the `---` lines a document starts with.
+    pub frontmatter: Option<String>,
+}
+
+/// What happened to a document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualMdDocumentEventKind {
+    Opened,
+    Saved,
+    Changed,
+}
+
+/// Something that happened to a document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdDocumentEvent {
+    pub kind: VisualMdDocumentEventKind,
+    pub path: Option<String>,
+    pub outline: VisualMdOutline,
+}
+
+/// A link the user is pointing at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdLinkRequest {
+    /// The scheme of an inline link's destination, lowercased.
+    pub scheme: Option<String>,
+    pub target: String,
+    pub wikilink: bool,
+    pub path: Option<String>,
+}
+
+/// Where a link leads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VisualMdLinkTarget {
+    Url(String),
+    /// An absolute path, or one relative to the document.
+    File(String),
+}
+
+/// The user is completing the name of a wikilink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdCompletionRequest {
+    pub query: String,
+    pub path: Option<String>,
+    /// The project's Markdown files, relative to its root.
+    pub files: Vec<String>,
+}
+
+/// A suggested completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisualMdCompletionItem {
+    pub label: String,
+    pub detail: Option<String>,
+    pub insert_text: String,
+}

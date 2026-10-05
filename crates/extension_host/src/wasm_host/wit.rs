@@ -1202,6 +1202,81 @@ impl Extension {
         }
     }
 
+    pub async fn call_visual_md_document_event(
+        &self,
+        store: &mut Store<WasmState>,
+        event: extension::VisualMdDocumentEvent,
+    ) -> wasmtime::Result<Result<(), String>> {
+        match self {
+            Extension::V0_9_0(ext) => {
+                let event = event.try_into().into_wasmtime_result()?;
+                ext.call_visual_md_document_event(store, &event).await
+            }
+            Extension::V0_8_0(_)
+            | Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => Err(wasmtime::Error::msg(
+                "`visual_md_document_event` not available prior to v0.9.0",
+            )),
+        }
+    }
+
+    pub async fn call_visual_md_resolve_link(
+        &self,
+        store: &mut Store<WasmState>,
+        request: extension::VisualMdLinkRequest,
+    ) -> wasmtime::Result<Result<Option<extension::VisualMdLinkTarget>, String>> {
+        match self {
+            Extension::V0_9_0(ext) => Ok(ext
+                .call_visual_md_resolve_link(store, &request.into())
+                .await?
+                .map(|target| target.map(Into::into))),
+            Extension::V0_8_0(_)
+            | Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => Err(wasmtime::Error::msg(
+                "`visual_md_resolve_link` not available prior to v0.9.0",
+            )),
+        }
+    }
+
+    pub async fn call_visual_md_complete(
+        &self,
+        store: &mut Store<WasmState>,
+        request: extension::VisualMdCompletionRequest,
+    ) -> wasmtime::Result<Result<Vec<extension::VisualMdCompletionItem>, String>> {
+        match self {
+            Extension::V0_9_0(ext) => Ok(ext
+                .call_visual_md_complete(store, &request.into())
+                .await?
+                .map(|items| items.into_iter().map(Into::into).collect())),
+            Extension::V0_8_0(_)
+            | Extension::V0_6_0(_)
+            | Extension::V0_5_0(_)
+            | Extension::V0_4_0(_)
+            | Extension::V0_3_0(_)
+            | Extension::V0_2_0(_)
+            | Extension::V0_1_0(_)
+            | Extension::V0_0_6(_)
+            | Extension::V0_0_4(_)
+            | Extension::V0_0_1(_) => Err(wasmtime::Error::msg(
+                "`visual_md_complete` not available prior to v0.9.0",
+            )),
+        }
+    }
+
     pub async fn call_suggest_docs_packages(
         &self,
         store: &mut Store<WasmState>,
