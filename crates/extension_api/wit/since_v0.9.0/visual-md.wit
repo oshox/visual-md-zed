@@ -157,4 +157,127 @@ interface visual-md {
         /// Text to show in place of ranges while the cursor is away from the match.
         replacements: list<replacement>,
     }
+
+    /// A heading of the document.
+    record outline-heading {
+        /// From 1 to 6.
+        level: u8,
+        /// The heading's text, without its markers.
+        text: string,
+        /// Where the heading is, in UTF-8 bytes of the document.
+        range: range,
+    }
+
+    /// How a link was written.
+    enum link-style {
+        /// `[text](destination)`.
+        inline,
+        /// `[[name]]`.
+        wikilink,
+        /// `![[name]]`.
+        embed,
+    }
+
+    /// A link or an embed in the document.
+    record outline-link {
+        style: link-style,
+        /// The destination of an inline link as written, or the name inside the
+        /// brackets of a wikilink or an embed.
+        target: string,
+        /// The text of an inline link.
+        text: option<string>,
+        /// Where the link is, in UTF-8 bytes of the document.
+        range: range,
+    }
+
+    /// A `#tag` in the document.
+    record outline-tag {
+        /// The tag without the `#`.
+        name: string,
+        /// Where the tag is, in UTF-8 bytes of the document.
+        range: range,
+    }
+
+    /// A task list item of the document.
+    record outline-task {
+        /// The item's text after its checkbox.
+        text: string,
+        checked: bool,
+        /// Where the item's checkbox is, in UTF-8 bytes of the document.
+        range: range,
+    }
+
+    /// The structure of a document.
+    record outline {
+        headings: list<outline-heading>,
+        links: list<outline-link>,
+        tags: list<outline-tag>,
+        tasks: list<outline-task>,
+        /// The front matter between the `---` lines the document starts with,
+        /// if it does.
+        frontmatter: option<string>,
+    }
+
+    /// What happened to a document.
+    enum document-event-kind {
+        /// The document was shown in an editor with live preview for the first time.
+        opened,
+        /// The document was saved.
+        saved,
+        /// The document was edited, and then left alone for the extension's
+        /// `changed_debounce_ms`.
+        changed,
+    }
+
+    /// Something that happened to a document.
+    record document-event {
+        kind: document-event-kind,
+        /// The path of the document, if it has one.
+        path: option<string>,
+        /// The structure of the document as it is now.
+        outline: outline,
+    }
+
+    /// A link the user is pointing at.
+    record link-request {
+        /// The scheme of an inline link's destination, lowercased, such as
+        /// `sample` for `sample://x`. `none` for a wikilink, and for a
+        /// destination without one.
+        scheme: option<string>,
+        /// The destination as written, or the name inside `[[` and `]]`.
+        target: string,
+        /// Whether this is a `[[wikilink]]`.
+        wikilink: bool,
+        /// The path of the document, if it has one.
+        path: option<string>,
+    }
+
+    /// Where a link leads.
+    variant link-target {
+        /// An address to open.
+        url(string),
+        /// A file to open, as an absolute path or one relative to the document.
+        file(string),
+    }
+
+    /// The user is completing the name of a wikilink.
+    record completion-request {
+        /// What the user has typed after `[[`.
+        query: string,
+        /// The path of the document, if it has one.
+        path: option<string>,
+        /// The Markdown files of the project, as paths relative to the project
+        /// root, at most 2,000 of them.
+        files: list<string>,
+    }
+
+    /// A suggested completion.
+    record completion-item {
+        /// What the menu shows.
+        label: string,
+        /// More about the item, shown beside it.
+        detail: option<string>,
+        /// What replaces what the user typed after `[[`.
+        insert-text: string,
+    }
 }
