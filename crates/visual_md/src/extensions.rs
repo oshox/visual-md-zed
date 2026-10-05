@@ -14,8 +14,9 @@ use std::time::Duration;
 use anyhow::Result;
 use extension::{
     Extension, ExtensionHostProxy, ExtensionManifest, ExtensionVisualMdProxy,
-    VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
-    VisualMdManifestEntry, VisualMdRuleMatch, VisualMdRuleOutput,
+    VisualMdCommandContext, VisualMdCommandResult, VisualMdDocumentEvent,
+    VisualMdEventsManifestEntry, VisualMdFenceRequest, VisualMdFenceResult, VisualMdManifestEntry,
+    VisualMdRuleMatch, VisualMdRuleOutput,
 };
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Either, select};
@@ -27,6 +28,7 @@ use crate::rules::CompiledRule;
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RULE_TIMEOUT: Duration = Duration::from_secs(1);
+pub const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An extension answers "busy" while it has several requests running, which
 /// happens when a document needs more of them at once than it may have. A
@@ -57,6 +59,8 @@ pub trait VisualMdHooks: Send + Sync + 'static {
         rule: String,
         matches: Vec<VisualMdRuleMatch>,
     ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>>;
+
+    fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>>;
 }
 
 struct ExtensionHooks(Arc<dyn Extension>);
@@ -87,6 +91,11 @@ impl VisualMdHooks for ExtensionHooks {
     ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>> {
         let extension = self.0.clone();
         async move { extension.visual_md_apply_rule(rule, matches).await }.boxed()
+    }
+
+    fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_document_event(event).await }.boxed()
     }
 }
 
@@ -472,6 +481,33 @@ impl VisualMdExtensions {
         })
     }
 
+    /// The extensions that want to hear about document events, with what they
+    /// subscribed to, in the order of their ids. An extension with no code cannot
+    /// be told anything and is left out.
+    pub fn event_subscribers(&self) -> Vec<(Arc<str>, VisualMdEventsManifestEntry)> {
+        self.extensions
+            .iter()
+            .filter(|(_, extension)| extension.hooks.is_some())
+            .filter_map(|(extension_id, extension)| {
+                let events = extension.entry.events.as_ref()?;
+                events
+                    .is_subscribed()
+                    .then(|| (extension_id.clone(), events.clone()))
+            })
+            .collect()
+    }
+
+    pub fn document_event(
+        &self,
+        extension_id: &str,
+        event: VisualMdDocumentEvent,
+        cx: &App,
+    ) -> Task<Result<(), HookError>> {
+        self.call(extension_id, EVENT_TIMEOUT, cx, move |hooks| {
+            hooks.document_event(event)
+        })
+    }
+
     pub fn apply_rule(
         &self,
         extension_id: &str,
@@ -583,6 +619,7 @@ pub(crate) mod test_support {
         command_contexts: Mutex<Vec<VisualMdCommandContext>>,
         rule_responder: Mutex<RuleResponder>,
         rule_requests: Mutex<Vec<(String, Vec<VisualMdRuleMatch>)>>,
+        document_events: Mutex<Vec<VisualMdDocumentEvent>>,
         /// How many outputs to leave off an answer, to test a short one.
         rule_outputs_to_drop: AtomicUsize,
     }
@@ -599,6 +636,7 @@ pub(crate) mod test_support {
                 command_contexts: Mutex::new(Vec::new()),
                 rule_responder: Mutex::new(Box::new(|_| VisualMdRuleOutput::default())),
                 rule_requests: Mutex::new(Vec::new()),
+                document_events: Mutex::new(Vec::new()),
                 rule_outputs_to_drop: AtomicUsize::new(0),
             })
         }
@@ -637,6 +675,13 @@ pub(crate) mod test_support {
 
         pub(crate) fn rule_requests(&self) -> Vec<(String, Vec<VisualMdRuleMatch>)> {
             self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
+        }
+
+        pub(crate) fn document_events(&self) -> Vec<VisualMdDocumentEvent> {
+            self.document_events
                 .lock()
                 .expect("the test lock is not poisoned")
                 .clone()
@@ -745,6 +790,14 @@ pub(crate) mod test_support {
                 .expect("the test lock is not poisoned")
                 .push((rule, matches));
             self.respond(outputs)
+        }
+
+        fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>> {
+            self.document_events
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(event);
+            self.respond(())
         }
     }
 
