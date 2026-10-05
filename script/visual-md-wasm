@@ -78,12 +78,33 @@ build_sample() {
     local build_dir="$repo_root/target/visual-md-sample"
     rm -rf "$build_dir"
     mkdir -p "$build_dir/output"
-    # The packager has been seen to hang instead of exiting when its own checks
-    # reject the manifest, so it is not left to run unbounded.
-    PATH="$(toolchain_dir)/bin:$PATH" timeout 600 "$repo_root/target/debug/zed-extension" \
+    # The packager does not exit once it has finished (and does not exit when
+    # its own checks reject the manifest either), so it is run in the background
+    # and stopped when its last output, manifest.json, has been written.
+    PATH="$(toolchain_dir)/bin:$PATH" "$repo_root/target/debug/zed-extension" \
         --source-dir "$repo_root/extensions/visual-md-sample" \
         --output-dir "$build_dir/output" \
-        --scratch-dir "$build_dir/scratch"
+        --scratch-dir "$build_dir/scratch" &
+    local packager_pid=$!
+    local seconds_waited=0
+    while [[ ! -f "$build_dir/output/manifest.json" ]]; do
+        if ! kill -0 "$packager_pid" 2>/dev/null; then
+            wait "$packager_pid" || true
+            break
+        fi
+        if ((seconds_waited >= 600)); then
+            kill "$packager_pid" 2>/dev/null || true
+            echo "The packager took more than 10 minutes without finishing." >&2
+            exit 1
+        fi
+        sleep 1
+        seconds_waited=$((seconds_waited + 1))
+    done
+    kill "$packager_pid" 2>/dev/null || true
+    if [[ ! -f "$build_dir/output/manifest.json" ]]; then
+        echo "The packager stopped without producing $build_dir/output/manifest.json." >&2
+        exit 1
+    fi
     echo "Built extensions/visual-md-sample/extension.wasm"
 }
 
