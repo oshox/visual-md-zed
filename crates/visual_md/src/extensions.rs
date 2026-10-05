@@ -15,8 +15,8 @@ use anyhow::Result;
 use extension::{
     Extension, ExtensionHostProxy, ExtensionManifest, ExtensionVisualMdProxy,
     VisualMdCommandContext, VisualMdCommandResult, VisualMdDocumentEvent,
-    VisualMdEventsManifestEntry, VisualMdFenceRequest, VisualMdFenceResult, VisualMdManifestEntry,
-    VisualMdRuleMatch, VisualMdRuleOutput,
+    VisualMdEventsManifestEntry, VisualMdFenceRequest, VisualMdFenceResult, VisualMdLinkRequest,
+    VisualMdLinkTarget, VisualMdManifestEntry, VisualMdRuleMatch, VisualMdRuleOutput,
 };
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Either, select};
@@ -29,6 +29,7 @@ pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RULE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const LINK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// An extension answers "busy" while it has several requests running, which
 /// happens when a document needs more of them at once than it may have. A
@@ -61,6 +62,11 @@ pub trait VisualMdHooks: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>>;
 
     fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>>;
+
+    fn resolve_link(
+        &self,
+        request: VisualMdLinkRequest,
+    ) -> BoxFuture<'static, Result<Option<VisualMdLinkTarget>>>;
 }
 
 struct ExtensionHooks(Arc<dyn Extension>);
@@ -96,6 +102,14 @@ impl VisualMdHooks for ExtensionHooks {
     fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>> {
         let extension = self.0.clone();
         async move { extension.visual_md_document_event(event).await }.boxed()
+    }
+
+    fn resolve_link(
+        &self,
+        request: VisualMdLinkRequest,
+    ) -> BoxFuture<'static, Result<Option<VisualMdLinkTarget>>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_resolve_link(request).await }.boxed()
     }
 }
 
@@ -168,6 +182,16 @@ struct RegisteredExtension {
     hooks: Option<Arc<dyn VisualMdHooks>>,
     health: Arc<Health>,
     generation: u64,
+}
+
+/// Which extensions resolve which links.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkResolvers {
+    /// The extension that resolves each URL scheme it declared.
+    pub schemes: BTreeMap<String, Arc<str>>,
+    /// The extensions that resolve `[[wikilinks]]`, asked in this order until
+    /// one knows the target.
+    pub wikilinks: Vec<Arc<str>>,
 }
 
 /// Where a callout's icon comes from.
@@ -497,6 +521,43 @@ impl VisualMdExtensions {
             .collect()
     }
 
+    /// The extensions that resolve links: which one handles each URL scheme, and
+    /// the ones that resolve `[[wikilinks]]`, in the order of their ids. An
+    /// extension with no code cannot resolve anything and is left out. When more
+    /// than one extension claims a scheme, the one whose id sorts first has it.
+    pub fn link_resolvers(&self) -> LinkResolvers {
+        let mut resolvers = LinkResolvers::default();
+        for (extension_id, extension) in &self.extensions {
+            let Some(links) = extension.entry.links.as_ref() else {
+                continue;
+            };
+            if extension.hooks.is_none() {
+                continue;
+            }
+            for scheme in &links.schemes {
+                resolvers
+                    .schemes
+                    .entry(scheme.clone())
+                    .or_insert_with(|| extension_id.clone());
+            }
+            if links.wikilinks {
+                resolvers.wikilinks.push(extension_id.clone());
+            }
+        }
+        resolvers
+    }
+
+    pub fn resolve_link(
+        &self,
+        extension_id: &str,
+        request: VisualMdLinkRequest,
+        cx: &App,
+    ) -> Task<Result<Option<VisualMdLinkTarget>, HookError>> {
+        self.call(extension_id, LINK_TIMEOUT, cx, move |hooks| {
+            hooks.resolve_link(request)
+        })
+    }
+
     pub fn document_event(
         &self,
         extension_id: &str,
@@ -599,6 +660,8 @@ pub(crate) mod test_support {
     use super::*;
 
     type RuleResponder = Box<dyn Fn(&VisualMdRuleMatch) -> VisualMdRuleOutput + Send + Sync>;
+    type LinkResponder =
+        Box<dyn Fn(&VisualMdLinkRequest) -> Option<VisualMdLinkTarget> + Send + Sync>;
 
     #[derive(Clone)]
     pub(crate) enum Behavior {
@@ -620,6 +683,8 @@ pub(crate) mod test_support {
         rule_responder: Mutex<RuleResponder>,
         rule_requests: Mutex<Vec<(String, Vec<VisualMdRuleMatch>)>>,
         document_events: Mutex<Vec<VisualMdDocumentEvent>>,
+        link_responder: Mutex<LinkResponder>,
+        link_requests: Mutex<Vec<VisualMdLinkRequest>>,
         /// How many outputs to leave off an answer, to test a short one.
         rule_outputs_to_drop: AtomicUsize,
     }
@@ -637,6 +702,8 @@ pub(crate) mod test_support {
                 rule_responder: Mutex::new(Box::new(|_| VisualMdRuleOutput::default())),
                 rule_requests: Mutex::new(Vec::new()),
                 document_events: Mutex::new(Vec::new()),
+                link_responder: Mutex::new(Box::new(|_| None)),
+                link_requests: Mutex::new(Vec::new()),
                 rule_outputs_to_drop: AtomicUsize::new(0),
             })
         }
@@ -675,6 +742,26 @@ pub(crate) mod test_support {
 
         pub(crate) fn rule_requests(&self) -> Vec<(String, Vec<VisualMdRuleMatch>)> {
             self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
+        }
+
+        pub(crate) fn set_link_responder(
+            &self,
+            responder: impl Fn(&VisualMdLinkRequest) -> Option<VisualMdLinkTarget>
+            + Send
+            + Sync
+            + 'static,
+        ) {
+            *self
+                .link_responder
+                .lock()
+                .expect("the test lock is not poisoned") = Box::new(responder);
+        }
+
+        pub(crate) fn link_requests(&self) -> Vec<VisualMdLinkRequest> {
+            self.link_requests
                 .lock()
                 .expect("the test lock is not poisoned")
                 .clone()
@@ -798,6 +885,21 @@ pub(crate) mod test_support {
                 .expect("the test lock is not poisoned")
                 .push(event);
             self.respond(())
+        }
+
+        fn resolve_link(
+            &self,
+            request: VisualMdLinkRequest,
+        ) -> BoxFuture<'static, Result<Option<VisualMdLinkTarget>>> {
+            let target = (self
+                .link_responder
+                .lock()
+                .expect("the test lock is not poisoned"))(&request);
+            self.link_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(request);
+            self.respond(target)
         }
     }
 
@@ -1138,6 +1240,55 @@ mod tests {
             render_fence(cx, "notes").await.is_ok(),
             "capacity frees up once the calls finish"
         );
+    }
+
+    #[gpui::test]
+    fn test_link_resolvers_are_the_extensions_with_code_that_declared_links(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let hooks = FakeHooks::new(&cx.executor(), Behavior::Succeed);
+        let links = |body: &str| format!("[visual_md.links]\n{body}");
+        register(
+            cx,
+            "zeta",
+            &links("schemes = [\"notes\", \"zeta\"]\nwikilinks = true\n"),
+            Some(hooks.clone()),
+        );
+        register(
+            cx,
+            "alpha",
+            &links("schemes = [\"notes\"]\nwikilinks = true\n"),
+            Some(hooks.clone()),
+        );
+        register(
+            cx,
+            "no-code",
+            &links("schemes = [\"ghost\"]\nwikilinks = true\n"),
+            None,
+        );
+        register(
+            cx,
+            "completions-only",
+            &links("wikilink_completions = true\n"),
+            Some(hooks),
+        );
+
+        cx.update(|cx| {
+            let resolvers = cx.global::<VisualMdExtensions>().link_resolvers();
+            assert_eq!(
+                resolvers.schemes,
+                BTreeMap::from([
+                    ("notes".to_string(), Arc::from("alpha")),
+                    ("zeta".to_string(), Arc::from("zeta")),
+                ]),
+                "the first id has a contested scheme, and an extension with no code has none"
+            );
+            assert_eq!(
+                resolvers.wikilinks,
+                vec![Arc::<str>::from("alpha"), Arc::from("zeta")]
+            );
+        });
     }
 
     #[gpui::test]

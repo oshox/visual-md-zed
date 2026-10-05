@@ -239,6 +239,7 @@ pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
+mod links;
 mod list_continuation;
 pub mod outline;
 mod plan;
@@ -711,6 +712,16 @@ impl Addon for VisualMdAddon {
         if self.active {
             key_context.add("visual_md");
         }
+    }
+
+    fn link_at(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        position: language::Anchor,
+        project: Option<&Entity<project::Project>>,
+        cx: &mut App,
+    ) -> Option<Task<Option<(Range<language::Anchor>, editor::hover_links::HoverLink)>>> {
+        links::link_at(self.active, buffer, position, project, cx)
     }
 
     fn to_any(&self) -> &dyn Any {
