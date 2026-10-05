@@ -784,12 +784,14 @@ impl ExtensionVisualMdProxy for RecordingVisualMdProxy {
     fn register_visual_md_extension(
         &self,
         manifest: Arc<ExtensionManifest>,
+        extension_dir: PathBuf,
         extension: Option<Arc<dyn Extension>>,
         _cx: &mut gpui::App,
     ) {
         self.events.lock().push(format!(
-            "register {} (wasm: {})",
+            "register {} in {} (wasm: {})",
             manifest.id,
+            extension_dir.display(),
             extension.is_some()
         ));
     }
@@ -859,7 +861,7 @@ async fn test_visual_md_extensions_are_registered_and_unregistered_with_the_stor
 
     assert_eq!(
         *recording.events.lock(),
-        vec!["register notes (wasm: false)".to_string()],
+        vec!["register notes in /the-extension-dir/installed/notes (wasm: false)".to_string()],
         "only extensions with a visual_md section are registered, and without wasm they have no hooks"
     );
 
@@ -886,7 +888,7 @@ async fn test_visual_md_extensions_are_registered_and_unregistered_with_the_stor
     assert_eq!(
         *recording.events.lock(),
         vec![
-            "register notes (wasm: false)".to_string(),
+            "register notes in /the-extension-dir/installed/notes (wasm: false)".to_string(),
             "unregister notes".to_string(),
         ]
     );

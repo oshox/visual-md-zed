@@ -6,6 +6,7 @@
 //! finishes, the way `ensure_code_languages_loaded` does for grammars.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -20,6 +21,7 @@ use futures::FutureExt as _;
 use futures::future::{BoxFuture, Either, select};
 use gpui::{App, AppContext as _, AsyncApp, BorrowAppContext as _, Global, Task};
 
+use crate::plan::CalloutKind;
 use crate::rules::CompiledRule;
 
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,9 +155,31 @@ struct RegisteredExtension {
     name: String,
     entry: VisualMdManifestEntry,
     rules: Vec<Arc<CompiledRule>>,
+    callouts: BTreeMap<String, ExtensionCallout>,
     hooks: Option<Arc<dyn VisualMdHooks>>,
     health: Arc<Health>,
     generation: u64,
+}
+
+/// Where a callout's icon comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionCalloutIcon {
+    /// The name of one of Zed's own icons.
+    Name(String),
+    /// An `.svg` file in the extension's directory.
+    Svg(PathBuf),
+}
+
+/// A callout type an extension registered. The fields are as the manifest gave
+/// them, except that the kind is known to be valid; the colors and the icon
+/// name are checked when a look is built from them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionCallout {
+    pub title: Option<String>,
+    pub kind: Option<CalloutKind>,
+    pub icon: Option<ExtensionCalloutIcon>,
+    pub accent: Option<String>,
+    pub background: Option<String>,
 }
 
 /// A renderer an extension registered for a fenced code block language.
@@ -210,11 +234,12 @@ impl ExtensionVisualMdProxy for VisualMdProxy {
     fn register_visual_md_extension(
         &self,
         manifest: Arc<ExtensionManifest>,
+        extension_dir: PathBuf,
         extension: Option<Arc<dyn Extension>>,
         cx: &mut App,
     ) {
         let hooks = extension.map(|extension| Arc::new(ExtensionHooks(extension)) as _);
-        VisualMdExtensions::register(&manifest, hooks, cx);
+        VisualMdExtensions::register(&manifest, &extension_dir, hooks, cx);
     }
 
     fn unregister_visual_md_extension(&self, extension_id: Arc<str>, cx: &mut App) {
@@ -228,6 +253,7 @@ impl VisualMdExtensions {
     /// registered at all.
     pub fn register(
         manifest: &ExtensionManifest,
+        extension_dir: &Path,
         hooks: Option<Arc<dyn VisualMdHooks>>,
         cx: &mut App,
     ) {
@@ -282,6 +308,40 @@ impl VisualMdExtensions {
                     }
                 })
                 .collect();
+            let callouts = entry
+                .callouts
+                .iter()
+                .filter_map(|(callout_name, callout)| {
+                    let kind = match callout.kind.as_deref().map(CalloutKind::from_declared_name) {
+                        Some(None) => {
+                            log::error!(
+                                "not using callout {callout_name} of extension {extension_id}: \
+                                {:?} is not a callout kind",
+                                callout.kind
+                            );
+                            return None;
+                        }
+                        Some(Some(kind)) => Some(kind),
+                        None => None,
+                    };
+                    Some((
+                        callout_name.to_lowercase(),
+                        ExtensionCallout {
+                            title: callout.title.clone(),
+                            kind,
+                            icon: callout.icon.as_ref().map(|icon| {
+                                if icon.ends_with(".svg") {
+                                    ExtensionCalloutIcon::Svg(extension_dir.join(icon))
+                                } else {
+                                    ExtensionCalloutIcon::Name(icon.clone())
+                                }
+                            }),
+                            accent: callout.accent.clone(),
+                            background: callout.background.clone(),
+                        },
+                    ))
+                })
+                .collect();
             let health = Arc::new(Health::new(extension_id.clone()));
             registry.extensions.insert(
                 extension_id,
@@ -289,6 +349,7 @@ impl VisualMdExtensions {
                     name,
                     entry,
                     rules,
+                    callouts,
                     hooks,
                     health,
                     generation,
@@ -343,6 +404,20 @@ impl VisualMdExtensions {
             .values()
             .flat_map(|extension| extension.rules.iter().cloned())
             .collect()
+    }
+
+    /// The callout types extensions registered, by lowercased name. When more
+    /// than one extension registers a name, the one whose id sorts first wins.
+    pub fn callouts(&self) -> BTreeMap<String, ExtensionCallout> {
+        let mut callouts = BTreeMap::new();
+        for extension in self.extensions.values() {
+            for (name, callout) in &extension.callouts {
+                callouts
+                    .entry(name.clone())
+                    .or_insert_with(|| callout.clone());
+            }
+        }
+        callouts
     }
 
     pub fn commands(&self) -> Vec<ExtensionCommand> {
@@ -691,6 +766,7 @@ pub(crate) mod test_support {
         cx.update(|cx| {
             VisualMdExtensions::register(
                 &manifest,
+                Path::new("/extensions/installed").join(id).as_path(),
                 hooks.map(|hooks| hooks as Arc<dyn VisualMdHooks>),
                 cx,
             )
@@ -1018,7 +1094,12 @@ mod tests {
 
         cx.update(|cx| {
             let proxy = ExtensionHostProxy::default_global(cx);
-            proxy.register_visual_md_extension(manifest, None, cx);
+            proxy.register_visual_md_extension(
+                manifest,
+                PathBuf::from("/extensions/notes"),
+                None,
+                cx,
+            );
             assert!(
                 cx.global::<VisualMdExtensions>()
                     .renderer_for_language("flow")

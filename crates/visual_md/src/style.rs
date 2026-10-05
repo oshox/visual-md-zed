@@ -24,6 +24,7 @@ use settings::{
 use theme::{ActiveTheme as _, SyntaxTheme};
 use util::ResultExt as _;
 
+use crate::extensions::{ExtensionCallout, ExtensionCalloutIcon, VisualMdExtensions};
 use crate::plan::CalloutKind;
 
 /// How much larger than the prose font each heading level is, H1 first.
@@ -35,12 +36,70 @@ const DEFAULT_MARKER_COLOR: u32 = 0x6b7280;
 /// A change this small in a size ratio is not worth restyling for.
 const SCALE_EPSILON: f32 = 1e-3;
 
-/// The icon, accent and background of one callout type.
+/// Where a callout's icon is drawn from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum CalloutIcon {
+    /// A path in the app's bundled assets, such as `icons/info.svg`.
+    Asset(SharedString),
+    /// An `.svg` file on disk, as an extension ships its own.
+    External(SharedString),
+}
+
+impl CalloutIcon {
+    /// The bundled asset path, for tests that pin the built-in icons.
+    #[cfg(test)]
+    pub(crate) fn asset_path(&self) -> Option<&str> {
+        match self {
+            Self::Asset(path) => Some(path.as_ref()),
+            Self::External(_) => None,
+        }
+    }
+}
+
+/// The icon, accent and background of one callout type, and the title an
+/// extension gave it, if it did.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CalloutLook {
-    pub icon_path: SharedString,
+    pub icon: CalloutIcon,
     pub accent: Hsla,
     pub background: Hsla,
+    /// Shown instead of the capitalized type name.
+    pub title: Option<SharedString>,
+}
+
+/// A callout type an extension registered, with its colors and icon parsed.
+#[derive(Clone, Debug, PartialEq)]
+struct ExtensionCalloutStyle {
+    title: Option<SharedString>,
+    kind: Option<CalloutKind>,
+    icon: Option<CalloutIcon>,
+    accent: Option<Hsla>,
+    background: Option<Hsla>,
+}
+
+impl ExtensionCalloutStyle {
+    fn resolve(callout: &ExtensionCallout) -> Self {
+        let color = |color: &Option<String>| {
+            color
+                .as_deref()
+                .and_then(|color| theme::try_parse_color(color).log_err())
+        };
+        Self {
+            title: callout.title.clone().map(SharedString::from),
+            kind: callout.kind,
+            icon: callout.icon.as_ref().and_then(|icon| match icon {
+                ExtensionCalloutIcon::Name(name) => IconName::from_str(name)
+                    .map_err(|_| anyhow::anyhow!("unknown callout icon {name:?}"))
+                    .log_err()
+                    .map(|icon| CalloutIcon::Asset(SharedString::from(icon.path()))),
+                ExtensionCalloutIcon::Svg(path) => Some(CalloutIcon::External(SharedString::from(
+                    path.to_string_lossy().into_owned(),
+                ))),
+            }),
+            accent: color(&callout.accent),
+            background: color(&callout.background),
+        }
+    }
 }
 
 /// Everything needed to look up the look of a callout by type name.
@@ -52,6 +111,8 @@ pub(crate) struct CalloutStyles {
     defaults: [CalloutLook; 5],
     callouts: HashMap<String, VisualMdCalloutContent>,
     colors: HashMap<String, VisualMdCalloutColorsContent>,
+    /// The callout types extensions registered, by lowercased name.
+    extension: HashMap<String, ExtensionCalloutStyle>,
     syntax: Arc<SyntaxTheme>,
 }
 
@@ -60,6 +121,7 @@ impl PartialEq for CalloutStyles {
         self.defaults == other.defaults
             && self.callouts == other.callouts
             && self.colors == other.colors
+            && self.extension == other.extension
             && Arc::ptr_eq(&self.syntax, &other.syntax)
     }
 }
@@ -94,9 +156,10 @@ impl CalloutStyles {
             ("icons/quote.svg", status.hint, status.hint_background),
         ]
         .map(|(icon_path, accent, background)| CalloutLook {
-            icon_path: SharedString::from(icon_path),
+            icon: CalloutIcon::Asset(SharedString::from(icon_path)),
             accent,
             background,
+            title: None,
         });
 
         Self {
@@ -113,6 +176,18 @@ impl CalloutStyles {
                 .flatten()
                 .map(|(name, colors)| (name.to_lowercase(), colors.clone()))
                 .collect(),
+            extension: cx
+                .try_global::<VisualMdExtensions>()
+                .map(|registry| {
+                    registry
+                        .callouts()
+                        .iter()
+                        .map(|(name, callout)| {
+                            (name.clone(), ExtensionCalloutStyle::resolve(callout))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             syntax: cx.theme().syntax().clone(),
         }
     }
@@ -125,8 +200,22 @@ impl CalloutStyles {
     /// for the written name, `colors.callout` for the kind's canonical name,
     /// then the theme's `visual_md.callout.<name>` token for the written name
     /// and for the canonical name, then the kind's default.
+    ///
+    /// A callout type an extension registered under the written name sits
+    /// among them. Everything set for that name specifically, by the user in
+    /// settings or by the theme, still wins over it, since the extension only
+    /// supplies the type's own look. It wins over what is set for the kind,
+    /// since a kind is only what the type starts from, and over the kind's
+    /// default. The kind it declares replaces `Other` for a type of an unknown
+    /// name, so the defaults and the kind-wide settings it starts from are its
+    /// kind's.
     pub fn look(&self, kind: CalloutKind, raw_type_name: &str) -> CalloutLook {
         let name = raw_type_name.to_lowercase();
+        let extension = self.extension.get(&name);
+        let kind = match (kind, extension.and_then(|extension| extension.kind)) {
+            (CalloutKind::Other, Some(declared)) => declared,
+            (kind, _) => kind,
+        };
         let canonical = kind.canonical_name();
         let default = &self.defaults[kind_index(kind)];
 
@@ -134,10 +223,18 @@ impl CalloutStyles {
         let named_colors = self.colors.get(&name);
         let canonical_colors = self.colors.get(canonical);
         let token = |token_name: &str| self.syntax.style_for_name(&token_for(token_name));
+        // The theme's token for the written name outranks an extension's look,
+        // so it is consulted ahead of it, when there is one. Without one it
+        // keeps its place below the kind-wide settings, as it always had.
+        let name_token = |field: fn(&HighlightStyle) -> Option<Hsla>| {
+            extension.and(token(&name)).and_then(|style| field(&style))
+        };
 
         let accent = custom
             .and_then(|custom| parse_color(custom.accent.as_ref()))
             .or_else(|| named_colors.and_then(|colors| parse_color(colors.accent.as_ref())))
+            .or_else(|| name_token(|style| style.color))
+            .or_else(|| extension.and_then(|extension| extension.accent))
             .or_else(|| canonical_colors.and_then(|colors| parse_color(colors.accent.as_ref())))
             .or_else(|| token(&name).and_then(|style| style.color))
             .or_else(|| token(canonical).and_then(|style| style.color))
@@ -145,24 +242,28 @@ impl CalloutStyles {
         let background = custom
             .and_then(|custom| parse_color(custom.background.as_ref()))
             .or_else(|| named_colors.and_then(|colors| parse_color(colors.background.as_ref())))
+            .or_else(|| name_token(|style| style.background_color))
+            .or_else(|| extension.and_then(|extension| extension.background))
             .or_else(|| canonical_colors.and_then(|colors| parse_color(colors.background.as_ref())))
             .or_else(|| token(&name).and_then(|style| style.background_color))
             .or_else(|| token(canonical).and_then(|style| style.background_color))
             .unwrap_or(default.background);
-        let icon_path = custom
+        let icon = custom
             .and_then(|custom| custom.icon.as_deref())
             .and_then(|icon| {
                 IconName::from_str(icon)
                     .map_err(|_| anyhow::anyhow!("unknown callout icon {icon:?}"))
                     .log_err()
             })
-            .map(|icon| SharedString::from(icon.path()))
-            .unwrap_or_else(|| default.icon_path.clone());
+            .map(|icon| CalloutIcon::Asset(SharedString::from(icon.path())))
+            .or_else(|| extension.and_then(|extension| extension.icon.clone()))
+            .unwrap_or_else(|| default.icon.clone());
 
         CalloutLook {
-            icon_path,
+            icon,
             accent,
             background,
+            title: extension.and_then(|extension| extension.title.clone()),
         }
     }
 }
@@ -443,5 +544,338 @@ fn family_or(setting: &Option<settings::FontFamilyName>, fallback: &gpui::Font) 
     match setting {
         Some(family) => FontFamilyName::new(family.as_ref()),
         None => FontFamilyName::new(&fallback.family),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use editor::HighlightKey;
+    use editor::test::editor_test_context::EditorTestContext;
+    use gpui::TestAppContext;
+    use settings::{VisualMdCalloutColorsContent, VisualMdCalloutContent};
+
+    use crate::extensions::VisualMdExtensions;
+    use crate::extensions::test_support::register;
+    use crate::integration_tests::{init_test, markdown_language};
+
+    use super::*;
+
+    const TODO: &str = "[visual_md.callouts.todo]\ntitle = \"To do\"\nkind = \"tip\"\nicon = \"star\"\naccent = \"#a855f7\"\nbackground = \"#a855f71a\"\n";
+
+    fn hex(color: &str) -> Hsla {
+        theme::try_parse_color(color).expect("the test colors are valid")
+    }
+
+    fn look_with(
+        cx: &mut TestAppContext,
+        settings: &VisualMdSettingsContent,
+        kind: CalloutKind,
+        name: &str,
+    ) -> CalloutLook {
+        cx.update(|cx| ResolvedStyle::resolve(settings, cx).callout_look(kind, name))
+    }
+
+    fn look(cx: &mut TestAppContext, kind: CalloutKind, name: &str) -> CalloutLook {
+        look_with(cx, &VisualMdSettingsContent::default(), kind, name)
+    }
+
+    fn status(cx: &mut TestAppContext) -> theme::StatusColors {
+        cx.update(|cx| cx.theme().status().clone())
+    }
+
+    #[gpui::test]
+    fn test_a_registered_callout_gives_its_title_icon_and_colors(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(cx, "notes", TODO, None);
+
+        let todo = look(cx, CalloutKind::Other, "todo");
+
+        assert_eq!(todo.title.as_deref(), Some("To do"));
+        assert_eq!(
+            todo.icon,
+            CalloutIcon::Asset(IconName::Star.path().to_string().into())
+        );
+        assert_eq!(todo.accent, hex("#a855f7"));
+        assert_eq!(todo.background, hex("#a855f71a"));
+        assert_eq!(
+            look(cx, CalloutKind::Other, "ToDo"),
+            todo,
+            "names ignore case"
+        );
+    }
+
+    #[gpui::test]
+    fn test_other_callouts_are_unaffected(cx: &mut TestAppContext) {
+        init_test(cx);
+        let before = look(cx, CalloutKind::Other, "custom");
+        let note_before = look(cx, CalloutKind::Note, "note");
+        register(cx, "notes", TODO, None);
+
+        assert_eq!(look(cx, CalloutKind::Other, "custom"), before);
+        assert_eq!(look(cx, CalloutKind::Note, "note"), note_before);
+        assert_eq!(look(cx, CalloutKind::Other, "custom").title, None);
+    }
+
+    #[gpui::test]
+    fn test_the_declared_kind_gives_the_defaults_a_type_starts_from(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(
+            cx,
+            "notes",
+            "[visual_md.callouts.careful]\nkind = \"caution\"\n[visual_md.callouts.plain]\n",
+            None,
+        );
+        let colors = status(cx);
+
+        let careful = look(cx, CalloutKind::Other, "careful");
+        assert_eq!(careful.accent, colors.warning);
+        assert_eq!(careful.background, colors.warning_background);
+        assert_eq!(careful.icon, CalloutIcon::Asset("icons/warning.svg".into()));
+
+        let plain = look(cx, CalloutKind::Other, "plain");
+        assert_eq!(plain.accent, colors.hint, "no kind means the generic look");
+    }
+
+    #[gpui::test]
+    fn test_a_registered_callout_may_restyle_a_built_in_name_without_changing_its_kind(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        register(
+            cx,
+            "notes",
+            "[visual_md.callouts.note]\naccent = \"#112233\"\nkind = \"danger\"\n",
+            None,
+        );
+        let colors = status(cx);
+
+        let note = look(cx, CalloutKind::Note, "note");
+
+        assert_eq!(note.accent, hex("#112233"));
+        assert_eq!(
+            note.background, colors.info_background,
+            "the planner's kind stands; the declared one only replaces `Other`"
+        );
+    }
+
+    #[gpui::test]
+    fn test_an_svg_icon_is_drawn_from_the_extensions_directory(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(
+            cx,
+            "notes",
+            "[visual_md.callouts.drawn]\nicon = \"icons/drawn.svg\"\n",
+            None,
+        );
+
+        assert_eq!(
+            look(cx, CalloutKind::Other, "drawn").icon,
+            CalloutIcon::External("/extensions/installed/notes/icons/drawn.svg".into())
+        );
+    }
+
+    #[gpui::test]
+    fn test_an_unknown_icon_name_leaves_the_kinds_icon(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(
+            cx,
+            "notes",
+            "[visual_md.callouts.odd]\nkind = \"tip\"\nicon = \"definitely_not_an_icon\"\n",
+            None,
+        );
+
+        assert_eq!(
+            look(cx, CalloutKind::Other, "odd").icon,
+            CalloutIcon::Asset("icons/sparkle.svg".into())
+        );
+    }
+
+    #[gpui::test]
+    fn test_a_callout_with_an_unknown_kind_is_not_registered(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(
+            cx,
+            "notes",
+            "[visual_md.callouts.bogus]\nkind = \"tipp\"\ntitle = \"Bogus\"\n[visual_md.callouts.fine]\nkind = \"info\"\n",
+            None,
+        );
+
+        cx.update(|cx| {
+            let callouts = cx.global::<VisualMdExtensions>().callouts();
+            assert_eq!(callouts.keys().collect::<Vec<_>>(), vec!["fine"]);
+            assert_eq!(callouts["fine"].kind, Some(CalloutKind::Note));
+        });
+    }
+
+    #[gpui::test]
+    fn test_the_first_extension_by_id_wins_a_contested_callout_name(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(
+            cx,
+            "zeta",
+            "[visual_md.callouts.todo]\ntitle = \"Zeta\"\n",
+            None,
+        );
+        register(
+            cx,
+            "alpha",
+            "[visual_md.callouts.todo]\ntitle = \"Alpha\"\n",
+            None,
+        );
+
+        assert_eq!(
+            look(cx, CalloutKind::Other, "todo").title.as_deref(),
+            Some("Alpha")
+        );
+    }
+
+    #[gpui::test]
+    fn test_unregistering_removes_the_callout(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(cx, "notes", TODO, None);
+        cx.update(|cx| VisualMdExtensions::unregister("notes", cx));
+
+        assert_eq!(look(cx, CalloutKind::Other, "todo").title, None);
+    }
+
+    fn settings_with_user_callout(accent: &str) -> VisualMdSettingsContent {
+        VisualMdSettingsContent {
+            callouts: Some(
+                [(
+                    "todo".to_string(),
+                    VisualMdCalloutContent {
+                        accent: Some(accent.into()),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn settings_with_colors(name: &str, accent: &str) -> VisualMdSettingsContent {
+        VisualMdSettingsContent {
+            colors: Some(VisualMdColorsContent {
+                callout: Some(
+                    [(
+                        name.to_string(),
+                        VisualMdCalloutColorsContent {
+                            accent: Some(accent.into()),
+                            background: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    fn test_what_the_user_sets_for_the_name_beats_the_extension(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(cx, "notes", TODO, None);
+
+        let by_callout = look_with(
+            cx,
+            &settings_with_user_callout("#00ff00"),
+            CalloutKind::Other,
+            "todo",
+        );
+        let by_colors = look_with(
+            cx,
+            &settings_with_colors("todo", "#0000ff"),
+            CalloutKind::Other,
+            "todo",
+        );
+
+        assert_eq!(by_callout.accent, hex("#00ff00"));
+        assert_eq!(by_colors.accent, hex("#0000ff"));
+        assert_eq!(
+            by_callout.background,
+            hex("#a855f71a"),
+            "what the user left alone stays the extension's"
+        );
+    }
+
+    #[gpui::test]
+    fn test_the_extension_beats_what_is_set_for_the_whole_kind(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(cx, "notes", TODO, None);
+        register(
+            cx,
+            "other",
+            "[visual_md.callouts.nocolor]\nkind = \"tip\"\n",
+            None,
+        );
+        let kind_wide = settings_with_colors("tip", "#ff00ff");
+
+        let todo = look_with(cx, &kind_wide, CalloutKind::Other, "todo");
+        let nocolor = look_with(cx, &kind_wide, CalloutKind::Other, "nocolor");
+
+        assert_eq!(
+            todo.accent,
+            hex("#a855f7"),
+            "the extension set its own accent"
+        );
+        assert_eq!(
+            nocolor.accent,
+            hex("#ff00ff"),
+            "without its own accent a type starts from what its kind is set to"
+        );
+    }
+
+    #[gpui::test]
+    fn test_the_themes_token_for_the_name_beats_the_extension(cx: &mut TestAppContext) {
+        init_test(cx);
+        register(cx, "notes", TODO, None);
+        let themed = cx.update(|cx| {
+            let mut resolved = ResolvedStyle::resolve(&Default::default(), cx);
+            let token = HighlightStyle {
+                color: Some(hex("#abcdef")),
+                ..Default::default()
+            };
+            resolved.callouts.syntax = Arc::new(SyntaxTheme::new_test_styles([(
+                "visual_md.callout.todo",
+                token,
+            )]));
+            resolved.callout_look(CalloutKind::Other, "todo")
+        });
+
+        assert_eq!(themed.accent, hex("#abcdef"));
+        assert_eq!(themed.background, hex("#a855f71a"));
+    }
+
+    #[gpui::test]
+    async fn test_a_callout_in_the_editor_shows_the_extensions_title_and_background(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        register(cx, "notes", TODO, None);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇabove\n\n> [!todo] Buy milk\n> and eggs\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| crate::refresh(editor, window, cx));
+
+        let displayed = cx.display_text();
+        assert!(displayed.contains("To do"), "{displayed:?}");
+        assert!(!displayed.contains("Todo"), "{displayed:?}");
+        let background = cx.update_editor(|editor, _, cx| {
+            editor
+                .text_highlights(HighlightKey::VisualMd(crate::KEY_CALLOUT_FIRST), cx)
+                .and_then(|(style, _)| style.background_color)
+        });
+        assert_eq!(background, Some(hex("#a855f71a")));
+
+        cx.update(|_, cx| VisualMdExtensions::unregister("notes", cx));
+        cx.run_until_parked();
+        let displayed = cx.display_text();
+        assert!(displayed.contains("Todo"), "{displayed:?}");
+        assert!(!displayed.contains("To do"), "{displayed:?}");
     }
 }

@@ -63,6 +63,18 @@ impl CalloutKind {
         }
     }
 
+    /// The kind a manifest names, by its canonical name or an alias, or `None`
+    /// for a name that is neither.
+    pub fn from_declared_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "other" => Some(Self::Other),
+            known => match Self::from_type_name(known) {
+                Self::Other => None,
+                kind => Some(kind),
+            },
+        }
+    }
+
     fn from_type_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
             "note" | "info" => Self::Note,

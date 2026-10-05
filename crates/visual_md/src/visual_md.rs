@@ -270,7 +270,7 @@ use gpui::{
 use language::{Language, Rope};
 use plan::{CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment};
 use settings::Settings;
-use style::ResolvedStyle;
+use style::{CalloutIcon, ResolvedStyle};
 use util::ResultExt;
 
 actions!(
@@ -1159,8 +1159,14 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 (
                     callout.marker_range.clone(),
                     format!(
-                        "callout-title:{:?}:{:?}:{}",
-                        callout.kind, callout.fold, callout.raw_type_name
+                        "callout-title:{:?}:{:?}:{}:{}",
+                        callout.kind,
+                        callout.fold,
+                        callout.raw_type_name,
+                        style
+                            .callout_look(callout.kind, &callout.raw_type_name)
+                            .title
+                            .unwrap_or_default()
                     ),
                     callout_title_placeholder(
                         editor_handle.clone(),
@@ -1689,7 +1695,11 @@ fn callout_title_placeholder(
     style: Arc<ArcSwap<ResolvedStyle>>,
 ) -> editor::FoldPlaceholder {
     let collapsed = fold.is_collapsed();
-    let label = SharedString::from(capitalize(&raw_type_name));
+    let label = style
+        .load()
+        .callout_look(kind, &raw_type_name)
+        .title
+        .unwrap_or_else(|| SharedString::from(capitalize(&raw_type_name)));
     let collapsed_text = label.clone();
     editor::FoldPlaceholder {
         render: std::sync::Arc::new(move |fold_id, _range, _| {
@@ -1697,7 +1707,7 @@ fn callout_title_placeholder(
             let suffix_range = suffix_range.clone();
             let label = label.clone();
             let look = style.load().callout_look(kind, &raw_type_name);
-            let (icon_path, color) = (look.icon_path, look.accent);
+            let (icon, color) = (look.icon, look.accent);
             let chevron_path = if collapsed {
                 "icons/chevron_right.svg"
             } else {
@@ -1729,7 +1739,7 @@ fn callout_title_placeholder(
                                 .log_err();
                         }),
                 )
-                .child(svg().path(icon_path).size(px(13.)).text_color(color))
+                .child(callout_icon(&icon).size(px(13.)).text_color(color))
                 .child(
                     div()
                         .text_color(color)
@@ -1745,6 +1755,15 @@ fn callout_title_placeholder(
         // tests asserting on `display_text()`.
         collapsed_text: Some(collapsed_text),
         ..base_placeholder()
+    }
+}
+
+/// The element that draws a callout's icon: one of the app's own, or an `.svg`
+/// file an extension ships.
+fn callout_icon(icon: &CalloutIcon) -> gpui::Svg {
+    match icon {
+        CalloutIcon::Asset(path) => svg().path(path.clone()),
+        CalloutIcon::External(path) => svg().external_path(path.clone()),
     }
 }
 
@@ -4359,7 +4378,11 @@ mod integration_tests {
                 ResolvedStyle::resolve(&Default::default(), cx).callout_look(kind, type_name)
             });
             assert_eq!(
-                (look.icon_path.as_ref(), look.accent, look.background),
+                (
+                    look.icon.asset_path().unwrap_or_default(),
+                    look.accent,
+                    look.background
+                ),
                 (icon, accent, background),
                 "{needle}"
             );
@@ -4791,8 +4814,8 @@ mod integration_tests {
                 .callout_look(CalloutKind::Other, "custom")
         });
         assert_eq!(
-            look.icon_path.as_ref(),
-            icons::IconName::Star.path().as_ref()
+            look.icon.asset_path(),
+            Some(icons::IconName::Star.path().as_ref())
         );
         assert_eq!(look.accent, hex("#ff0000"));
 
@@ -4825,7 +4848,7 @@ mod integration_tests {
             ResolvedStyle::resolve(&content, cx).callout_look(CalloutKind::Note, "note")
         });
 
-        assert_eq!(look.icon_path.as_ref(), "icons/info.svg");
+        assert_eq!(look.icon.asset_path(), Some("icons/info.svg"));
     }
 
     /// Exercises the M11 callout title widget through a real `refresh()`,

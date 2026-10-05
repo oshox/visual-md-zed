@@ -406,11 +406,14 @@ impl ExtensionContextServerProxy for ExtensionHostProxy {
 /// to Zed MD's Markdown live preview.
 pub trait ExtensionVisualMdProxy: Send + Sync + 'static {
     /// Registers an extension's hooks, replacing any it registered before.
-    /// `extension` is `None` when the extension has no WebAssembly component, in
-    /// which case only the hooks that need none apply.
+    /// `extension_dir` is the directory the extension is installed in, which
+    /// holds the files its manifest refers to. `extension` is `None` when the
+    /// extension has no WebAssembly component, in which case only the hooks
+    /// that need none apply.
     fn register_visual_md_extension(
         &self,
         manifest: Arc<ExtensionManifest>,
+        extension_dir: PathBuf,
         extension: Option<Arc<dyn Extension>>,
         cx: &mut App,
     );
@@ -422,6 +425,7 @@ impl ExtensionVisualMdProxy for ExtensionHostProxy {
     fn register_visual_md_extension(
         &self,
         manifest: Arc<ExtensionManifest>,
+        extension_dir: PathBuf,
         extension: Option<Arc<dyn Extension>>,
         cx: &mut App,
     ) {
@@ -429,7 +433,7 @@ impl ExtensionVisualMdProxy for ExtensionHostProxy {
             return;
         };
 
-        proxy.register_visual_md_extension(manifest, extension, cx)
+        proxy.register_visual_md_extension(manifest, extension_dir, extension, cx)
     }
 
     fn unregister_visual_md_extension(&self, extension_id: Arc<str>, cx: &mut App) {
@@ -543,12 +547,14 @@ mod tests {
         fn register_visual_md_extension(
             &self,
             manifest: Arc<ExtensionManifest>,
+            extension_dir: PathBuf,
             extension: Option<Arc<dyn Extension>>,
             _cx: &mut App,
         ) {
             self.events.lock().unwrap().push(format!(
-                "register {} (wasm: {})",
+                "register {} in {} (wasm: {})",
                 manifest.id,
+                extension_dir.display(),
                 extension.is_some()
             ));
         }
@@ -594,14 +600,19 @@ mod tests {
         host_proxy.register_visual_md_proxy(recording.clone());
 
         cx.update(|cx| {
-            host_proxy.register_visual_md_extension(manifest("notes"), None, cx);
+            host_proxy.register_visual_md_extension(
+                manifest("notes"),
+                PathBuf::from("/extensions/notes"),
+                None,
+                cx,
+            );
             host_proxy.unregister_visual_md_extension("notes".into(), cx);
         });
 
         assert_eq!(
             *recording.events.lock().unwrap(),
             vec![
-                "register notes (wasm: false)".to_string(),
+                "register notes in /extensions/notes (wasm: false)".to_string(),
                 "unregister notes".to_string()
             ]
         );
@@ -612,7 +623,12 @@ mod tests {
         let host_proxy = ExtensionHostProxy::new();
 
         cx.update(|cx| {
-            host_proxy.register_visual_md_extension(manifest("notes"), None, cx);
+            host_proxy.register_visual_md_extension(
+                manifest("notes"),
+                PathBuf::from("/extensions/notes"),
+                None,
+                cx,
+            );
             host_proxy.unregister_visual_md_extension("notes".into(), cx);
         });
     }
