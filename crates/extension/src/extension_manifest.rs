@@ -168,7 +168,8 @@ fn default_changed_debounce_ms() -> u64 {
 /// The document events an extension is told about, `[visual_md.events]`.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct VisualMdEventsManifestEntry {
-    /// A document was shown in an editor with live preview for the first time.
+    /// A document is shown in an editor with live preview and the extension has
+    /// not been told yet, including one that was open before the extension loaded.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub opened: bool,
     /// A document was saved.

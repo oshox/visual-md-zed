@@ -355,7 +355,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         saved_text_style_refinement: None,
         callout_key_count: 0,
         extension_key_count: 0,
-        opened_event_sent: false,
+        opened_events_sent: HashMap::new(),
         changed_events: HashMap::new(),
         completion_provider: None,
     });
@@ -695,9 +695,10 @@ struct VisualMdAddon {
     /// How many `HighlightKey::VisualMdExtension` keys the last refresh used,
     /// for the same reason.
     extension_key_count: usize,
-    /// Whether the extensions subscribed to it have been told this editor
-    /// opened its document. It happens once, the first time live preview shows.
-    opened_event_sent: bool,
+    /// The generation of each extension that has been told this editor opened
+    /// its document. An extension is told once per build, as soon as live
+    /// preview shows and the extension is registered, whichever comes last.
+    opened_events_sent: HashMap<Arc<str>, u64>,
     /// The wait before each extension is told the document changed, by
     /// extension. Starting one again, on the next edit, drops the one before.
     changed_events: HashMap<Arc<str>, Task<()>>,
@@ -1079,12 +1080,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         editor.set_show_fold_indicators(if enabled { false } else { gutter.folds }, cx);
     }
 
-    if enabled
-        && !was_active
-        && editor
-            .addon_mut::<VisualMdAddon>()
-            .is_some_and(|addon| !std::mem::replace(&mut addon.opened_event_sent, true))
-    {
+    if enabled {
         document_events::send_opened(editor, cx);
     }
     if enabled && !was_active {

@@ -36,10 +36,26 @@ fn subscribers(
         .unwrap_or_default()
 }
 
-/// The document was shown with live preview for the first time.
-pub(crate) fn send_opened(editor: &Editor, cx: &mut Context<Editor>) {
-    let extension_ids = subscribers(cx, |events| events.opened)
+/// Tells the extensions that want to hear of documents being opened about this
+/// one, unless this editor has told that build of them already. An extension
+/// that loads after the document was opened, which is how it goes for documents
+/// restored at startup, hears of it when it registers.
+pub(crate) fn send_opened(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let subscribers = cx
+        .try_global::<VisualMdExtensions>()
+        .map(|registry| registry.opened_subscribers())
+        .unwrap_or_default();
+    let Some(addon) = editor.addon_mut::<VisualMdAddon>() else {
+        return;
+    };
+    let extension_ids = subscribers
         .into_iter()
+        .filter(|(extension_id, generation)| {
+            addon
+                .opened_events_sent
+                .insert(extension_id.clone(), *generation)
+                != Some(*generation)
+        })
         .map(|(extension_id, _)| extension_id)
         .collect();
     send(editor, VisualMdDocumentEventKind::Opened, extension_ids, cx);
@@ -420,7 +436,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_an_extension_registered_later_is_not_told_of_a_document_already_open(
+    async fn test_an_extension_registered_later_is_told_of_a_document_already_open(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -431,6 +447,58 @@ mod tests {
             &mut cx,
             "notes",
             &events_section("opened = true\n"),
+            Some(hooks.clone()),
+        );
+        cx.run_until_parked();
+        settle(&mut cx);
+
+        assert_eq!(kinds(&hooks), vec![VisualMdDocumentEventKind::Opened]);
+        assert_eq!(
+            hooks.document_events()[0].outline.headings.len(),
+            1,
+            "with the document as it is now"
+        );
+
+        cx.update_editor(|editor, window, cx| crate::force_refresh(editor, window, cx));
+        settle(&mut cx);
+        assert_eq!(hooks.document_events().len(), 1, "and only once");
+    }
+
+    #[gpui::test]
+    async fn test_a_rebuilt_extension_is_told_of_the_open_document_again(cx: &mut TestAppContext) {
+        let hooks = setup(cx, "opened = true\n");
+        let mut cx = editor_showing(cx, DOCUMENT).await;
+        settle(&mut cx);
+        assert_eq!(hooks.document_events().len(), 1);
+
+        register(
+            &mut cx,
+            "notes",
+            &events_section("opened = true\n"),
+            Some(hooks.clone()),
+        );
+        cx.run_until_parked();
+        settle(&mut cx);
+
+        assert_eq!(
+            hooks.document_events().len(),
+            2,
+            "a new build has not heard of the document"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_an_extension_that_subscribed_to_nothing_is_not_told_of_an_open_document(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut cx = editor_showing(cx, DOCUMENT).await;
+        let hooks = FakeHooks::new(&cx.executor(), Behavior::Succeed);
+
+        register(
+            &mut cx,
+            "notes",
+            &events_section("saved = true\n"),
             Some(hooks.clone()),
         );
         cx.run_until_parked();
