@@ -19,7 +19,7 @@ use extension::{
     ExtensionHostProxy, ExtensionVisualMdProxy, KeyValueStoreDelegate, LibManifestEntry,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput,
     StartDebuggingRequestArgumentsRequest, Symbol, VisualMdAppearance, VisualMdCommandContext,
-    VisualMdFenceOutput, VisualMdFenceRequest, WorktreeDelegate,
+    VisualMdFenceOutput, VisualMdFenceRequest, VisualMdRuleMatch, WorktreeDelegate,
 };
 use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use futures::{AsyncReadExt, FutureExt, StreamExt, io::BufReader};
@@ -922,13 +922,11 @@ async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
         kind: Some(extension::ExtensionLibraryKind::Rust),
         version: Some(semver::Version::new(0, 1, 0)),
     };
-    assert_eq!(
-        manifest
-            .visual_md
-            .as_ref()
-            .map(|visual_md| visual_md.fence_renderers.len()),
-        Some(3)
-    );
+    let visual_md = manifest.visual_md.as_ref().expect("the sample has hooks");
+    assert_eq!(visual_md.fence_renderers.len(), 3);
+    assert_eq!(visual_md.syntax_rules.len(), 2);
+    assert_eq!(visual_md.callouts.len(), 1);
+    assert_eq!(visual_md.validate(), Vec::<String>::new());
     let manifest = Arc::new(manifest);
 
     let work_dir = TempTree::new(json!({}));
@@ -1023,6 +1021,34 @@ async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
     assert_eq!(uppercased.edits[0].range, 4..9);
     assert_eq!(uppercased.edits[0].new_text, "HELLO");
     assert_eq!(uppercased.message.as_deref(), Some("Uppercased 1 place"));
+
+    let outputs = extension
+        .visual_md_apply_rule(
+            "emoji".to_string(),
+            vec![
+                VisualMdRuleMatch {
+                    text: ":smile:".to_string(),
+                    captures: vec![Some(0..7), Some(0..1), Some(1..6), Some(6..7)],
+                },
+                VisualMdRuleMatch {
+                    text: ":nonsense:".to_string(),
+                    captures: vec![Some(0..10), Some(0..1), Some(1..9), Some(9..10)],
+                },
+            ],
+        )
+        .await
+        .expect("the rule is applied");
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].hidden, vec![0..1, 6..7]);
+    assert_eq!(outputs[0].replacements.len(), 1);
+    assert_eq!(outputs[0].replacements[0].range, 1..6);
+    assert_eq!(outputs[0].replacements[0].text, "🙂");
+    assert!(outputs[1].hidden.is_empty() && outputs[1].replacements.is_empty());
+
+    extension
+        .visual_md_apply_rule("no-such-rule".to_string(), Vec::new())
+        .await
+        .expect_err("an unknown rule is an error");
 
     extension
         .visual_md_run_command(

@@ -208,6 +208,21 @@ pub struct VisualMdCommandManifestEntry {
 }
 
 impl VisualMdManifestEntry {
+    /// The paths, relative to the extension's directory, of the `.svg` files
+    /// its callouts use as icons. They have to ship with the extension.
+    pub fn callout_icon_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .callouts
+            .values()
+            .filter_map(|callout| callout.icon.as_deref())
+            .filter(|icon| icon.ends_with(".svg"))
+            .map(PathBuf::from)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// Checks the entry, returning one message for each problem found. The
     /// extension's hooks should not be registered when there are any.
     pub fn validate(&self) -> Vec<String> {
@@ -1257,5 +1272,48 @@ icon = "icons/drawn.svg"
         for color in ["fff", "#ff", "#fffff", "#fffffffff", "#ggg", "red", "", "#"] {
             assert!(!is_hex_color(color), "{color}");
         }
+    }
+
+    #[test]
+    fn test_callout_icon_paths_lists_each_svg_once() {
+        let entry = VisualMdManifestEntry {
+            callouts: BTreeMap::from([
+                (
+                    Arc::from("a"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("icons/b.svg".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Arc::from("b"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("icons/b.svg".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Arc::from("c"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("icons/a.svg".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Arc::from("d"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("star".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (Arc::from("e"), VisualMdCalloutManifestEntry::default()),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            entry.callout_icon_paths(),
+            vec![PathBuf::from("icons/a.svg"), PathBuf::from("icons/b.svg")]
+        );
     }
 }
