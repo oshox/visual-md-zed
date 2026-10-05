@@ -239,6 +239,7 @@ pub mod extensions;
 mod fence_render;
 mod format_toggle;
 mod list_continuation;
+pub mod outline;
 mod plan;
 pub mod rules;
 mod style;
