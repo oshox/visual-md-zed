@@ -239,6 +239,7 @@ mod fence_render;
 mod format_toggle;
 mod list_continuation;
 mod plan;
+pub mod rules;
 mod style;
 
 use std::any::Any;
@@ -347,6 +348,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         ))),
         saved_text_style_refinement: None,
         callout_key_count: 0,
+        extension_key_count: 0,
     });
     refresh(editor, window, cx);
 
@@ -681,6 +683,9 @@ struct VisualMdAddon {
     /// How many `KEY_CALLOUT_FIRST` keys the last refresh used, so the ones a
     /// later refresh no longer needs can be cleared.
     callout_key_count: usize,
+    /// How many `HighlightKey::VisualMdExtension` keys the last refresh used,
+    /// for the same reason.
+    extension_key_count: usize,
 }
 
 struct ParsedDocument {
@@ -1160,6 +1165,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     folds.extend(table_alignment_spacer_folds(
         &computed, &text, &style, window, cx,
     ));
+    folds.extend(computed.extension_replacements.iter().map(|(range, text)| {
+        (
+            range.clone(),
+            format!("ext:{text}"),
+            ordinal_placeholder(text.clone()),
+        )
+    }));
 
     apply_folds(editor, &snapshot, folds, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
@@ -1175,6 +1187,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .collect();
     ensure_code_languages_loaded(editor, window, cx, code_languages);
     apply_code_syntax_highlights(editor, &snapshot, &text, &computed, cx);
+    apply_extension_highlights(editor, &snapshot, &computed, cx);
 
     if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
         addon.last_applied = Some((edit_count, computed));
@@ -1183,11 +1196,61 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
 /// What extensions currently claim, as far as the planner needs to know.
 fn plan_extensions(cx: &App) -> plan::PlanExtensions {
+    let Some(registry) = cx.try_global::<extensions::VisualMdExtensions>() else {
+        return plan::PlanExtensions::default();
+    };
     plan::PlanExtensions {
-        rendered_fence_languages: cx
-            .try_global::<extensions::VisualMdExtensions>()
-            .map(|registry| registry.fence_languages().into_iter().collect())
-            .unwrap_or_default(),
+        rendered_fence_languages: registry.fence_languages().into_iter().collect(),
+        rules: rules::RuleSet {
+            rules: registry.syntax_rules().into(),
+            results: Arc::default(),
+        },
+    }
+}
+
+/// Gives the text that extensions' syntax rules style its style. Each distinct
+/// style gets a highlight key of its own, so the editor merges them in a fixed
+/// order and a style that is no longer wanted can be cleared by its key.
+fn apply_extension_highlights(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    computed: &Plan,
+    cx: &mut Context<Editor>,
+) {
+    let syntax_theme = {
+        use theme::ActiveTheme;
+        cx.theme().syntax().clone()
+    };
+    let mut groups: Vec<(&extension::VisualMdSpanStyle, Vec<Range<Anchor>>)> = Vec::new();
+    for (range, style) in &computed.extension_styled {
+        let anchors = to_anchor_range(snapshot, range);
+        match groups.iter_mut().find(|(known, _)| *known == style) {
+            Some((_, ranges)) => ranges.push(anchors),
+            None => groups.push((style, vec![anchors])),
+        }
+    }
+
+    let previous_count = editor
+        .addon_mut::<VisualMdAddon>()
+        .map(|addon| std::mem::replace(&mut addon.extension_key_count, groups.len()))
+        .unwrap_or_default();
+    for index in groups.len()..previous_count {
+        editor.highlight_text_key(
+            HighlightKey::VisualMdExtension(index),
+            Vec::new(),
+            HighlightStyle::default(),
+            false,
+            cx,
+        );
+    }
+    for (index, (style, ranges)) in groups.into_iter().enumerate() {
+        editor.highlight_text_key(
+            HighlightKey::VisualMdExtension(index),
+            ranges,
+            fence_render::highlight_style(style, &syntax_theme),
+            false,
+            cx,
+        );
     }
 }
 

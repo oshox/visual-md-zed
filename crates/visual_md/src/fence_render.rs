@@ -661,7 +661,7 @@ fn render_fence_block(
         .into_any_element()
 }
 
-fn highlight_style(style: &VisualMdSpanStyle, syntax: &SyntaxTheme) -> HighlightStyle {
+pub(crate) fn highlight_style(style: &VisualMdSpanStyle, syntax: &SyntaxTheme) -> HighlightStyle {
     let parse_color = |color: &str| theme::try_parse_color(color).log_err();
     let mut highlight = style
         .theme_token

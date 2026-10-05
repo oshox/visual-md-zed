@@ -20,6 +20,8 @@ use futures::FutureExt as _;
 use futures::future::{BoxFuture, Either, select};
 use gpui::{App, AppContext as _, BorrowAppContext as _, Global, Task};
 
+use crate::rules::CompiledRule;
+
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -128,6 +130,7 @@ impl Drop for InFlightCall {
 struct RegisteredExtension {
     name: String,
     entry: VisualMdManifestEntry,
+    rules: Vec<Arc<CompiledRule>>,
     hooks: Option<Arc<dyn VisualMdHooks>>,
     health: Arc<Health>,
     generation: u64,
@@ -240,15 +243,33 @@ impl VisualMdExtensions {
                     );
                 }
             }
+            let generation = registry.registrations;
+            let rules = entry
+                .syntax_rules
+                .iter()
+                .filter_map(|rule| {
+                    match CompiledRule::compile(extension_id.clone(), generation, rule) {
+                        Ok(rule) => Some(Arc::new(rule)),
+                        Err(error) => {
+                            log::error!(
+                                "not using syntax rule {} of extension {extension_id}: {error}",
+                                rule.id
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
             let health = Arc::new(Health::new(extension_id.clone()));
             registry.extensions.insert(
                 extension_id,
                 RegisteredExtension {
                     name,
                     entry,
+                    rules,
                     hooks,
                     health,
-                    generation: registry.registrations,
+                    generation,
                 },
             );
         });
@@ -291,6 +312,15 @@ impl VisualMdExtensions {
                     renderer: renderer.clone(),
                 })
             })
+    }
+
+    /// The syntax rules of every extension, by extension id and then in the
+    /// order they were declared. A rule that could not be compiled is left out.
+    pub fn syntax_rules(&self) -> Vec<Arc<CompiledRule>> {
+        self.extensions
+            .values()
+            .flat_map(|extension| extension.rules.iter().cloned())
+            .collect()
     }
 
     pub fn commands(&self) -> Vec<ExtensionCommand> {
