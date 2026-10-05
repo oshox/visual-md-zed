@@ -1,0 +1,128 @@
+interface visual-md {
+    use common.{range};
+
+    /// How a run of text is styled.
+    ///
+    /// Colors are hex strings (`#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`). A
+    /// color that does not parse is ignored.
+    record span-style {
+        /// The text color.
+        color: option<string>,
+        /// The background color.
+        background-color: option<string>,
+        /// The name of a theme syntax token, such as `keyword` or
+        /// `visual_md.link`, to take colors from. Explicit colors win.
+        theme-token: option<string>,
+        /// The font weight, from 100 to 900.
+        font-weight: option<u16>,
+        /// Whether the text is italic.
+        italic: option<bool>,
+        /// Whether the text is underlined.
+        underline: option<bool>,
+        /// Whether the text is struck through.
+        strikethrough: option<bool>,
+    }
+
+    /// A style applied to a range of text.
+    record styled-span {
+        /// The range the style covers, in UTF-8 bytes of the text it belongs to.
+        range: range,
+        /// The style to apply.
+        style: span-style,
+    }
+
+    /// Text with styles applied to ranges of it.
+    record styled-text {
+        /// The text.
+        text: string,
+        /// The styles, in UTF-8 byte offsets into `text`.
+        spans: list<styled-span>,
+    }
+
+    /// The format of an image.
+    enum image-format {
+        png,
+        jpeg,
+        gif,
+        webp,
+    }
+
+    /// An encoded image.
+    record image {
+        /// The format `bytes` is encoded in.
+        format: image-format,
+        /// The encoded image.
+        bytes: list<u8>,
+    }
+
+    /// What a fenced code block renderer produces, shown in place of the block.
+    variant fence-output {
+        /// Styled text, shown in the code font.
+        styled-text(styled-text),
+        /// Markdown, rendered with the editor's Markdown renderer.
+        markdown(string),
+        /// An SVG document.
+        svg(string),
+        /// An encoded raster image.
+        image(image),
+    }
+
+    /// Whether the active theme is light or dark.
+    enum appearance {
+        light,
+        dark,
+    }
+
+    /// A fenced code block to render.
+    record fence-request {
+        /// The language tag of the block, lowercased.
+        language: string,
+        /// The whole info string after the opening fence.
+        info: string,
+        /// The text between the fences.
+        content: string,
+        /// The appearance of the active theme.
+        appearance: appearance,
+        /// The path of the document, if it has one.
+        path: option<string>,
+    }
+
+    /// The result of rendering a fenced code block.
+    record fence-result {
+        /// What to show in place of the block.
+        output: fence-output,
+        /// How many editor rows the output is expected to need. It only sizes
+        /// the block until it has been laid out.
+        height-hint: option<u32>,
+    }
+
+    /// The document an editor command runs on.
+    record command-context {
+        /// The whole text of the document.
+        text: string,
+        /// The selections, in UTF-8 byte offsets into `text`.
+        selections: list<range>,
+        /// The path of the document, if it has one.
+        path: option<string>,
+    }
+
+    /// A replacement of a range of text.
+    record text-edit {
+        /// The range to replace, in the coordinates of the text the command ran
+        /// on. Edits must not overlap.
+        range: range,
+        /// The text to put in its place.
+        new-text: string,
+    }
+
+    /// What an editor command changes.
+    record command-result {
+        /// The edits to apply, all in the coordinates of the original text.
+        edits: list<text-edit>,
+        /// The selections to leave afterwards, in the coordinates of the text
+        /// after the edits. Without them the editor keeps its own.
+        selections: option<list<range>>,
+        /// A message for the user.
+        message: option<string>,
+    }
+}

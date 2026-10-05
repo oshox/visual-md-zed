@@ -787,7 +787,7 @@ impl VimGlobals {
                 CommandPaletteFilter::update_global(cx, |filter, _| {
                     filter.show_namespace(Vim::NAMESPACE);
                 });
-                GlobalCommandPaletteInterceptor::set(cx, command_interceptor);
+                GlobalCommandPaletteInterceptor::register(cx, "vim", command_interceptor);
                 for window in cx.windows() {
                     if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
                         multi_workspace
@@ -806,7 +806,7 @@ impl VimGlobals {
             } else {
                 KeyBinding::set_vim_mode(cx, false);
                 *Vim::globals(cx) = VimGlobals::default();
-                GlobalCommandPaletteInterceptor::clear(cx);
+                GlobalCommandPaletteInterceptor::unregister(cx, "vim");
                 CommandPaletteFilter::update_global(cx, |filter, _| {
                     filter.hide_namespace(Vim::NAMESPACE);
                 });

@@ -54,6 +54,15 @@ pub mod lsp {
     };
 }
 
+/// Types for hooking into Markdown live preview, enabled by the `[visual_md]`
+/// section of `extension.toml`.
+pub mod visual_md {
+    pub use crate::wit::zed::extension::visual_md::{
+        Appearance, CommandContext, CommandResult, FenceOutput, FenceRequest, FenceResult, Image,
+        ImageFormat, SpanStyle, StyledSpan, StyledText, TextEdit,
+    };
+}
+
 /// A result returned from a Zed extension.
 pub type Result<T, E = String> = core::result::Result<T, E>;
 
@@ -177,6 +186,27 @@ pub trait Extension: Send + Sync {
         _worktree: Option<&Worktree>,
     ) -> Result<SlashCommandOutput, String> {
         Err("`run_slash_command` not implemented".to_string())
+    }
+
+    /// Renders a fenced code block with the renderer the extension declared for
+    /// the block's language in `fence_renderers`, to be shown in place of the
+    /// block while the cursor is away from it.
+    fn visual_md_render_fence(
+        &self,
+        _renderer: String,
+        _request: visual_md::FenceRequest,
+    ) -> Result<visual_md::FenceResult, String> {
+        Err("`visual_md_render_fence` not implemented".to_string())
+    }
+
+    /// Runs an editor command declared under `[visual_md.commands]` and returns
+    /// the edits to make to the document.
+    fn visual_md_run_command(
+        &self,
+        _command: String,
+        _context: visual_md::CommandContext,
+    ) -> Result<visual_md::CommandResult, String> {
+        Err("`visual_md_run_command` not implemented".to_string())
     }
 
     /// Returns the command used to start a context server.
@@ -355,7 +385,7 @@ pub static ZED_API_VERSION: [u8; 6] = *include_bytes!(concat!(env!("OUT_DIR"), "
 mod wit {
     wit_bindgen::generate!({
         skip: ["init-extension"],
-        path: "./wit/since_v0.8.0",
+        path: "./wit/since_v0.9.0",
     });
 }
 
@@ -489,6 +519,20 @@ impl wit::Guest for Component {
         worktree: Option<&Worktree>,
     ) -> Result<SlashCommandOutput, String> {
         extension().run_slash_command(command, args, worktree)
+    }
+
+    fn visual_md_render_fence(
+        renderer: String,
+        request: visual_md::FenceRequest,
+    ) -> Result<visual_md::FenceResult, String> {
+        extension().visual_md_render_fence(renderer, request)
+    }
+
+    fn visual_md_run_command(
+        command: String,
+        context: visual_md::CommandContext,
+    ) -> Result<visual_md::CommandResult, String> {
+        extension().visual_md_run_command(command, context)
     }
 
     fn context_server_command(

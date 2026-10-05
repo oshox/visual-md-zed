@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+
+# Builds and runs WebAssembly extensions for Zed MD without touching the host
+# Rust toolchain.
+#
+# Extensions are built for wasm32-wasip2, a target that distro Rust packages
+# often lack. `setup` installs an isolated toolchain of the version in
+# rust-toolchain.toml with that target, under $ZED_MD_WASM_HOME (default
+# ~/.local/share/zed-md-wasm). Nothing else is changed: no shims on PATH, no
+# shell profile edits, no default toolchain. Commands that need the target get
+# that toolchain's `bin` first on PATH for that one command, which is how
+# extensions are compiled (the extension builder runs `cargo` and `rustc` from
+# PATH). `rustup run` is deliberately not used: with some distributions' rustup
+# it leaves the system `rustc` first on PATH.
+#
+# Usage:
+#   script/visual-md-wasm setup           Install the isolated toolchain.
+#   script/visual-md-wasm build-sample    Build extensions/visual-md-sample.
+#   script/visual-md-wasm run -- CMD...   Run CMD with the wasm toolchain on PATH,
+#                                         for example the built Zed, so that
+#                                         "Install Dev Extension" can compile.
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+home_dir="${ZED_MD_WASM_HOME:-$HOME/.local/share/zed-md-wasm}"
+rust_version="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$repo_root/rust-toolchain.toml")"
+
+if [[ -z "$rust_version" ]]; then
+    echo "Could not read the Rust version from rust-toolchain.toml" >&2
+    exit 1
+fi
+
+host_triple() {
+    rustc -vV | sed -n 's/^host: //p'
+}
+
+toolchain_dir() {
+    echo "$home_dir/rustup/toolchains/$rust_version-$(host_triple)"
+}
+
+require_toolchain() {
+    if [[ ! -x "$(toolchain_dir)/bin/cargo" ]]; then
+        echo "No wasm toolchain at $(toolchain_dir). Run: script/visual-md-wasm setup" >&2
+        exit 1
+    fi
+}
+
+setup() {
+    local rustup_bin="${RUSTUP:-}"
+    if [[ -z "$rustup_bin" ]]; then
+        rustup_bin="$(command -v rustup || true)"
+    fi
+    if [[ -z "$rustup_bin" && -x /home/linuxbrew/.linuxbrew/opt/rustup/bin/rustup ]]; then
+        rustup_bin=/home/linuxbrew/.linuxbrew/opt/rustup/bin/rustup
+    fi
+    if [[ -z "$rustup_bin" ]]; then
+        echo "rustup was not found. Install it (for example with 'brew install rustup'), or set RUSTUP to its path." >&2
+        exit 1
+    fi
+
+    # rustup reads rust-toolchain.toml from the working directory upwards and
+    # would install the repository's toolchain into ~/.rustup, so it runs from
+    # a directory with none above it.
+    cd /
+    RUSTUP_HOME="$home_dir/rustup" CARGO_HOME="$home_dir/cargo" \
+        "$rustup_bin" toolchain install "$rust_version" \
+        --profile minimal --target wasm32-wasip2 --no-self-update
+    echo "Installed $(toolchain_dir)"
+}
+
+build_sample() {
+    require_toolchain
+    cd "$repo_root"
+    # The packager is an ordinary host program, so it builds with the host toolchain.
+    cargo build -p extension_cli --bin zed-extension
+
+    local build_dir="$repo_root/target/visual-md-sample"
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir/output"
+    # The packager does not exit once it has finished (and does not exit when
+    # its own checks reject the manifest either), so it is run in the background
+    # and stopped when its last output, manifest.json, has been written.
+    PATH="$(toolchain_dir)/bin:$PATH" "$repo_root/target/debug/zed-extension" \
+        --source-dir "$repo_root/extensions/visual-md-sample" \
+        --output-dir "$build_dir/output" \
+        --scratch-dir "$build_dir/scratch" &
+    local packager_pid=$!
+    local seconds_waited=0
+    while [[ ! -f "$build_dir/output/manifest.json" ]]; do
+        if ! kill -0 "$packager_pid" 2>/dev/null; then
+            wait "$packager_pid" || true
+            break
+        fi
+        if ((seconds_waited >= 600)); then
+            kill "$packager_pid" 2>/dev/null || true
+            echo "The packager took more than 10 minutes without finishing." >&2
+            exit 1
+        fi
+        sleep 1
+        seconds_waited=$((seconds_waited + 1))
+    done
+    kill "$packager_pid" 2>/dev/null || true
+    if [[ ! -f "$build_dir/output/manifest.json" ]]; then
+        echo "The packager stopped without producing $build_dir/output/manifest.json." >&2
+        exit 1
+    fi
+    echo "Built extensions/visual-md-sample/extension.wasm"
+}
+
+run() {
+    require_toolchain
+    if [[ "${1:-}" == "--" ]]; then
+        shift
+    fi
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: script/visual-md-wasm run -- COMMAND..." >&2
+        exit 1
+    fi
+    PATH="$(toolchain_dir)/bin:$PATH" exec "$@"
+}
+
+case "${1:-}" in
+    setup) setup ;;
+    build-sample) build_sample ;;
+    run) shift; run "$@" ;;
+    *)
+        sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+        exit 1
+        ;;
+esac

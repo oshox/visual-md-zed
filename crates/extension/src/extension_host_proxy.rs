@@ -8,7 +8,7 @@ use language::{BinaryStatus, LanguageLoader, LanguageMatcher, LanguageName};
 use lsp::LanguageServerName;
 use parking_lot::RwLock;
 
-use crate::Extension;
+use crate::{Extension, ExtensionManifest};
 
 #[derive(Default)]
 struct GlobalExtensionHostProxy(Arc<ExtensionHostProxy>);
@@ -32,6 +32,7 @@ pub struct ExtensionHostProxy {
     context_server_proxy: RwLock<Option<Arc<dyn ExtensionContextServerProxy>>>,
     debug_adapter_provider_proxy: RwLock<Option<Arc<dyn ExtensionDebugAdapterProviderProxy>>>,
     language_model_provider_proxy: RwLock<Option<Arc<dyn ExtensionLanguageModelProviderProxy>>>,
+    visual_md_proxy: RwLock<Option<Arc<dyn ExtensionVisualMdProxy>>>,
 }
 
 impl ExtensionHostProxy {
@@ -57,6 +58,7 @@ impl ExtensionHostProxy {
             context_server_proxy: RwLock::default(),
             debug_adapter_provider_proxy: RwLock::default(),
             language_model_provider_proxy: RwLock::default(),
+            visual_md_proxy: RwLock::default(),
         }
     }
 
@@ -88,6 +90,10 @@ impl ExtensionHostProxy {
         self.debug_adapter_provider_proxy
             .write()
             .replace(Arc::new(proxy));
+    }
+
+    pub fn register_visual_md_proxy(&self, proxy: impl ExtensionVisualMdProxy) {
+        self.visual_md_proxy.write().replace(Arc::new(proxy));
     }
 
     pub fn register_language_model_provider_proxy(
@@ -396,6 +402,45 @@ impl ExtensionContextServerProxy for ExtensionHostProxy {
     }
 }
 
+/// Hands the hooks an extension declares in its `[visual_md]` manifest section
+/// to Zed MD's Markdown live preview.
+pub trait ExtensionVisualMdProxy: Send + Sync + 'static {
+    /// Registers an extension's hooks, replacing any it registered before.
+    /// `extension` is `None` when the extension has no WebAssembly component, in
+    /// which case only the hooks that need none apply.
+    fn register_visual_md_extension(
+        &self,
+        manifest: Arc<ExtensionManifest>,
+        extension: Option<Arc<dyn Extension>>,
+        cx: &mut App,
+    );
+
+    fn unregister_visual_md_extension(&self, extension_id: Arc<str>, cx: &mut App);
+}
+
+impl ExtensionVisualMdProxy for ExtensionHostProxy {
+    fn register_visual_md_extension(
+        &self,
+        manifest: Arc<ExtensionManifest>,
+        extension: Option<Arc<dyn Extension>>,
+        cx: &mut App,
+    ) {
+        let Some(proxy) = self.visual_md_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.register_visual_md_extension(manifest, extension, cx)
+    }
+
+    fn unregister_visual_md_extension(&self, extension_id: Arc<str>, cx: &mut App) {
+        let Some(proxy) = self.visual_md_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.unregister_visual_md_extension(extension_id, cx)
+    }
+}
+
 pub trait ExtensionDebugAdapterProviderProxy: Send + Sync + 'static {
     fn register_debug_adapter(
         &self,
@@ -476,5 +521,99 @@ impl ExtensionLanguageModelProviderProxy for ExtensionHostProxy {
         };
 
         proxy.unregister_language_model_provider(provider_id, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use gpui::TestAppContext;
+
+    use crate::SchemaVersion;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingVisualMdProxy {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ExtensionVisualMdProxy for RecordingVisualMdProxy {
+        fn register_visual_md_extension(
+            &self,
+            manifest: Arc<ExtensionManifest>,
+            extension: Option<Arc<dyn Extension>>,
+            _cx: &mut App,
+        ) {
+            self.events.lock().unwrap().push(format!(
+                "register {} (wasm: {})",
+                manifest.id,
+                extension.is_some()
+            ));
+        }
+
+        fn unregister_visual_md_extension(&self, extension_id: Arc<str>, _cx: &mut App) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("unregister {extension_id}"));
+        }
+    }
+
+    fn manifest(id: &str) -> Arc<ExtensionManifest> {
+        Arc::new(ExtensionManifest {
+            id: id.into(),
+            name: id.to_string(),
+            version: "1.0.0".into(),
+            schema_version: SchemaVersion::ZERO,
+            description: None,
+            repository: None,
+            authors: Vec::new(),
+            lib: Default::default(),
+            themes: Vec::new(),
+            icon_themes: Vec::new(),
+            languages: Vec::new(),
+            grammars: Default::default(),
+            language_servers: Default::default(),
+            context_servers: Default::default(),
+            slash_commands: Default::default(),
+            snippets: None,
+            capabilities: Vec::new(),
+            debug_adapters: Default::default(),
+            debug_locators: Default::default(),
+            language_model_providers: Default::default(),
+            visual_md: Some(Default::default()),
+        })
+    }
+
+    #[gpui::test]
+    fn test_visual_md_registration_is_forwarded_to_the_registered_proxy(cx: &mut TestAppContext) {
+        let host_proxy = ExtensionHostProxy::new();
+        let recording = RecordingVisualMdProxy::default();
+        host_proxy.register_visual_md_proxy(recording.clone());
+
+        cx.update(|cx| {
+            host_proxy.register_visual_md_extension(manifest("notes"), None, cx);
+            host_proxy.unregister_visual_md_extension("notes".into(), cx);
+        });
+
+        assert_eq!(
+            *recording.events.lock().unwrap(),
+            vec![
+                "register notes (wasm: false)".to_string(),
+                "unregister notes".to_string()
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn test_visual_md_registration_without_a_proxy_does_nothing(cx: &mut TestAppContext) {
+        let host_proxy = ExtensionHostProxy::new();
+
+        cx.update(|cx| {
+            host_proxy.register_visual_md_extension(manifest("notes"), None, cx);
+            host_proxy.unregister_visual_md_extension("notes".into(), cx);
+        });
     }
 }

@@ -233,6 +233,9 @@
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+mod commands;
+pub mod extensions;
+mod fence_render;
 mod format_toggle;
 mod list_continuation;
 mod plan;
@@ -244,6 +247,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+pub use commands::RunExtensionCommand;
 use editor::actions::Newline;
 use editor::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId,
@@ -283,6 +287,9 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    extensions::init(cx);
+    fence_render::init(cx);
+    commands::init(cx);
     cx.observe_new(register_editor).detach();
 }
 
@@ -309,17 +316,21 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let toggle_bold_action = editor.register_action(cx.listener(intercept_toggle_bold));
     let toggle_italic_action = editor.register_action(cx.listener(intercept_toggle_italic));
     let toggle_live_preview_action = editor.register_action(cx.listener(toggle_live_preview));
+    let run_extension_command_action =
+        editor.register_action(cx.listener(commands::run_extension_command));
     editor.register_addon(VisualMdAddon {
         _state: state,
         _newline_action: newline_action,
         _toggle_bold_action: toggle_bold_action,
         _toggle_italic_action: toggle_italic_action,
         _toggle_live_preview_action: toggle_live_preview_action,
+        _run_extension_command_action: run_extension_command_action,
         enabled_override: None,
         active: false,
         folded_markers: Vec::new(),
         hr_blocks: Vec::new(),
         image_blocks: Vec::new(),
+        rendered_fence_blocks: Vec::new(),
         code_fence_borders: Vec::new(),
         code_languages: HashMap::new(),
         pending_language_tasks: HashMap::new(),
@@ -588,6 +599,8 @@ struct VisualMdAddon {
     _toggle_bold_action: Subscription,
     _toggle_italic_action: Subscription,
     _toggle_live_preview_action: Subscription,
+    /// Keeps the handler for extension commands (see `commands`) alive.
+    _run_extension_command_action: Subscription,
     /// What `ToggleLivePreview` last forced for this editor, taking priority
     /// over the settings. `None` once the toggle lands back on the setting's
     /// own value.
@@ -609,6 +622,9 @@ struct VisualMdAddon {
     /// source without moving the range's start, and the block must be rebuilt
     /// to show the new image.
     image_blocks: Vec<(Range<usize>, String, CustomBlockId)>,
+    /// Blocks standing in for fenced code blocks that an extension renders
+    /// (see `fence_render::apply_rendered_fences`).
+    rendered_fence_blocks: Vec<fence_render::RenderedFenceBlock>,
     /// Fenced-code-block fence-line border/chip blocks currently inserted
     /// (see `apply_code_fence_borders`). Diffed on `(range, language)`
     /// together, not range alone, the same reasoning `folded_markers`'
@@ -704,7 +720,7 @@ impl Addon for VisualMdAddon {
 
 struct VisualMdState {
     editor: WeakEntity<Editor>,
-    _subscriptions: [Subscription; 5],
+    _subscriptions: [Subscription; 6],
 }
 
 impl VisualMdState {
@@ -793,6 +809,21 @@ impl VisualMdState {
                         })
                         .log_err();
                 }),
+                // An extension registering or unregistering changes what its
+                // hooks render, which the plan does not capture.
+                cx.observe_global_in::<extensions::VisualMdExtensions>(
+                    window,
+                    |state, window, cx| {
+                        state
+                            .editor
+                            .update(cx, |editor, cx| {
+                                if is_decorating(editor) {
+                                    force_refresh(editor, window, cx)
+                                }
+                            })
+                            .log_err();
+                    },
+                ),
                 // Font settings live in `ThemeSettings`, so a change to them
                 // does not alter the buffer's own language settings.
                 cx.observe_global_in::<settings::SettingsStore>(window, |state, window, cx| {
@@ -1006,8 +1037,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 VIEWPORT_OVERSCAN_ROWS,
                 cx,
             );
-            let plan =
-                plan::plan_viewport_with_tree(text, block_tree, &selections, visible_range.clone());
+            let plan = plan::plan_viewport_with_extensions(
+                text,
+                block_tree,
+                &selections,
+                visible_range.clone(),
+                &plan_extensions(cx),
+            );
             if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
                 addon.planned = Some((snapshot.edit_count(), visible_range));
             }
@@ -1129,6 +1165,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_images(editor, &snapshot, &computed, cx);
+    fence_render::apply_rendered_fences(editor, &snapshot, &text, &computed, cx);
     apply_table_dividers(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_code_fence_borders(editor, &snapshot, &computed, style_handle, cx);
     let code_languages: HashSet<String> = computed
@@ -1141,6 +1178,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
     if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
         addon.last_applied = Some((edit_count, computed));
+    }
+}
+
+/// What extensions currently claim, as far as the planner needs to know.
+fn plan_extensions(cx: &App) -> plan::PlanExtensions {
+    plan::PlanExtensions {
+        rendered_fence_languages: cx
+            .try_global::<extensions::VisualMdExtensions>()
+            .map(|registry| registry.fence_languages().into_iter().collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -2719,7 +2766,7 @@ mod integration_tests {
     use editor::test::editor_test_context::EditorTestContext;
     use gpui::{FontStyle, StrikethroughStyle, TestAppContext, rgb};
 
-    fn init_test(cx: &mut TestAppContext) {
+    pub(crate) fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
             let store = settings::SettingsStore::test(cx);
@@ -2740,7 +2787,7 @@ mod integration_tests {
         });
     }
 
-    fn markdown_language() -> std::sync::Arc<language::Language> {
+    pub(crate) fn markdown_language() -> std::sync::Arc<language::Language> {
         std::sync::Arc::new(language::Language::new(
             language::LanguageConfig {
                 name: "Markdown".into(),

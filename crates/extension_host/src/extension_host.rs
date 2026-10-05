@@ -18,6 +18,7 @@ use extension::{
     ExtensionContextServerProxy, ExtensionDebugAdapterProviderProxy, ExtensionEvents,
     ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy,
     ExtensionLanguageServerProxy, ExtensionSnippetProxy, ExtensionThemeProxy,
+    ExtensionVisualMdProxy,
 };
 use fs::{Fs, RemoveOptions, RenameOptions};
 use futures::future::{Shared, join_all};
@@ -65,7 +66,7 @@ use util::{
 };
 use wasm_host::{
     WasmExtension, WasmHost,
-    wit::{is_supported_wasm_api_version, wasm_api_version_range},
+    wit::{is_supported_wasm_api_version, supports_visual_md, wasm_api_version_range},
 };
 
 pub use extension::{
@@ -1393,6 +1394,10 @@ impl ExtensionStore {
             for locator in extension.manifest.debug_locators.keys() {
                 self.proxy.unregister_debug_locator(locator.clone());
             }
+            if extension.manifest.visual_md.is_some() {
+                self.proxy
+                    .unregister_visual_md_extension(extension_id.clone(), cx);
+            }
         }
 
         self.wasm_extensions
@@ -1537,6 +1542,11 @@ impl ExtensionStore {
         let extension_entries = extensions_to_load
             .iter()
             .filter_map(|name| new_index.extensions.get(name).cloned())
+            .collect::<Vec<_>>();
+        let visual_md_manifests = extension_entries
+            .iter()
+            .filter(|extension| extension.manifest.visual_md.is_some())
+            .map(|extension| extension.manifest.clone())
             .collect::<Vec<_>>();
         self.extension_index = new_index;
         cx.notify();
@@ -1691,6 +1701,28 @@ impl ExtensionStore {
                         this.proxy
                             .register_debug_locator(extension.clone(), debug_adapter.clone());
                     }
+                }
+
+                for manifest in visual_md_manifests {
+                    let extension = wasm_extensions
+                        .iter()
+                        .find(|(wasm_manifest, _)| wasm_manifest.id == manifest.id)
+                        .and_then(|(_, wasm_extension)| {
+                            if supports_visual_md(&wasm_extension.zed_api_version) {
+                                Some(Arc::new(wasm_extension.clone())
+                                    as Arc<dyn extension::Extension>)
+                            } else {
+                                log::warn!(
+                                    "extension {} was built for extension API {}, which has no \
+                                    visual_md hooks; only its manifest entries apply",
+                                    manifest.id,
+                                    wasm_extension.zed_api_version
+                                );
+                                None
+                            }
+                        });
+                    this.proxy
+                        .register_visual_md_extension(manifest, extension, cx);
                 }
 
                 this.wasm_extensions.extend(wasm_extensions);
