@@ -19,11 +19,16 @@ use extension::{
     ExtensionHostProxy, ExtensionVisualMdProxy, KeyValueStoreDelegate, LibManifestEntry,
     ProjectDelegate, SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput,
     StartDebuggingRequestArgumentsRequest, Symbol, VisualMdAppearance, VisualMdCommandContext,
-    VisualMdFenceOutput, VisualMdFenceRequest, VisualMdRuleMatch, WorktreeDelegate,
+    VisualMdCompletionRequest, VisualMdDocumentEvent, VisualMdDocumentEventKind,
+    VisualMdFenceOutput, VisualMdFenceRequest, VisualMdLinkRequest, VisualMdLinkTarget,
+    VisualMdOutline, VisualMdOutlineHeading, VisualMdRuleMatch, WorktreeDelegate,
 };
 use fs::{FakeFs, Fs, RealFs, RemoveOptions};
 use futures::{AsyncReadExt, FutureExt, StreamExt, io::BufReader};
-use gpui::{AppContext as _, BackgroundExecutor, Entity, EntityId, TaskExt, TestAppContext};
+use gpui::{
+    AppContext as _, BackgroundExecutor, Entity, EntityId, TaskExt, TestAppContext,
+    UpdateGlobal as _,
+};
 use http_client::{FakeHttpClient, Response};
 use language::{
     BinaryStatus, LanguageConfig, LanguageMatcher, LanguageName, LanguageRegistry, QueryFiles,
@@ -926,6 +931,28 @@ async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
     assert_eq!(visual_md.fence_renderers.len(), 3);
     assert_eq!(visual_md.syntax_rules.len(), 2);
     assert_eq!(visual_md.callouts.len(), 1);
+    assert!(
+        visual_md
+            .events
+            .as_ref()
+            .is_some_and(|events| events.opened && events.saved && events.changed)
+    );
+    assert_eq!(
+        visual_md.links.as_ref().map(|links| links.schemes.clone()),
+        Some(vec!["sample".to_string()])
+    );
+    assert!(
+        visual_md
+            .links
+            .as_ref()
+            .is_some_and(|links| links.wikilink_completions)
+    );
+    assert!(
+        visual_md
+            .commands
+            .get("uppercase")
+            .is_some_and(|command| command.slash)
+    );
     assert_eq!(visual_md.validate(), Vec::<String>::new());
     let manifest = Arc::new(manifest);
 
@@ -1049,6 +1076,102 @@ async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
         .visual_md_apply_rule("no-such-rule".to_string(), Vec::new())
         .await
         .expect_err("an unknown rule is an error");
+
+    let event_log = work_dir.path().join("visual-md-sample").join("events.log");
+    for (kind, path) in [
+        (VisualMdDocumentEventKind::Opened, None),
+        (
+            VisualMdDocumentEventKind::Saved,
+            Some("/notes/a.md".to_string()),
+        ),
+    ] {
+        extension
+            .visual_md_document_event(VisualMdDocumentEvent {
+                kind,
+                path,
+                outline: VisualMdOutline {
+                    headings: vec![VisualMdOutlineHeading {
+                        level: 1,
+                        text: "Title".to_string(),
+                        range: 0..7,
+                    }],
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("the event is handled");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&event_log).expect("the extension logged the events"),
+        "opened (unsaved): 1 headings, 0 links, 0 tags, 0 tasks\n\
+         saved /notes/a.md: 1 headings, 0 links, 0 tags, 0 tasks\n",
+        "the extension wrote to its own work directory"
+    );
+
+    let resolve = |scheme: Option<&str>, target: &str| {
+        extension.visual_md_resolve_link(VisualMdLinkRequest {
+            scheme: scheme.map(str::to_string),
+            target: target.to_string(),
+            wikilink: false,
+            path: None,
+        })
+    };
+    assert_eq!(
+        resolve(Some("sample"), "sample://docs")
+            .await
+            .expect("the link is resolved"),
+        Some(VisualMdLinkTarget::Url(
+            "https://example.com/sample/docs".to_string()
+        ))
+    );
+    assert_eq!(
+        resolve(Some("https"), "https://zed.dev")
+            .await
+            .expect("a link it does not know is not an error"),
+        None
+    );
+
+    let complete = |query: &str| {
+        extension.visual_md_complete(VisualMdCompletionRequest {
+            query: query.to_string(),
+            path: None,
+            files: vec!["inbox.md".to_string(), "sub/plan.md".to_string()],
+        })
+    };
+    let labels = |items: Vec<extension::VisualMdCompletionItem>| {
+        items.into_iter().map(|item| item.label).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        labels(complete("").await.expect("names are completed")),
+        vec!["inbox", "plan"],
+        "without settings, the files are all there is"
+    );
+
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.project.all_languages.defaults.visual_md =
+                    Some(settings::VisualMdSettingsContent {
+                        extensions: serde_json::from_value(json!({
+                            "visual-md-sample": { "notes": ["Ideas", "Journal"] },
+                            "someone-else": { "notes": ["Secret"] },
+                        }))
+                        .ok(),
+                        ..Default::default()
+                    });
+            });
+        });
+    });
+    assert_eq!(
+        labels(complete("").await.expect("names are completed")),
+        vec!["Ideas", "Journal", "inbox", "plan"],
+        "the extension reads its own entry of the settings through the host, and \
+         never the other extension's"
+    );
+    assert_eq!(
+        labels(complete("pl").await.expect("names are completed")),
+        vec!["plan"]
+    );
 
     extension
         .visual_md_run_command(
