@@ -19,8 +19,8 @@ purpose even though the app is branded Zed MD.
 | M9 | GFM tables | Done |
 | M10 | Bold and italic shortcuts | Done |
 | M11 | Callout boxes | Done |
-| M12 | Inline images | Draft PR #2 |
-| M13 | Turn the editor off globally or per project, in settings.json and the settings UI | Planned |
+| M12 | Inline images | Done |
+| M13 | Turn the editor off globally or per project, in settings.json and the settings UI | Done |
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Planned |
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Planned |
 
@@ -39,13 +39,19 @@ settings UI has no entry for it.
    crate checks `enabled` (decoration refresh, the Enter handler, the
    bold/italic shortcuts, the `visual_md` key context).
 2. Per-language override as a bonus of the same change: `enabled` can also be
-   set per language (for example off for `MDX` but on for `Markdown`).
+   set under `languages`, for example
+   `"languages": { "Markdown": { "visual_md": { "enabled": false } } }`.
+   The live preview only runs on buffers whose language is named `Markdown`,
+   so other language entries have no effect until the crate learns to treat
+   another language (such as an MDX extension's) as Markdown.
 3. A "Markdown Live Preview" section in the settings UI with an "Enabled"
    toggle. The settings UI already switches between User and project scopes,
    so the same toggle covers both levels.
 4. A command palette action, `visual_md: toggle live preview`, that flips the
-   setting for the current buffer only, without writing any file. Useful for
-   a quick look at the raw source.
+   setting for the current editor only, without writing any file. Useful for
+   a quick look at the raw source. The override belongs to that editor, so a
+   second split of the same file is unaffected, and it is dropped once the
+   settings change to agree with it.
 5. Flipping any of these while a file is open re-renders it immediately with
    no leftover folds or highlights (the current off path already clears them;
    this adds tests for the project and per-buffer paths).

@@ -1838,6 +1838,40 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
+    fn markdown_live_preview_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Markdown Live Preview"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Enabled",
+                description: "Render Markdown files with live preview instead of plain source text.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("visual_md.enabled"),
+                    pick: |settings_content| {
+                        settings_content
+                            .project
+                            .all_languages
+                            .defaults
+                            .visual_md
+                            .as_ref()
+                            .and_then(|settings| settings.enabled.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .project
+                            .all_languages
+                            .defaults
+                            .visual_md
+                            .get_or_insert_default()
+                            .enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER | PROJECT,
+            }),
+        ]
+    }
+
     fn multibuffer_section() -> [SettingsPageItem; 7] {
         [
             SettingsPageItem::SectionHeader("Multibuffer"),
@@ -3308,6 +3342,7 @@ fn editor_page() -> SettingsPage {
     let items = concat_sections!(
         auto_save_section(),
         which_key_section(),
+        markdown_live_preview_section(),
         multibuffer_section(),
         scrolling_section(),
         signature_help_section(),

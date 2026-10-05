@@ -183,6 +183,9 @@ pub struct LanguageSettings {
     pub word_diff_enabled: bool,
     /// Whether to use tree-sitter bracket queries to detect and colorize the brackets in the editor.
     pub colorize_brackets: bool,
+    /// Whether Markdown buffers are rendered with live preview instead of plain
+    /// source text.
+    pub visual_md_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -914,6 +917,10 @@ impl settings::Settings for AllLanguageSettings {
                 show_completions_on_input: settings.show_completions_on_input.unwrap(),
                 show_completion_documentation: settings.show_completion_documentation.unwrap(),
                 colorize_brackets: settings.colorize_brackets.unwrap(),
+                visual_md_enabled: settings
+                    .visual_md
+                    .and_then(|visual_md| visual_md.enabled)
+                    .unwrap_or(true),
                 completions: CompletionSettings {
                     words: completions.words.unwrap(),
                     words_min_length: completions.words_min_length.unwrap() as usize,
@@ -1260,6 +1267,67 @@ mod tests {
                 .edit_predictions_disabled_in,
             ["comment"]
         );
+    }
+
+    #[gpui::test]
+    fn test_visual_md_enabled_precedence(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &settings::default_settings());
+        store.register_setting::<AllLanguageSettings>();
+        let worktree_id = WorktreeId::from_usize(1);
+        let root = LocalSettingsPath::InWorktree(rel_path("root").into());
+        let child = LocalSettingsPath::InWorktree(rel_path("root/child").into());
+        let markdown = LanguageName::from("Markdown");
+        let disabled = r#"{"visual_md":{"enabled":false}}"#;
+        let enabled = r#"{"visual_md":{"enabled":true}}"#;
+        let markdown_disabled = r#"{"languages":{"Markdown":{"visual_md":{"enabled":false}}}}"#;
+        let markdown_enabled = r#"{"languages":{"Markdown":{"visual_md":{"enabled":true}}}}"#;
+
+        // (user, project root, project child, default enabled, Markdown enabled)
+        for (user, project_root, project_child, expected_default, expected_markdown) in [
+            ("{}", "{}", "{}", true, true),
+            (disabled, "{}", "{}", false, false),
+            (disabled, enabled, "{}", true, true),
+            ("{}", disabled, "{}", false, false),
+            ("{}", markdown_disabled, "{}", true, false),
+            (disabled, markdown_enabled, "{}", false, true),
+            ("{}", disabled, enabled, true, true),
+            ("{}", enabled, disabled, false, false),
+            ("{}", disabled, markdown_enabled, false, true),
+            ("{}", markdown_disabled, enabled, true, true),
+        ] {
+            store
+                .set_user_settings(user, cx)
+                .expect("user settings should load");
+            for (path, content) in [(root.clone(), project_root), (child.clone(), project_child)] {
+                store
+                    .set_local_settings(
+                        worktree_id,
+                        path,
+                        LocalSettingsKind::Settings,
+                        Some(content),
+                        cx,
+                    )
+                    .expect("project settings should load");
+            }
+
+            let settings = store.get::<AllLanguageSettings>(Some(SettingsLocation {
+                worktree_id,
+                path: rel_path("root/child/file.md"),
+            }));
+            let markdown_settings = settings
+                .languages
+                .get(&markdown)
+                .unwrap_or(&settings.defaults);
+            let case = format!("user: {user}, root: {project_root}, child: {project_child}");
+            assert_eq!(
+                settings.defaults.visual_md_enabled, expected_default,
+                "default language, {case}"
+            );
+            assert_eq!(
+                markdown_settings.visual_md_enabled, expected_markdown,
+                "Markdown, {case}"
+            );
+        }
     }
 
     #[gpui::test]

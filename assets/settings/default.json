@@ -140,7 +140,9 @@
   // Whether to enable helix mode and key bindings.
   // Enabling this mode will automatically enable vim mode.
   "helix_mode": false,
-  // Settings for Zed MD's live-preview Markdown editing.
+  // Settings for Zed MD's live-preview Markdown editing. Like other language
+  // settings, this can also be set in a project's `.zed/settings.json` and
+  // per language, e.g. `"languages": { "Markdown": { "visual_md": { "enabled": false } } }`.
   "visual_md": {
     // Whether to render Markdown buffers with live preview instead of plain
     // source text.
