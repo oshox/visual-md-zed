@@ -591,6 +591,17 @@ fn heading_level(node: Node) -> Option<u8> {
     None
 }
 
+/// `range` cut off at its first newline. A block node's byte range includes its
+/// trailing `\n`, and `touches_selection` is inclusive at both ends, so testing
+/// the whole node would also count a cursor at column 0 of the next line.
+fn first_line(range: &Range<usize>, text: &str) -> Range<usize> {
+    let end = text
+        .get(range.clone())
+        .and_then(|node_text| node_text.find('\n'))
+        .map_or(range.end, |offset| range.start + offset);
+    range.start..end
+}
+
 fn plan_heading(
     node: Node,
     text: &str,
@@ -608,7 +619,7 @@ fn plan_heading(
         .unwrap_or(node_range.end);
     let marker_range = node_range.start..content_start;
 
-    if touches_selection(&node_range, selections) {
+    if touches_selection(&first_line(&node_range, text), selections) {
         plan.dimmed_markers.push(marker_range);
     } else {
         plan.hidden_markers.push(marker_range);
@@ -1016,11 +1027,7 @@ fn detect_callout(
     // but deliberately not for a cursor anywhere in the body, which stays
     // independently live-previewed (per spec) rather than coupled to the
     // title's own raw/rendered state.
-    let title_line_end = text[node_range.start..node_range.end]
-        .find('\n')
-        .map(|offset| node_range.start + offset)
-        .unwrap_or(node_range.end);
-    let touched = touches_selection(&(node_range.start..title_line_end), selections);
+    let touched = touches_selection(&first_line(&node_range, text), selections);
     Some(CalloutInfo {
         kind: CalloutKind::from_type_name(type_name),
         raw_type_name: type_name.to_string(),
@@ -1409,6 +1416,24 @@ mod tests {
     #[test]
     fn heading_marker_dimmed_when_cursor_on_line() {
         let result = plan("# Heading\n", &[4..4]);
+        assert!(result.hidden_markers.is_empty());
+        assert_eq!(result.dimmed_markers, vec![0..2]);
+    }
+
+    #[test]
+    fn heading_marker_hidden_when_cursor_on_next_line() {
+        for cursor in [10, 11] {
+            let result = plan("# Heading\n\ntext", &[cursor..cursor]);
+            assert_eq!(result.hidden_markers, vec![0..2], "cursor at {cursor}");
+            assert!(result.dimmed_markers.is_empty(), "cursor at {cursor}");
+        }
+        let result = plan("# Heading\ntext", &[10..10]);
+        assert_eq!(result.hidden_markers, vec![0..2]);
+    }
+
+    #[test]
+    fn heading_marker_dimmed_when_cursor_at_end_of_heading_line() {
+        let result = plan("# Heading\n\ntext", &[9..9]);
         assert!(result.hidden_markers.is_empty());
         assert_eq!(result.dimmed_markers, vec![0..2]);
     }
