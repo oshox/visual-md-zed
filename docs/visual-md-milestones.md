@@ -22,7 +22,7 @@ purpose even though the app is branded Zed MD.
 | M12 | Inline images | Done |
 | M13 | Turn the editor off globally or per project, in settings.json and the settings UI | Done |
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
-| M15 | Extension hooks on par with Obsidian, Notion and Logseq | In progress: every hook is built (fence renderers, editor commands, syntax rules, callouts, document events, links, completions and settings); the sample and guide are being finished |
+| M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 
 ## M13: On/off switch at global and project level
 
@@ -201,3 +201,100 @@ and link providers.
 **Done when:** the sample extension installs as a dev extension and each of
 its hooks works in the running app, and removing it restores the default
 rendering.
+
+### As built
+
+The developer guide, [`visual-md-extensions.md`](./visual-md-extensions.md),
+documents every hook, key and limit. This records the decisions behind them.
+
+**API version.** The hooks are extension API 0.9.0, a version that exists only
+in this fork: upstream has never released one, and its 0.8.0 is still
+development-only. `since_v0_9_0.rs` is a thin layer over the 0.8.0
+implementation, so upstream's edits to 0.8.0 do not conflict with it. 0.9.0
+loads on every release channel, and the registry is never told about it, so it
+cannot collide with the 0.9.0 upstream eventually releases. Its WIT changes
+until it is released, and components are checked structurally, so a guest
+must be rebuilt against the version of Zed MD it runs in.
+
+**Manifest.** Everything is under `[visual_md]` in `extension.toml`. A section
+that does not validate is logged and none of that extension's hooks register.
+Syntax rules without `dynamic = true` and callouts need no code, so an
+extension can be only a manifest.
+
+**Calls into an extension.** A call never happens while the editor draws or a
+key is handled: refresh reads caches and asks for what is missing, and the
+answer re-applies when it lands. Every call has a timeout (fence 5 s, command
+10 s, dynamic rule 1 s, event 5 s, link 2 s, completion 1 s), at most four
+are in flight per extension, and three failures in a row disable an extension's
+Markdown hooks until restart or reload. Answers are cached by extension build,
+so reinstalling a dev extension never shows stale output.
+
+**Precedence.**
+- Zed MD's own decorations win. A range an extension asks to hide or replace is
+  dropped when it overlaps anything Zed MD folds or reveals, because two folds
+  over the same text would panic the editor.
+- Between extensions, the leftmost range wins for rules, and the extension
+  whose id sorts first wins a fence language, a callout name or a link scheme.
+- A callout the user or the theme sets for a name beats the extension's, which
+  beats what is set for its kind.
+- A fence renderer claims a block only while the cursor is outside it, and an
+  unclosed fence is never claimed.
+
+**Links.** `[text](destination)` shows only its text, so Zed's detection of
+URLs under the pointer never saw it. `Addon::link_at` lets the addon say what
+is under the pointer, which makes inline links clickable in live preview as a
+side effect: web addresses open in the browser, relative paths open the file.
+
+**Completions.** Zed MD wraps the editor's completion provider, forwards what
+it does not handle, and hands the original back when live preview stops, unless
+something replaced it in the meantime.
+
+**Settings.** `visual_md.extensions.<id>` is free-form JSON. The host answers
+`get-settings` with category `visual_md` from the id of the calling extension,
+so an extension is never given another's entry.
+
+**Checked in the running app.** The sample was installed into a throwaway
+profile, as a symlink in its `extensions/installed` directory, and a document
+using every rule and renderer was opened in the real binary on a headless
+Wayland compositor, with screenshots. It showed the `sample-flow` SVG, the
+`sample-table` Markdown table and the `sample-styled` text in place of their
+blocks, `@ada` in blue, the `sample` callout with its purple accent and star
+icon, and `opened` written to the extension's `events.log` with the right
+counts. Removing the extension and starting again gave the same document as a
+profile that never had it. The check found two bugs that no test had: an
+extension that registers no language server lost its channel as soon as the
+store finished loading it, and `opened` never reached an extension that loaded
+after the document, which is every document restored at startup. Both are fixed
+and tested.
+
+Not checked in the running app, because they need keystrokes or the mouse and
+there was no way to send either: running `uppercase` from the palette, as a
+keymap binding and as `/uppercase`, the `[[` menu, hovering and clicking
+`sample://docs`, the `saved` and `changed` events, and **zed: install dev
+extension** (the symlink does what it does after compiling). The `:smile:`
+replacements were present, but their emoji drew blank, as a literal emoji does
+in that session, whose only emoji font is Noto's COLRv1 one. Ordinary code
+fences in the same session lost their first line under the opening border
+whether or not the extension was installed. The code that draws them is not
+touched here, and whether it happens at the base was not checked.
+
+**Limitations.**
+- A call that times out is abandoned but not stopped. The extension keeps
+  running it and answers nothing else until it finishes. The breaker is the
+  backstop.
+- Extensions can make network requests without declaring a capability, as in
+  upstream Zed.
+- Hidden and replacement text from rules is one line. Only fence renderers
+  make blocks.
+- A rule can name only the node kinds the Markdown grammar produces and Zed MD
+  does not decorate itself: `html_tag`, the reference link kinds, `html_block`,
+  `link_reference_definition`, `minus_metadata` and `plus_metadata`.
+- A rendered fence's height is a first guess from the extension's hint, and
+  the block is re-measured, so it can move when it scrolls into view.
+- Settings have no schema, and the settings UI shows `visual_md.extensions` as
+  a row that is edited in `settings.json`.
+- PNG output is covered only by tests with fake hooks: the sample has no
+  encoder.
+- Only the Linux backend compiles here, so nothing was type-checked for macOS
+  or Windows, and the extension paths were exercised on Linux only.
+
