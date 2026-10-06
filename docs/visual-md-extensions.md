@@ -11,9 +11,10 @@ stages, and each stage adds its hooks here.
 | Fenced code block renderers    | Available |
 | Editor commands                | Available |
 | Syntax rules and callouts      | Available |
-| Events, outline, link provider | Planned   |
-| `/` and `[[` completions       | Planned   |
-| Extension settings             | Planned   |
+| Document events and outline    | Available |
+| Link provider                  | Available |
+| `/` and `[[` completions       | Available |
+| Extension settings             | Available |
 
 A working example is in [`extensions/visual-md-sample`](../extensions/visual-md-sample).
 
@@ -119,8 +120,8 @@ impl zed::Extension for MyExtension {
 zed::register_extension!(MyExtension);
 ```
 
-Both methods have defaults that return an error, so implement only the hooks
-the manifest declares.
+Every `visual_md_*` method has a default that returns an error, so implement only
+the hooks the manifest declares.
 
 ## The manifest
 
@@ -132,8 +133,12 @@ Everything lives under `[visual_md]` in `extension.toml`.
 | `[visual_md.commands.<id>]` | An editor command. `title` is required, `description` is optional. |
 | `[[visual_md.syntax_rules]]` | A rule that styles, hides or replaces text. See below. |
 | `[visual_md.callouts.<name>]` | A callout type, written `> [!name]`. See below. |
+| `[visual_md.events]` | The document events the extension hears. See below. |
+| `[visual_md.links]` | The links the extension resolves and the names it completes. See below. |
 
-Command ids may contain letters, digits, `-` and `_`. A command is run as
+Command ids may contain letters, digits, `-` and `_`. A command with
+`slash = true` is also offered when `/` is typed at the start of a line, see
+"Completions". A command is run as
 `<extension id>.<command id>`. An invalid `[visual_md]` section is logged and the
 extension's hooks are not registered at all. If two extensions claim the same
 language, the one whose id sorts first renders it.
@@ -353,6 +358,155 @@ What the user sets for the name in `visual_md.callouts` or
 wins over what is set for the kind and over the kind's defaults. SVG files
 declared as icons are packaged with the extension.
 
+## Document events
+
+```toml
+[visual_md.events]
+opened = true
+saved = true
+changed = true
+changed_debounce_ms = 1000
+```
+
+```wit
+export visual-md-document-event: func(event: document-event) -> result<_, string>;
+```
+
+An extension is told about the events it turned on, for documents shown with
+live preview, and only for those:
+
+- `opened`: the document is shown with live preview in an editor for the first
+  time. Showing it again in another editor, a split for example, tells the
+  extension again; turning live preview off and on again in the same editor does
+  not.
+- `saved`: the document was saved.
+- `changed`: the document was edited and then left alone for
+  `changed_debounce_ms`, which is kept between 250 and 10,000 and is 1,000 when
+  not set. Typing on tells the extension once, when you stop.
+
+The event has the `kind`, the `path` of the document if it has one, and its
+`outline`. The outline is built for every event, off the main thread:
+
+- `headings`: `level` from 1 to 6 and `text` without the markers, for `#` and
+  underlined headings.
+- `links`: inline links and images `[text](destination)` with the `destination`
+  as written, and `[[wikilinks]]` and `![[embeds]]` with the name between the
+  brackets. The `style` says which.
+- `tags`: `#name` at the start of a word. A tag may contain letters, digits, `_`,
+  `-` and `/`, and is not only digits, so `#12` is not one.
+- `tasks`: list items with a checkbox, their `text` and whether they are
+  `checked`.
+- `frontmatter`: the text between the `---` lines a document starts with.
+
+Everything is a UTF-8 byte range of the document. Code blocks and inline code
+hold no links, tags or tasks. Each kind holds at most 5,000 entries, and a
+document over 2 MB is not reported at all.
+
+Events are fire and forget. The result is only logged, and a call that takes more
+than 5 seconds is abandoned.
+
+## Links
+
+```toml
+[visual_md.links]
+schemes = ["sample"]
+wikilinks = true
+```
+
+```wit
+export visual-md-resolve-link: func(request: link-request) -> result<option<link-target>, string>;
+```
+
+Zed MD makes the links of a document work with Cmd or Ctrl and a click, the way
+URLs in text do: `[text](https://…)` opens in the browser, and
+`[text](other.md)` opens the file next to the document. `schemes` and `wikilinks`
+add to that:
+
+- `schemes` lists URL schemes, lowercase, that the extension resolves, such as
+  `sample` for `[text](sample://x)`. When two extensions list one scheme, the one
+  whose id sorts first has it. A scheme an extension lists is its, even `https`.
+- `wikilinks = true` makes `[[name]]` and `![[name]]` links, which nothing else
+  resolves. Extensions that list it are asked in turn until one answers.
+
+The `link-request` has the `target` as written, the `scheme` (`none` for a
+wikilink and for a destination without one), whether it is a `wikilink`, and the
+`path` of the document. Answer with `url(address)`, which is opened, `file(path)`,
+which is opened in the editor, absolute or relative to the document, or `none`
+for a link the extension does not know.
+
+The call is made while the pointer is over the link, and gives up after 2
+seconds, which shows the link as not clickable.
+
+## Completions
+
+```toml
+[visual_md.commands.uppercase]
+title = "Uppercase Selection"
+slash = true
+
+[visual_md.links]
+wikilink_completions = true
+```
+
+```wit
+export visual-md-complete: func(request: completion-request) -> result<list<completion-item>, string>;
+```
+
+**Slash commands.** With `slash = true`, a command is offered in the completion
+menu when `/` is typed at the start of a line, after any indentation. Typing on
+narrows the menu. Choosing a command removes what was typed, `/` and the letters
+after it, and then runs it, so the command's text and selections are those of the
+document without it. No call into the extension is needed to show the menu.
+
+**Names after `[[`.** With `wikilink_completions = true` the extension is asked
+what to suggest when `[[` or `![[` has been typed, and again as more is typed.
+The `completion-request` has the `query` typed so far, the `path` of the document,
+and `files`, the Markdown files (`.md` and `.markdown`) of the project as paths
+relative to the project's root, at most 2,000. Each `completion-item` has a
+`label`, an optional `detail` shown beside it and the `insert-text` that replaces
+what was typed. `]]` is added after it unless it is already there. The editor
+narrows the suggestions as the query grows, so an extension that has few
+candidates can answer with all of them and let the editor filter; one that has
+many should use `query`. The call gives up after 1 second.
+
+What the menu offered before is still offered: Zed MD adds its entries to the
+editor's own, language server completions among them, and hands the editor its
+original provider back when live preview stops showing. If something else has
+replaced the provider in the meantime it is left in place.
+
+## Settings
+
+An extension has a place in the user's settings for what the user can set:
+
+```json
+{
+  "visual_md": {
+    "extensions": {
+      "my-extension": { "notes": ["Ideas", "Inbox"] }
+    }
+  }
+}
+```
+
+It can be set in the user settings, in a project's `.zed/settings.json`, and for
+Markdown under `languages`, and the entries merge key by key, deeply, like the
+rest of `visual_md`. The settings UI lists `visual_md.extensions` as a row that
+is edited in `settings.json`. The values are free-form JSON: the extension
+decides what it accepts, and there is no schema.
+
+An extension reads its own entry, or one key of it, with
+`zed::settings::visual_md_extension_settings`:
+
+```rust
+let notes: Option<Vec<String>> =
+    zed::settings::visual_md_extension_settings(Some("notes"))?;
+```
+
+Nothing set is `null`, which is `None` for an `Option`. The host looks the
+entry up by the id of the extension that is calling, so an extension is never
+given another's settings. Under the hood this is the `get-settings` import with
+the category `visual_md` and the key.
+
 ## Limits
 
 An extension runs in the same process as Zed, one call at a time, so Zed guards
@@ -363,11 +517,16 @@ every call into it:
 | Time for a fence render | 5 seconds |
 | Time for a command | 10 seconds |
 | Time for a dynamic rule call | 1 second |
+| Time for a document event | 5 seconds |
+| Time to resolve a link | 2 seconds |
+| Time to complete a wikilink name | 1 second |
 | Matches in one dynamic rule call | 256, each distinct text once |
 | Replacement text | 200 characters, one line |
 | Calls in flight per extension | 4. More wait their turn. |
 | Text output | 1 MB for Markdown, SVG and styled text |
 | Image output | 16 MB |
+| Outline | 5,000 entries of each kind, in documents up to 2 MB |
+| Files sent for `[[` completions | 2,000 |
 | Failures in a row | After 3 failed or timed out calls, the extension's Markdown hooks are disabled until Zed restarts or the extension is reloaded. |
 
 A call that times out is abandoned, but it cannot be stopped: the extension keeps

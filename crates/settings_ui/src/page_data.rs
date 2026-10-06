@@ -2511,6 +2511,31 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
+    fn markdown_live_preview_extensions_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Markdown Live Preview Extensions"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Extension Settings",
+                description: "Settings of Zed MD extensions, keyed by extension id. Each extension defines what goes in its own entry.",
+                field: Box::new(
+                    SettingField {
+                        organization_override: None,
+                        json_path: Some("visual_md.extensions"),
+                        pick: |settings_content| {
+                            visual_md_settings(settings_content)?.extensions.as_ref()
+                        },
+                        write: |settings_content, value, _| {
+                            visual_md_settings_mut(settings_content).extensions = value;
+                        },
+                    }
+                    .unimplemented(),
+                ),
+                metadata: allow_unset(),
+                files: USER | PROJECT,
+            }),
+        ]
+    }
+
     fn multibuffer_section() -> [SettingsPageItem; 7] {
         [
             SettingsPageItem::SectionHeader("Multibuffer"),
@@ -3986,6 +4011,7 @@ fn editor_page() -> SettingsPage {
         markdown_live_preview_headings_section(),
         markdown_live_preview_colors_section(),
         markdown_live_preview_callouts_section(),
+        markdown_live_preview_extensions_section(),
         multibuffer_section(),
         scrolling_section(),
         signature_help_section(),

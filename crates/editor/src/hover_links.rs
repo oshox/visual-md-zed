@@ -558,6 +558,18 @@ pub fn show_link_definition(
                     });
             drop(snapshot);
 
+            // An addon's link comes after a language server's, which declares
+            // exactly which ranges are links, and before the guesses made from
+            // the text.
+            let addon_link = this
+                .update(cx, |editor, cx| editor.addon_link_at(&buffer, anchor, cx))
+                .ok()
+                .flatten();
+            let addon_link = match addon_link {
+                Some(task) => task.await,
+                None => None,
+            };
+
             let result = match &trigger_point {
                 TriggerPoint::Text(_) => {
                     let mut links = Vec::new();
@@ -572,6 +584,15 @@ pub fn show_link_definition(
                     {
                         symbol_range = Some(RangeInEditor::Text(multi_buffer_range));
                         links.push(document_link_target_to_hover_link(&target, server_id));
+                    } else if let Some((link_range, link)) = addon_link {
+                        let snapshot =
+                            this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
+                        if let Some(range) =
+                            snapshot.buffer_anchor_range_to_anchor_range(link_range)
+                        {
+                            symbol_range = Some(RangeInEditor::Text(range));
+                        }
+                        links.push(link);
                     } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx) {
                         let snapshot =
                             this.read_with(cx, |editor, cx| editor.buffer.read(cx).snapshot(cx))?;
@@ -2324,6 +2345,95 @@ mod tests {
             indoc! {"
             Let's test a [complex](«https://zed.dev/channel/ˇ») case.
         "},
+        );
+    }
+
+    /// An addon that makes the word "magic" a link to a fixed address.
+    struct MagicWordAddon;
+
+    impl crate::Addon for MagicWordAddon {
+        fn to_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn link_at(
+            &self,
+            buffer: &gpui::Entity<language::Buffer>,
+            position: text::Anchor,
+            _project: Option<&gpui::Entity<project::Project>>,
+            cx: &mut gpui::App,
+        ) -> Option<gpui::Task<Option<(std::ops::Range<text::Anchor>, HoverLink)>>> {
+            use text::ToOffset as _;
+
+            let snapshot = buffer.read(cx).snapshot();
+            let offset = position.to_offset(&snapshot);
+            let start = snapshot.text().find("magic")?;
+            let range = start..start + "magic".len();
+            if !range.contains(&offset) {
+                return None;
+            }
+            let anchors = snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end);
+            Some(gpui::Task::ready(Some((
+                anchors,
+                HoverLink::Url("https://example.com/magic".to_string()),
+            ))))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_an_addon_provides_a_link_the_editor_would_not_find(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+        cx.update_editor(|editor, _, _| editor.register_addon(MagicWordAddon));
+        cx.set_state("one magic wordˇ and another word\n");
+
+        let on_magic = cx.pixel_position("one maˇgic word and another word\n");
+        cx.simulate_mouse_move(on_magic, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            "one «magicˇ» word and another word\n",
+        );
+        cx.simulate_click(on_magic, Modifiers::secondary_key());
+        assert_eq!(cx.opened_url(), Some("https://example.com/magic".into()));
+    }
+
+    #[gpui::test]
+    async fn test_an_addon_link_leaves_the_rest_of_the_text_alone(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+        cx.update_editor(|editor, _, _| editor.register_addon(MagicWordAddon));
+        cx.set_state("one magic word and https://zed.dev/pageˇ\n");
+
+        let on_url = cx.pixel_position("one magic word and https://zed.dev/paˇge\n");
+        cx.simulate_mouse_move(on_url, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            "one magic word and «https://zed.dev/pageˇ»\n",
+        );
+        cx.simulate_click(on_url, Modifiers::secondary_key());
+        assert_eq!(cx.opened_url(), Some("https://zed.dev/page".into()));
+    }
+
+    #[gpui::test]
+    async fn test_an_addon_link_wins_over_a_detected_url(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+        cx.update_editor(|editor, _, _| editor.register_addon(MagicWordAddon));
+        cx.set_state("see https://zed.dev/magicˇ\n");
+
+        let on_magic = cx.pixel_position("see https://zed.dev/maˇgic\n");
+        cx.simulate_mouse_move(on_magic, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            "see https://zed.dev/«magicˇ»\n",
+        );
+        cx.simulate_click(on_magic, Modifiers::secondary_key());
+        assert_eq!(
+            cx.opened_url(),
+            Some("https://example.com/magic".into()),
+            "the addon's link, not the URL under it"
         );
     }
 

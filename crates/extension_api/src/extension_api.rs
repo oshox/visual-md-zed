@@ -58,9 +58,11 @@ pub mod lsp {
 /// section of `extension.toml`.
 pub mod visual_md {
     pub use crate::wit::zed::extension::visual_md::{
-        Appearance, CommandContext, CommandResult, FenceOutput, FenceRequest, FenceResult, Image,
-        ImageFormat, Replacement, RuleMatch, RuleOutput, SpanStyle, StyledSpan, StyledText,
-        TextEdit,
+        Appearance, CommandContext, CommandResult, CompletionItem, CompletionRequest,
+        DocumentEvent, DocumentEventKind, FenceOutput, FenceRequest, FenceResult, Image,
+        ImageFormat, LinkRequest, LinkStyle, LinkTarget, Outline, OutlineHeading, OutlineLink,
+        OutlineTag, OutlineTask, Replacement, RuleMatch, RuleOutput, SpanStyle, StyledSpan,
+        StyledText, TextEdit,
     };
 }
 
@@ -219,6 +221,29 @@ pub trait Extension: Send + Sync {
         _matches: Vec<visual_md::RuleMatch>,
     ) -> Result<Vec<visual_md::RuleOutput>, String> {
         Err("`visual_md_apply_rule` not implemented".to_string())
+    }
+
+    /// Is told that something happened to a document, for the events declared in
+    /// `[visual_md.events]`.
+    fn visual_md_document_event(&self, _event: visual_md::DocumentEvent) -> Result<(), String> {
+        Err("`visual_md_document_event` not implemented".to_string())
+    }
+
+    /// Says where a link leads, for the schemes and wikilinks declared in
+    /// `[visual_md.links]`. Returns `None` when the extension does not know.
+    fn visual_md_resolve_link(
+        &self,
+        _request: visual_md::LinkRequest,
+    ) -> Result<Option<visual_md::LinkTarget>, String> {
+        Err("`visual_md_resolve_link` not implemented".to_string())
+    }
+
+    /// Suggests completions for the name of a wikilink the user is typing.
+    fn visual_md_complete(
+        &self,
+        _request: visual_md::CompletionRequest,
+    ) -> Result<Vec<visual_md::CompletionItem>, String> {
+        Err("`visual_md_complete` not implemented".to_string())
     }
 
     /// Returns the command used to start a context server.
@@ -552,6 +577,22 @@ impl wit::Guest for Component {
         matches: Vec<visual_md::RuleMatch>,
     ) -> Result<Vec<visual_md::RuleOutput>, String> {
         extension().visual_md_apply_rule(rule, matches)
+    }
+
+    fn visual_md_document_event(event: visual_md::DocumentEvent) -> Result<(), String> {
+        extension().visual_md_document_event(event)
+    }
+
+    fn visual_md_resolve_link(
+        request: visual_md::LinkRequest,
+    ) -> Result<Option<visual_md::LinkTarget>, String> {
+        extension().visual_md_resolve_link(request)
+    }
+
+    fn visual_md_complete(
+        request: visual_md::CompletionRequest,
+    ) -> Result<Vec<visual_md::CompletionItem>, String> {
+        extension().visual_md_complete(request)
     }
 
     fn context_server_command(

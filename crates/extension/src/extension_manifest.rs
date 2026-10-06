@@ -145,6 +145,84 @@ pub struct VisualMdManifestEntry {
     /// `> [!name]`. Matching ignores case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub callouts: BTreeMap<Arc<str>, VisualMdCalloutManifestEntry>,
+    /// The document events this extension wants to be told about, declared in
+    /// `[visual_md.events]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<VisualMdEventsManifestEntry>,
+    /// The links this extension resolves, declared in `[visual_md.links]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<VisualMdLinksManifestEntry>,
+}
+
+/// The URL schemes Zed MD opens itself, which no extension may take over.
+pub const VISUAL_MD_BUILT_IN_LINK_SCHEMES: &[&str] = &["http", "https", "file", "mailto"];
+
+/// The shortest and longest time a document is left alone before a `changed`
+/// event, in milliseconds.
+pub const VISUAL_MD_CHANGED_DEBOUNCE_RANGE_MS: std::ops::RangeInclusive<u64> = 250..=10_000;
+
+fn default_changed_debounce_ms() -> u64 {
+    1_000
+}
+
+/// The document events an extension is told about, `[visual_md.events]`.
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct VisualMdEventsManifestEntry {
+    /// A document was shown in an editor with live preview for the first time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opened: bool,
+    /// A document was saved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saved: bool,
+    /// A document was edited and then left alone for `changed_debounce_ms`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changed: bool,
+    /// How long a document is left alone before `changed`, in milliseconds. Kept
+    /// between 250 and 10,000.
+    #[serde(default = "default_changed_debounce_ms")]
+    pub changed_debounce_ms: u64,
+}
+
+impl Default for VisualMdEventsManifestEntry {
+    fn default() -> Self {
+        Self {
+            opened: false,
+            saved: false,
+            changed: false,
+            changed_debounce_ms: default_changed_debounce_ms(),
+        }
+    }
+}
+
+impl VisualMdEventsManifestEntry {
+    /// How long a document is left alone before `changed`, within the allowed range.
+    pub fn changed_debounce(&self) -> std::time::Duration {
+        let milliseconds = self.changed_debounce_ms.clamp(
+            *VISUAL_MD_CHANGED_DEBOUNCE_RANGE_MS.start(),
+            *VISUAL_MD_CHANGED_DEBOUNCE_RANGE_MS.end(),
+        );
+        std::time::Duration::from_millis(milliseconds)
+    }
+
+    /// Whether the extension wants to hear about any event.
+    pub fn is_subscribed(&self) -> bool {
+        self.opened || self.saved || self.changed
+    }
+}
+
+/// The links an extension resolves, `[visual_md.links]`.
+#[derive(Debug, PartialEq, Eq, Clone, Default, Serialize, Deserialize)]
+pub struct VisualMdLinksManifestEntry {
+    /// The URL schemes of inline links the extension resolves, such as
+    /// `sample` for `[text](sample://x)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schemes: Vec<String>,
+    /// Whether the extension resolves `[[wikilinks]]`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wikilinks: bool,
+    /// Whether the extension suggests completions after `[[`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wikilink_completions: bool,
 }
 
 /// A syntax rule provided through `[[visual_md.syntax_rules]]`. It has exactly
@@ -205,6 +283,10 @@ pub struct VisualMdCommandManifestEntry {
     /// What the command does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Whether the command is also offered when `/` is typed at the start of a
+    /// line, as an entry that runs it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slash: bool,
 }
 
 impl VisualMdManifestEntry {
@@ -254,7 +336,37 @@ impl VisualMdManifestEntry {
         }
         self.validate_syntax_rules(&mut problems);
         self.validate_callouts(&mut problems);
+        self.validate_links(&mut problems);
         problems
+    }
+
+    fn validate_links(&self, problems: &mut Vec<String>) {
+        let Some(links) = &self.links else {
+            return;
+        };
+        for scheme in &links.schemes {
+            let mut characters = scheme.chars();
+            let is_valid = characters
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase())
+                && characters.all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || "+-.".contains(character)
+                });
+            if !is_valid {
+                problems.push(format!(
+                    "link scheme {scheme:?} must be lowercase letters, digits, `+`, `-` and `.`, starting with a letter"
+                ));
+            } else if VISUAL_MD_BUILT_IN_LINK_SCHEMES.contains(&scheme.as_str()) {
+                problems.push(format!(
+                    "link scheme `{scheme}` is handled by Zed MD itself"
+                ));
+            }
+        }
+        if links.schemes.is_empty() && !links.wikilinks && !links.wikilink_completions {
+            problems.push("`[visual_md.links]` declares nothing".to_string());
+        }
     }
 
     fn validate_syntax_rules(&self, problems: &mut Vec<String>) {
@@ -797,6 +909,7 @@ title = "Insert Today's Date"
             Some(&VisualMdCommandManifestEntry {
                 title: "Uppercase Selection".to_string(),
                 description: Some("Uppercases the selected text.".to_string()),
+                slash: false,
             })
         );
         assert_eq!(visual_md.commands["today"].description, None);
@@ -849,6 +962,7 @@ title = "Insert Today's Date"
                     VisualMdCommandManifestEntry {
                         title: "Fine".to_string(),
                         description: None,
+                        slash: false,
                     },
                 ),
                 (
@@ -856,6 +970,7 @@ title = "Insert Today's Date"
                     VisualMdCommandManifestEntry {
                         title: "Dotted".to_string(),
                         description: None,
+                        slash: false,
                     },
                 ),
                 (
@@ -863,6 +978,7 @@ title = "Insert Today's Date"
                     VisualMdCommandManifestEntry {
                         title: "   ".to_string(),
                         description: None,
+                        slash: false,
                     },
                 ),
             ]),
@@ -1315,5 +1431,134 @@ icon = "icons/drawn.svg"
             entry.callout_icon_paths(),
             vec![PathBuf::from("icons/a.svg"), PathBuf::from("icons/b.svg")]
         );
+    }
+
+    const VISUAL_MD_EVENTS_MANIFEST: &str = r#"
+id = "notes"
+name = "Notes"
+version = "1.0.0"
+schema_version = 1
+
+[visual_md.events]
+opened = true
+changed = true
+changed_debounce_ms = 500
+
+[visual_md.links]
+schemes = ["notes", "wiki+v2"]
+wikilinks = true
+wikilink_completions = true
+
+[visual_md.commands.insert-date]
+title = "Insert Date"
+slash = true
+
+[visual_md.commands.sort]
+title = "Sort"
+"#;
+
+    #[test]
+    fn test_events_links_and_slash_commands_are_parsed() {
+        let manifest: ExtensionManifest = toml::from_str(VISUAL_MD_EVENTS_MANIFEST).unwrap();
+        let visual_md = manifest.visual_md.as_ref().unwrap();
+
+        let events = visual_md.events.as_ref().unwrap();
+        assert!(events.opened && events.changed && !events.saved);
+        assert_eq!(events.changed_debounce_ms, 500);
+        assert!(events.is_subscribed());
+
+        let links = visual_md.links.as_ref().unwrap();
+        assert_eq!(links.schemes, vec!["notes", "wiki+v2"]);
+        assert!(links.wikilinks && links.wikilink_completions);
+
+        assert!(visual_md.commands["insert-date"].slash);
+        assert!(!visual_md.commands["sort"].slash);
+        assert_eq!(visual_md.validate(), Vec::<String>::new());
+
+        let reparsed: ExtensionManifest =
+            toml::from_str(&toml::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(reparsed.visual_md, manifest.visual_md);
+    }
+
+    #[test]
+    fn test_events_default_to_a_one_second_debounce_and_no_subscription() {
+        let events = VisualMdEventsManifestEntry::default();
+
+        assert_eq!(events.changed_debounce(), std::time::Duration::from_secs(1));
+        assert!(!events.is_subscribed());
+        let parsed: ExtensionManifest = toml::from_str(
+            "id = \"a\"\nname = \"A\"\nversion = \"1\"\nschema_version = 1\n[visual_md.events]\nsaved = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .visual_md
+                .unwrap()
+                .events
+                .unwrap()
+                .changed_debounce_ms,
+            1_000
+        );
+    }
+
+    #[test]
+    fn test_the_changed_debounce_is_kept_between_250_and_10000_milliseconds() {
+        let debounce = |milliseconds: u64| {
+            VisualMdEventsManifestEntry {
+                changed: true,
+                changed_debounce_ms: milliseconds,
+                ..Default::default()
+            }
+            .changed_debounce()
+            .as_millis()
+        };
+
+        assert_eq!(debounce(0), 250);
+        assert_eq!(debounce(249), 250);
+        assert_eq!(debounce(250), 250);
+        assert_eq!(debounce(4_000), 4_000);
+        assert_eq!(debounce(10_000), 10_000);
+        assert_eq!(debounce(10_001), 10_000);
+        assert_eq!(debounce(u64::MAX), 10_000);
+    }
+
+    fn links(schemes: &[&str], wikilinks: bool, completions: bool) -> VisualMdManifestEntry {
+        VisualMdManifestEntry {
+            links: Some(VisualMdLinksManifestEntry {
+                schemes: schemes.iter().map(|scheme| scheme.to_string()).collect(),
+                wikilinks,
+                wikilink_completions: completions,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_link_schemes_are_checked() {
+        assert_eq!(
+            links(&["notes", "a1", "x+y-z.w"], false, false)
+                .validate()
+                .len(),
+            0
+        );
+        for bad in ["", "Notes", "1abc", "has space", "a:b", "ünï"] {
+            assert_eq!(
+                links(&[bad], false, false).validate().len(),
+                1,
+                "scheme {bad:?} should be refused"
+            );
+        }
+        for built_in in VISUAL_MD_BUILT_IN_LINK_SCHEMES {
+            let problems = links(&[built_in], false, false).validate();
+            assert_eq!(problems.len(), 1, "{built_in}");
+            assert!(problems[0].contains("handled by Zed MD itself"));
+        }
+    }
+
+    #[test]
+    fn test_a_links_section_must_declare_something() {
+        assert_eq!(links(&[], false, false).validate().len(), 1);
+        assert!(links(&[], true, false).validate().is_empty());
+        assert!(links(&[], false, true).validate().is_empty());
     }
 }

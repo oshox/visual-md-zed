@@ -13,7 +13,10 @@ preview. It is the worked example for `docs/visual-md-extensions.md`.
 | Syntax rule               | `mention`       | Styles `@names` in blue and bold. No code needed.                   |
 | Dynamic syntax rule       | `emoji`         | Shows `:smile:`, `:tada:` and a few more as emoji.                  |
 | Callout                   | `sample`        | `> [!sample]` as a purple callout titled "Sample" with its own icon. |
-| Editor command            | `uppercase`     | Uppercases the selection, or the current line with nothing selected. |
+| Editor command            | `uppercase`     | Uppercases the selection, or the current line with nothing selected. Also offered as `/uppercase`. |
+| Document events           | `opened`, `saved`, `changed` | Appends a line about the document to `events.log` in the extension's work directory. |
+| Link scheme               | `sample`        | `[text](sample://docs)` opens `https://example.com/sample/docs`.    |
+| Wikilink completions      | `[[`            | Suggests the names in the `notes` setting and the project's Markdown files. |
 
 ````markdown
 ```sample-flow
@@ -23,6 +26,25 @@ parse -> check -> emit
 
 While the cursor is outside a block, the extension's rendering stands in for
 it. Moving the cursor into the block, or clicking it, shows the source.
+
+Type `/` at the start of a line and `Uppercase Selection` is offered in the
+completion menu. Type `[[` and the names it knows are offered, the project's
+Markdown files by name and these, which are set in `settings.json`:
+
+```json
+{
+  "visual_md": {
+    "extensions": {
+      "visual-md-sample": { "notes": ["Ideas", "Inbox"] }
+    }
+  }
+}
+```
+
+Hold Cmd (Ctrl on Linux and Windows) over `[a link](sample://docs)` to see it
+become clickable. The events are in `events.log` under the extension's work
+directory, in `work/visual-md-sample` of Zed's extensions directory, one line for
+each: `saved /notes/a.md: 2 headings, 1 links, 0 tags, 3 tasks`.
 
 Run the command from the command palette (`Uppercase Selection`, listed while
 live preview is showing) or bind it in your keymap:

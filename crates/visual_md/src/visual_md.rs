@@ -234,11 +234,15 @@
 //! single keystroke or cursor move touches only what changed.
 
 mod commands;
+mod completions;
+mod document_events;
 pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
+mod links;
 mod list_continuation;
+pub mod outline;
 mod plan;
 pub mod rules;
 mod style;
@@ -351,6 +355,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         saved_text_style_refinement: None,
         callout_key_count: 0,
         extension_key_count: 0,
+        opened_event_sent: false,
+        changed_events: HashMap::new(),
+        completion_provider: None,
     });
     refresh(editor, window, cx);
 
@@ -681,6 +688,15 @@ struct VisualMdAddon {
     /// How many `HighlightKey::VisualMdExtension` keys the last refresh used,
     /// for the same reason.
     extension_key_count: usize,
+    /// Whether the extensions subscribed to it have been told this editor
+    /// opened its document. It happens once, the first time live preview shows.
+    opened_event_sent: bool,
+    /// The wait before each extension is told the document changed, by
+    /// extension. Starting one again, on the next edit, drops the one before.
+    changed_events: HashMap<Arc<str>, Task<()>>,
+    /// The completion provider Zed MD put in the editor while live preview
+    /// shows, which wraps the one the editor had.
+    completion_provider: Option<std::rc::Rc<completions::VisualMdCompletionProvider>>,
 }
 
 struct ParsedDocument {
@@ -694,6 +710,16 @@ impl Addon for VisualMdAddon {
         if self.active {
             key_context.add("visual_md");
         }
+    }
+
+    fn link_at(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        position: language::Anchor,
+        project: Option<&Entity<project::Project>>,
+        cx: &mut App,
+    ) -> Option<Task<Option<(Range<language::Anchor>, editor::hover_links::HoverLink)>>> {
+        links::link_at(self.active, buffer, position, project, cx)
     }
 
     fn to_any(&self) -> &dyn Any {
@@ -751,7 +777,15 @@ impl VisualMdState {
                         // the next edit or cursor move.
                         match event {
                             EditorEvent::BufferEdited => {
-                                editor.update(cx, |editor, cx| refresh(editor, window, cx));
+                                editor.update(cx, |editor, cx| {
+                                    refresh(editor, window, cx);
+                                    document_events::schedule_changed(editor, cx);
+                                });
+                            }
+                            EditorEvent::Saved => {
+                                editor.update(cx, |editor, cx| {
+                                    document_events::send_saved(editor, cx)
+                                });
                             }
                             EditorEvent::SelectionsChanged { .. } => {
                                 editor.update(cx, |editor, cx| {
@@ -1036,6 +1070,20 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         let gutter = editor::EditorSettings::get_global(cx).gutter;
         editor.set_show_line_numbers(if enabled { false } else { gutter.line_numbers }, cx);
         editor.set_show_fold_indicators(if enabled { false } else { gutter.folds }, cx);
+    }
+
+    if enabled
+        && !was_active
+        && editor
+            .addon_mut::<VisualMdAddon>()
+            .is_some_and(|addon| !std::mem::replace(&mut addon.opened_event_sent, true))
+    {
+        document_events::send_opened(editor, cx);
+    }
+    if enabled && !was_active {
+        completions::install(editor);
+    } else if !enabled && was_active {
+        completions::uninstall(editor);
     }
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);

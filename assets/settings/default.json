@@ -196,6 +196,10 @@
     // Custom callout types, for example
     // `"todo": { "icon": "check", "accent": "#3b82f6", "background": "#3b82f622" }`.
     "callouts": {},
+    // Settings of Zed MD extensions, keyed by extension id, for example
+    // `"my-extension": { "notes": ["Alpha", "Beta"] }`. An extension reads only
+    // its own entry, and defines what goes in it.
+    "extensions": {},
   },
   // Whether to show the informational hover box when moving the mouse
   // over symbols in the editor.

@@ -41,6 +41,18 @@ impl ContextServerSettings {
     }
 }
 
+/// Reads what the user has set for the calling extension under
+/// `visual_md.extensions.<extension id>`, or, given a key, that key of it.
+///
+/// The settings are free-form JSON, and an extension is only ever handed its
+/// own. They are `null` when nothing is set, so ask for an `Option` to tell
+/// that apart from a value that does not fit `T`.
+pub fn visual_md_extension_settings<T: serde::de::DeserializeOwned>(
+    key: Option<&str>,
+) -> Result<T> {
+    get_settings("visual_md", key, None)
+}
+
 fn get_settings<T: serde::de::DeserializeOwned>(
     settings_type: &str,
     settings_name: Option<&str>,

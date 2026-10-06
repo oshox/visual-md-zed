@@ -15,7 +15,7 @@ world extension {
     use lsp.{completion, symbol};
     use process.{command};
     use slash-command.{slash-command, slash-command-argument-completion, slash-command-output};
-    use visual-md.{command-context, command-result, fence-request, fence-result, rule-match, rule-output};
+    use visual-md.{command-context, command-result, completion-item, completion-request, document-event, fence-request, fence-result, link-request, link-target, rule-match, rule-output};
 
     /// Initializes the extension.
     export init-extension: func();
@@ -184,6 +184,18 @@ world extension {
     ///
     /// Returns one output per match, in the order of `matches`.
     export visual-md-apply-rule: func(rule: string, matches: list<rule-match>) -> result<list<rule-output>, string>;
+
+    /// Tells the extension that something happened to a document, for the events
+    /// it subscribed to in `[visual_md.events]`. Nothing is expected back.
+    export visual-md-document-event: func(event: document-event) -> result<_, string>;
+
+    /// Says where a link leads, for the schemes and wikilinks declared in
+    /// `[visual_md.links]`. Return `none` when the extension does not know.
+    export visual-md-resolve-link: func(request: link-request) -> result<option<link-target>, string>;
+
+    /// Suggests completions for the name of a wikilink the user is typing, for an
+    /// extension that declared `wikilink_completions` in `[visual_md.links]`.
+    export visual-md-complete: func(request: completion-request) -> result<list<completion-item>, string>;
 
     /// Returns a configured debug adapter binary for a given debug task.
     export get-dap-binary: func(adapter-name: string, config: debug-task-definition, user-installed-path: option<string>, worktree: borrow<worktree>) -> result<debug-adapter-binary, string>;

@@ -1,6 +1,6 @@
 id = "visual-md-sample"
 name = "Zed MD Sample"
-description = "A sample for Zed MD's live preview: fenced code block renderers and an editor command."
+description = "A sample for Zed MD's live preview: fenced code block renderers, syntax rules, a callout, document events, links, completions and an editor command."
 version = "0.1.0"
 schema_version = 1
 authors = ["Zed MD contributors"]
@@ -19,6 +19,16 @@ id = "emoji"
 pattern = '(:)([a-z_]+)(:)'
 dynamic = true
 
+[visual_md.events]
+opened = true
+saved = true
+changed = true
+changed_debounce_ms = 1000
+
+[visual_md.links]
+schemes = ["sample"]
+wikilink_completions = true
+
 [visual_md.callouts.sample]
 title = "Sample"
 kind = "tip"
@@ -29,3 +39,4 @@ background = "#a855f71a"
 [visual_md.commands.uppercase]
 title = "Uppercase Selection"
 description = "Uppercases the selected text, or the current line when nothing is selected."
+slash = true

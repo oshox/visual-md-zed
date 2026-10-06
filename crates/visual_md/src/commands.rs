@@ -414,6 +414,7 @@ mod tests {
             command: "uppercase".into(),
             title: title.to_string(),
             description: None,
+            slash: false,
         }
     }
 

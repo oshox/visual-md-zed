@@ -287,7 +287,11 @@ struct WantedFence {
 }
 
 pub(crate) fn note_path(editor: &Editor, cx: &App) -> Option<String> {
-    let buffer = editor.buffer().read(cx).as_singleton()?;
+    buffer_path(&editor.buffer().read(cx).as_singleton()?, cx)
+}
+
+/// The path of the file a buffer is of, if it is a local one.
+pub(crate) fn buffer_path(buffer: &Entity<language::Buffer>, cx: &App) -> Option<String> {
     let file = buffer.read(cx).file()?.as_local()?;
     Some(file.abs_path(cx).to_string_lossy().into_owned())
 }

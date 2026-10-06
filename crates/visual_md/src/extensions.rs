@@ -14,7 +14,9 @@ use std::time::Duration;
 use anyhow::Result;
 use extension::{
     Extension, ExtensionHostProxy, ExtensionManifest, ExtensionVisualMdProxy,
-    VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
+    VisualMdCommandContext, VisualMdCommandResult, VisualMdCompletionItem,
+    VisualMdCompletionRequest, VisualMdDocumentEvent, VisualMdEventsManifestEntry,
+    VisualMdFenceRequest, VisualMdFenceResult, VisualMdLinkRequest, VisualMdLinkTarget,
     VisualMdManifestEntry, VisualMdRuleMatch, VisualMdRuleOutput,
 };
 use futures::FutureExt as _;
@@ -27,6 +29,9 @@ use crate::rules::CompiledRule;
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RULE_TIMEOUT: Duration = Duration::from_secs(1);
+pub const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const LINK_TIMEOUT: Duration = Duration::from_secs(2);
+pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// An extension answers "busy" while it has several requests running, which
 /// happens when a document needs more of them at once than it may have. A
@@ -57,6 +62,18 @@ pub trait VisualMdHooks: Send + Sync + 'static {
         rule: String,
         matches: Vec<VisualMdRuleMatch>,
     ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>>;
+
+    fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>>;
+
+    fn resolve_link(
+        &self,
+        request: VisualMdLinkRequest,
+    ) -> BoxFuture<'static, Result<Option<VisualMdLinkTarget>>>;
+
+    fn complete(
+        &self,
+        request: VisualMdCompletionRequest,
+    ) -> BoxFuture<'static, Result<Vec<VisualMdCompletionItem>>>;
 }
 
 struct ExtensionHooks(Arc<dyn Extension>);
@@ -87,6 +104,27 @@ impl VisualMdHooks for ExtensionHooks {
     ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>> {
         let extension = self.0.clone();
         async move { extension.visual_md_apply_rule(rule, matches).await }.boxed()
+    }
+
+    fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_document_event(event).await }.boxed()
+    }
+
+    fn resolve_link(
+        &self,
+        request: VisualMdLinkRequest,
+    ) -> BoxFuture<'static, Result<Option<VisualMdLinkTarget>>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_resolve_link(request).await }.boxed()
+    }
+
+    fn complete(
+        &self,
+        request: VisualMdCompletionRequest,
+    ) -> BoxFuture<'static, Result<Vec<VisualMdCompletionItem>>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_complete(request).await }.boxed()
     }
 }
 
@@ -161,6 +199,16 @@ struct RegisteredExtension {
     generation: u64,
 }
 
+/// Which extensions resolve which links.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkResolvers {
+    /// The extension that resolves each URL scheme it declared.
+    pub schemes: BTreeMap<String, Arc<str>>,
+    /// The extensions that resolve `[[wikilinks]]`, asked in this order until
+    /// one knows the target.
+    pub wikilinks: Vec<Arc<str>>,
+}
+
 /// Where a callout's icon comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtensionCalloutIcon {
@@ -202,6 +250,9 @@ pub struct ExtensionCommand {
     pub command: Arc<str>,
     pub title: String,
     pub description: Option<String>,
+    /// Whether the command is also offered when `/` is typed at the start of a
+    /// line.
+    pub slash: bool,
 }
 
 impl ExtensionCommand {
@@ -434,6 +485,7 @@ impl VisualMdExtensions {
                         command: command.clone(),
                         title: entry.title.clone(),
                         description: entry.description.clone(),
+                        slash: entry.slash,
                     })
             })
             .collect()
@@ -469,6 +521,98 @@ impl VisualMdExtensions {
     ) -> Task<Result<VisualMdCommandResult, HookError>> {
         self.call(extension_id, COMMAND_TIMEOUT, cx, move |hooks| {
             hooks.run_command(command, context)
+        })
+    }
+
+    /// The extensions that want to hear about document events, with what they
+    /// subscribed to, in the order of their ids. An extension with no code cannot
+    /// be told anything and is left out.
+    pub fn event_subscribers(&self) -> Vec<(Arc<str>, VisualMdEventsManifestEntry)> {
+        self.extensions
+            .iter()
+            .filter(|(_, extension)| extension.hooks.is_some())
+            .filter_map(|(extension_id, extension)| {
+                let events = extension.entry.events.as_ref()?;
+                events
+                    .is_subscribed()
+                    .then(|| (extension_id.clone(), events.clone()))
+            })
+            .collect()
+    }
+
+    /// The extensions that resolve links: which one handles each URL scheme, and
+    /// the ones that resolve `[[wikilinks]]`, in the order of their ids. An
+    /// extension with no code cannot resolve anything and is left out. When more
+    /// than one extension claims a scheme, the one whose id sorts first has it.
+    pub fn link_resolvers(&self) -> LinkResolvers {
+        let mut resolvers = LinkResolvers::default();
+        for (extension_id, extension) in &self.extensions {
+            let Some(links) = extension.entry.links.as_ref() else {
+                continue;
+            };
+            if extension.hooks.is_none() {
+                continue;
+            }
+            for scheme in &links.schemes {
+                resolvers
+                    .schemes
+                    .entry(scheme.clone())
+                    .or_insert_with(|| extension_id.clone());
+            }
+            if links.wikilinks {
+                resolvers.wikilinks.push(extension_id.clone());
+            }
+        }
+        resolvers
+    }
+
+    /// The extensions that suggest completions after `[[`, in the order of
+    /// their ids. An extension with no code cannot suggest anything.
+    pub fn wikilink_completers(&self) -> Vec<Arc<str>> {
+        self.extensions
+            .iter()
+            .filter(|(_, extension)| extension.hooks.is_some())
+            .filter(|(_, extension)| {
+                extension
+                    .entry
+                    .links
+                    .as_ref()
+                    .is_some_and(|links| links.wikilink_completions)
+            })
+            .map(|(extension_id, _)| extension_id.clone())
+            .collect()
+    }
+
+    pub fn complete(
+        &self,
+        extension_id: &str,
+        request: VisualMdCompletionRequest,
+        cx: &App,
+    ) -> Task<Result<Vec<VisualMdCompletionItem>, HookError>> {
+        self.call(extension_id, COMPLETION_TIMEOUT, cx, move |hooks| {
+            hooks.complete(request)
+        })
+    }
+
+    pub fn resolve_link(
+        &self,
+        extension_id: &str,
+        request: VisualMdLinkRequest,
+        cx: &App,
+    ) -> Task<Result<Option<VisualMdLinkTarget>, HookError>> {
+        self.call(extension_id, LINK_TIMEOUT, cx, move |hooks| {
+            hooks.resolve_link(request)
+        })
+    }
+
+    pub fn document_event(
+        &self,
+        extension_id: &str,
+        event: VisualMdDocumentEvent,
+        cx: &App,
+    ) -> Task<Result<(), HookError>> {
+        self.call(extension_id, EVENT_TIMEOUT, cx, move |hooks| {
+            hooks.document_event(event)
         })
     }
 
@@ -563,6 +707,10 @@ pub(crate) mod test_support {
     use super::*;
 
     type RuleResponder = Box<dyn Fn(&VisualMdRuleMatch) -> VisualMdRuleOutput + Send + Sync>;
+    type LinkResponder =
+        Box<dyn Fn(&VisualMdLinkRequest) -> Option<VisualMdLinkTarget> + Send + Sync>;
+    type CompletionResponder =
+        Box<dyn Fn(&VisualMdCompletionRequest) -> Vec<VisualMdCompletionItem> + Send + Sync>;
 
     #[derive(Clone)]
     pub(crate) enum Behavior {
@@ -581,8 +729,14 @@ pub(crate) mod test_support {
         calls: AtomicUsize,
         fence_requests: Mutex<Vec<VisualMdFenceRequest>>,
         command_contexts: Mutex<Vec<VisualMdCommandContext>>,
+        command_ids: Mutex<Vec<String>>,
         rule_responder: Mutex<RuleResponder>,
         rule_requests: Mutex<Vec<(String, Vec<VisualMdRuleMatch>)>>,
+        document_events: Mutex<Vec<VisualMdDocumentEvent>>,
+        link_responder: Mutex<LinkResponder>,
+        link_requests: Mutex<Vec<VisualMdLinkRequest>>,
+        completion_responder: Mutex<CompletionResponder>,
+        completion_requests: Mutex<Vec<VisualMdCompletionRequest>>,
         /// How many outputs to leave off an answer, to test a short one.
         rule_outputs_to_drop: AtomicUsize,
     }
@@ -597,8 +751,14 @@ pub(crate) mod test_support {
                 calls: AtomicUsize::new(0),
                 fence_requests: Mutex::new(Vec::new()),
                 command_contexts: Mutex::new(Vec::new()),
+                command_ids: Mutex::new(Vec::new()),
                 rule_responder: Mutex::new(Box::new(|_| VisualMdRuleOutput::default())),
                 rule_requests: Mutex::new(Vec::new()),
+                document_events: Mutex::new(Vec::new()),
+                link_responder: Mutex::new(Box::new(|_| None)),
+                link_requests: Mutex::new(Vec::new()),
+                completion_responder: Mutex::new(Box::new(|_| Vec::new())),
+                completion_requests: Mutex::new(Vec::new()),
                 rule_outputs_to_drop: AtomicUsize::new(0),
             })
         }
@@ -637,6 +797,60 @@ pub(crate) mod test_support {
 
         pub(crate) fn rule_requests(&self) -> Vec<(String, Vec<VisualMdRuleMatch>)> {
             self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
+        }
+
+        pub(crate) fn set_link_responder(
+            &self,
+            responder: impl Fn(&VisualMdLinkRequest) -> Option<VisualMdLinkTarget>
+            + Send
+            + Sync
+            + 'static,
+        ) {
+            *self
+                .link_responder
+                .lock()
+                .expect("the test lock is not poisoned") = Box::new(responder);
+        }
+
+        pub(crate) fn set_completion_responder(
+            &self,
+            responder: impl Fn(&VisualMdCompletionRequest) -> Vec<VisualMdCompletionItem>
+            + Send
+            + Sync
+            + 'static,
+        ) {
+            *self
+                .completion_responder
+                .lock()
+                .expect("the test lock is not poisoned") = Box::new(responder);
+        }
+
+        pub(crate) fn completion_requests(&self) -> Vec<VisualMdCompletionRequest> {
+            self.completion_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
+        }
+
+        pub(crate) fn link_requests(&self) -> Vec<VisualMdLinkRequest> {
+            self.link_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
+        }
+
+        pub(crate) fn document_events(&self) -> Vec<VisualMdDocumentEvent> {
+            self.document_events
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
+        }
+
+        pub(crate) fn command_ids(&self) -> Vec<String> {
+            self.command_ids
                 .lock()
                 .expect("the test lock is not poisoned")
                 .clone()
@@ -705,9 +919,13 @@ pub(crate) mod test_support {
 
         fn run_command(
             &self,
-            _command: String,
+            command: String,
             context: VisualMdCommandContext,
         ) -> BoxFuture<'static, Result<VisualMdCommandResult>> {
+            self.command_ids
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(command);
             self.command_contexts
                 .lock()
                 .expect("the test lock is not poisoned")
@@ -745,6 +963,44 @@ pub(crate) mod test_support {
                 .expect("the test lock is not poisoned")
                 .push((rule, matches));
             self.respond(outputs)
+        }
+
+        fn document_event(&self, event: VisualMdDocumentEvent) -> BoxFuture<'static, Result<()>> {
+            self.document_events
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(event);
+            self.respond(())
+        }
+
+        fn resolve_link(
+            &self,
+            request: VisualMdLinkRequest,
+        ) -> BoxFuture<'static, Result<Option<VisualMdLinkTarget>>> {
+            let target = (self
+                .link_responder
+                .lock()
+                .expect("the test lock is not poisoned"))(&request);
+            self.link_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(request);
+            self.respond(target)
+        }
+
+        fn complete(
+            &self,
+            request: VisualMdCompletionRequest,
+        ) -> BoxFuture<'static, Result<Vec<VisualMdCompletionItem>>> {
+            let items = (self
+                .completion_responder
+                .lock()
+                .expect("the test lock is not poisoned"))(&request);
+            self.completion_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push(request);
+            self.respond(items)
         }
     }
 
@@ -1085,6 +1341,55 @@ mod tests {
             render_fence(cx, "notes").await.is_ok(),
             "capacity frees up once the calls finish"
         );
+    }
+
+    #[gpui::test]
+    fn test_link_resolvers_are_the_extensions_with_code_that_declared_links(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let hooks = FakeHooks::new(&cx.executor(), Behavior::Succeed);
+        let links = |body: &str| format!("[visual_md.links]\n{body}");
+        register(
+            cx,
+            "zeta",
+            &links("schemes = [\"notes\", \"zeta\"]\nwikilinks = true\n"),
+            Some(hooks.clone()),
+        );
+        register(
+            cx,
+            "alpha",
+            &links("schemes = [\"notes\"]\nwikilinks = true\n"),
+            Some(hooks.clone()),
+        );
+        register(
+            cx,
+            "no-code",
+            &links("schemes = [\"ghost\"]\nwikilinks = true\n"),
+            None,
+        );
+        register(
+            cx,
+            "completions-only",
+            &links("wikilink_completions = true\n"),
+            Some(hooks),
+        );
+
+        cx.update(|cx| {
+            let resolvers = cx.global::<VisualMdExtensions>().link_resolvers();
+            assert_eq!(
+                resolvers.schemes,
+                BTreeMap::from([
+                    ("notes".to_string(), Arc::from("alpha")),
+                    ("zeta".to_string(), Arc::from("zeta")),
+                ]),
+                "the first id has a contested scheme, and an extension with no code has none"
+            );
+            assert_eq!(
+                resolvers.wikilinks,
+                vec![Arc::<str>::from("alpha"), Arc::from("zeta")]
+            );
+        });
     }
 
     #[gpui::test]
