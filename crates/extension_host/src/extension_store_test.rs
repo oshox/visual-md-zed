@@ -1186,6 +1186,129 @@ async fn test_visual_md_sample_extension(cx: &mut TestAppContext) {
         .expect_err("an unknown command is an error");
 }
 
+#[derive(Clone, Default)]
+struct KeepingVisualMdProxy {
+    extension: Arc<Mutex<Option<Arc<dyn Extension>>>>,
+}
+
+impl ExtensionVisualMdProxy for KeepingVisualMdProxy {
+    fn register_visual_md_extension(
+        &self,
+        _manifest: Arc<ExtensionManifest>,
+        _extension_dir: PathBuf,
+        extension: Option<Arc<dyn Extension>>,
+        _cx: &mut gpui::App,
+    ) {
+        *self.extension.lock() = extension;
+    }
+
+    fn unregister_visual_md_extension(&self, _extension_id: Arc<str>, _cx: &mut gpui::App) {
+        *self.extension.lock() = None;
+    }
+}
+
+/// Dropping any clone of a `WasmExtension` closes the channel all of its clones
+/// share. The store makes a clone for every extension it loads and, for one that
+/// registers no language server, context server or debug adapter, as a visual_md
+/// extension does not, used to drop it at once, which left the extension it had
+/// handed to the visual_md registry unable to run anything.
+#[gpui::test]
+async fn test_a_visual_md_extension_loaded_by_the_store_can_still_be_called(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.executor().allow_parking();
+
+    let sample_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../extensions/visual-md-sample");
+    let Ok(wasm_bytes) = std::fs::read(sample_dir.join("extension.wasm")) else {
+        eprintln!(
+            "skipping test_a_visual_md_extension_loaded_by_the_store_can_still_be_called: run `script/visual-md-wasm build-sample` first"
+        );
+        return;
+    };
+
+    let extensions_tree = TempTree::new(json!({
+        "installed": { "visual-md-sample": {} },
+        "work": {},
+    }));
+    let extensions_dir = extensions_tree
+        .path()
+        .canonicalize()
+        .expect("the extensions directory exists");
+    let installed = extensions_dir.join("installed/visual-md-sample");
+    for file in ["extension.toml", "Cargo.toml"] {
+        std::fs::copy(sample_dir.join(file), installed.join(file))
+            .expect("the sample's files are copied");
+    }
+    std::fs::write(installed.join("extension.wasm"), wasm_bytes)
+        .expect("the sample's wasm is copied");
+
+    let proxy = Arc::new(ExtensionHostProxy::new());
+    let keeping = KeepingVisualMdProxy::default();
+    proxy.register_visual_md_proxy(keeping.clone());
+
+    let http_client = FakeHttpClient::with_200_response();
+    let fs: Arc<dyn Fs> = RealFs::new(None, cx.executor());
+    let store = cx.new(|cx| {
+        ExtensionStore::new(
+            extensions_dir,
+            None,
+            proxy,
+            fs,
+            http_client.clone(),
+            http_client,
+            None,
+            NodeRuntime::unavailable(),
+            cx,
+        )
+    });
+    let mut events = cx.events(&store);
+    let executor = cx.executor();
+    let _debounce = cx.executor().spawn({
+        let executor = executor.clone();
+        async move {
+            while let Some(event) = events.next().await {
+                if let Event::StartedReloading = event {
+                    executor.advance_clock(RELOAD_DEBOUNCE_DURATION);
+                }
+            }
+        }
+    });
+    executor.advance_clock(RELOAD_DEBOUNCE_DURATION);
+
+    let mut registered = None;
+    for _ in 0..600 {
+        registered = keeping.extension.lock().clone();
+        if registered.is_some() {
+            break;
+        }
+        executor.timer(std::time::Duration::from_millis(50)).await;
+    }
+    let extension = registered.expect("the store registers the sample's hooks");
+
+    let rendered = extension
+        .visual_md_render_fence(
+            "sample-table".to_string(),
+            VisualMdFenceRequest {
+                language: "sample-table".to_string(),
+                info: "sample-table".to_string(),
+                content: "Name, Role\nAda, Dev".to_string(),
+                appearance: VisualMdAppearance::Dark,
+                path: None,
+            },
+        )
+        .await
+        .expect("the extension runs after the store has finished loading it");
+    assert_eq!(
+        rendered.output,
+        VisualMdFenceOutput::Markdown(
+            "| Name | Role |\n| --- | --- |\n| Ada | Dev |\n".to_string()
+        )
+    );
+    drop(store);
+}
+
 #[gpui::test]
 async fn test_extension_store_with_test_extension(cx: &mut TestAppContext) {
     init_test(cx);

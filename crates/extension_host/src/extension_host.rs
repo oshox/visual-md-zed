@@ -1662,8 +1662,25 @@ impl ExtensionStore {
             this.update(cx, |this, cx| {
                 this.reload_complete_senders.clear();
 
+                // Dropping any clone of a `WasmExtension` closes the channel all
+                // of them share, so the clone that hands the extension to the
+                // visual_md registry has to be the one that is kept, not a second
+                // clone made later while the first one has already been dropped.
+                let mut visual_md_extensions: HashMap<Arc<str>, Arc<dyn extension::Extension>> =
+                    HashMap::default();
+
                 for (manifest, wasm_extension) in &wasm_extensions {
                     let extension = Arc::new(wasm_extension.clone());
+                    if supports_visual_md(&wasm_extension.zed_api_version)
+                        && visual_md_manifests
+                            .iter()
+                            .any(|visual_md_manifest| visual_md_manifest.id == manifest.id)
+                    {
+                        visual_md_extensions.insert(
+                            manifest.id.clone(),
+                            extension.clone() as Arc<dyn extension::Extension>,
+                        );
+                    }
 
                     for (language_server_id, language_server_config) in &manifest.language_servers {
                         for language in language_server_config.languages() {
@@ -1704,23 +1721,19 @@ impl ExtensionStore {
                 }
 
                 for manifest in visual_md_manifests {
-                    let extension = wasm_extensions
-                        .iter()
-                        .find(|(wasm_manifest, _)| wasm_manifest.id == manifest.id)
-                        .and_then(|(_, wasm_extension)| {
-                            if supports_visual_md(&wasm_extension.zed_api_version) {
-                                Some(Arc::new(wasm_extension.clone())
-                                    as Arc<dyn extension::Extension>)
-                            } else {
-                                log::warn!(
-                                    "extension {} was built for extension API {}, which has no \
-                                    visual_md hooks; only its manifest entries apply",
-                                    manifest.id,
-                                    wasm_extension.zed_api_version
-                                );
-                                None
-                            }
-                        });
+                    let extension = visual_md_extensions.remove(&manifest.id);
+                    if extension.is_none()
+                        && let Some((_, wasm_extension)) = wasm_extensions
+                            .iter()
+                            .find(|(wasm_manifest, _)| wasm_manifest.id == manifest.id)
+                    {
+                        log::warn!(
+                            "extension {} was built for extension API {}, which has no \
+                            visual_md hooks; only its manifest entries apply",
+                            manifest.id,
+                            wasm_extension.zed_api_version
+                        );
+                    }
                     let extension_dir = root_dir.join(manifest.id.as_ref());
                     this.proxy
                         .register_visual_md_extension(manifest, extension_dir, extension, cx);

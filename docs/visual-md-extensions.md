@@ -2,19 +2,19 @@
 
 Extensions can hook into Zed MD's Markdown live preview. They are ordinary Zed
 extensions: WebAssembly components built on `zed_extension_api`, installed like
-any other. This guide covers what exists today. The milestone it belongs to,
-M15 in [`visual-md-milestones.md`](./visual-md-milestones.md), is being built in
-stages, and each stage adds its hooks here.
+any other. Milestone M15 in [`visual-md-milestones.md`](./visual-md-milestones.md)
+records how the hooks were built and what they cannot do.
 
-| Hook                           | Status    |
-| ------------------------------ | --------- |
-| Fenced code block renderers    | Available |
-| Editor commands                | Available |
-| Syntax rules and callouts      | Available |
-| Document events and outline    | Available |
-| Link provider                  | Available |
-| `/` and `[[` completions       | Available |
-| Extension settings             | Available |
+| Hook                        | Declared in                      | Export (if it needs code)   |
+| --------------------------- | -------------------------------- | --------------------------- |
+| Fenced code block renderers | `fence_renderers`                | `visual-md-render-fence`    |
+| Editor commands             | `[visual_md.commands.<id>]`      | `visual-md-run-command`     |
+| Syntax rules                | `[[visual_md.syntax_rules]]`     | `visual-md-apply-rule`      |
+| Callouts                    | `[visual_md.callouts.<name>]`    | none                        |
+| Document events, outline    | `[visual_md.events]`             | `visual-md-document-event`  |
+| Links                       | `[visual_md.links]`              | `visual-md-resolve-link`    |
+| `/` and `[[` completions    | `slash`, `wikilink_completions`  | `visual-md-complete`        |
+| Settings                    | `visual_md.extensions` (user)    | the `get-settings` import   |
 
 A working example is in [`extensions/visual-md-sample`](../extensions/visual-md-sample).
 
@@ -27,9 +27,9 @@ Upstream Zed has never released it, so:
   0.8.0 is still limited to development builds, as upstream has it.
 - Zed MD never advertises 0.9.0 to the extension registry, and the registry
   has no extensions for it. Install yours as a dev extension.
-- 0.9.0 is **unstable until M15 is finished**. Each stage adds exports to it, and
-  WebAssembly components are checked structurally, so an extension has to be
-  rebuilt against each stage.
+- 0.9.0 is **unstable until it is released**. It is a fork-only version: any
+  change to its interface, and WebAssembly components are checked structurally,
+  so an extension has to be rebuilt against the version of Zed MD it runs in.
 - Extensions can make network requests without declaring it, exactly as they
   can in upstream Zed. Process execution and file downloads still need the
   capabilities an extension declares. Review an extension's code before
@@ -375,10 +375,12 @@ export visual-md-document-event: func(event: document-event) -> result<_, string
 An extension is told about the events it turned on, for documents shown with
 live preview, and only for those:
 
-- `opened`: the document is shown with live preview in an editor for the first
-  time. Showing it again in another editor, a split for example, tells the
-  extension again; turning live preview off and on again in the same editor does
-  not.
+- `opened`: a document is shown with live preview in an editor. Each editor
+  tells each build of the extension once, so an extension that loads after the
+  document was opened, which is how it goes for documents restored at startup,
+  is told when it loads, and one that is reinstalled is told again. Showing the
+  document in another editor, a split for example, tells the extension again;
+  turning live preview off and on again in the same editor does not.
 - `saved`: the document was saved.
 - `changed`: the document was edited and then left alone for
   `changed_debounce_ms`, which is kept between 250 and 10,000 and is 1,000 when

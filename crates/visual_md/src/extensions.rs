@@ -540,6 +540,22 @@ impl VisualMdExtensions {
             .collect()
     }
 
+    /// The extensions that want to be told a document was opened, with the
+    /// generation of the build that does, so that a rebuilt extension is told
+    /// again. An extension with no code cannot be told anything.
+    pub fn opened_subscribers(&self) -> Vec<(Arc<str>, u64)> {
+        self.extensions
+            .iter()
+            .filter(|(_, extension)| extension.hooks.is_some())
+            .filter_map(|(extension_id, extension)| {
+                let events = extension.entry.events.as_ref()?;
+                events
+                    .opened
+                    .then(|| (extension_id.clone(), extension.generation))
+            })
+            .collect()
+    }
+
     /// The extensions that resolve links: which one handles each URL scheme, and
     /// the ones that resolve `[[wikilinks]]`, in the order of their ids. An
     /// extension with no code cannot resolve anything and is left out. When more
