@@ -20103,6 +20103,7 @@ dependencies = [
  "multi_buffer",
  "parking_lot",
  "project",
+ "regex",
  "release_channel",
  "schemars 1.0.4",
  "semver",

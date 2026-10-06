@@ -9,6 +9,23 @@ repository = "https://github.com/oshox/visual-md-zed"
 [visual_md]
 fence_renderers = ["sample-flow", "sample-table", "sample-styled"]
 
+[[visual_md.syntax_rules]]
+id = "mention"
+pattern = '@\w+'
+style = { color = "#3b82f6", font_weight = 600 }
+
+[[visual_md.syntax_rules]]
+id = "emoji"
+pattern = '(:)([a-z_]+)(:)'
+dynamic = true
+
+[visual_md.callouts.sample]
+title = "Sample"
+kind = "tip"
+icon = "icons/sample.svg"
+accent = "#a855f7"
+background = "#a855f71a"
+
 [visual_md.commands.uppercase]
 title = "Uppercase Selection"
 description = "Uppercases the selected text, or the current line when nothing is selected."

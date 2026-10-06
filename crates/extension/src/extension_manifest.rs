@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use util::paths::PathStyle;
 use util::rel_path::{RelPath, RelPathBuf};
 
-use crate::ExtensionCapability;
+use crate::{ExtensionCapability, VISUAL_MD_RULE_NODE_KINDS, VisualMdSpanStyle, is_hex_color};
 
 /// This is the old version of the extension manifest, from when it was `extension.json`.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -137,6 +137,64 @@ pub struct VisualMdManifestEntry {
     /// command is run as `<extension id>.<command id>`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub commands: BTreeMap<Arc<str>, VisualMdCommandManifestEntry>,
+    /// Rules that style, hide or replace text matching a pattern or a syntax
+    /// node, declared with `[[visual_md.syntax_rules]]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syntax_rules: Vec<VisualMdSyntaxRuleManifestEntry>,
+    /// Callout types this extension adds, keyed by the name used in
+    /// `> [!name]`. Matching ignores case.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub callouts: BTreeMap<Arc<str>, VisualMdCalloutManifestEntry>,
+}
+
+/// A syntax rule provided through `[[visual_md.syntax_rules]]`. It has exactly
+/// one of `pattern` and `node`.
+#[derive(Debug, PartialEq, Eq, Clone, Default, Serialize, Deserialize)]
+pub struct VisualMdSyntaxRuleManifestEntry {
+    /// Names the rule, for the extension's `visual-md-apply-rule`.
+    pub id: Arc<str>,
+    /// A regular expression, in the syntax of Rust's `regex` crate, matched
+    /// against the text of each paragraph, heading, list item and table cell,
+    /// outside inline code. A match never spans a line break.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// A kind of syntax node to match instead, one of
+    /// [`VISUAL_MD_RULE_NODE_KINDS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// How to style every match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<VisualMdSpanStyle>,
+    /// The capture groups of `pattern` to hide while the cursor is away from
+    /// the match. Group 0 is the whole match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide: Vec<usize>,
+    /// Whether the extension is asked what to do with each match, through
+    /// `visual-md-apply-rule`, on top of `style` and `hide`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic: bool,
+}
+
+/// A callout type provided through `[visual_md.callouts.<name>]`.
+#[derive(Debug, PartialEq, Eq, Clone, Default, Serialize, Deserialize)]
+pub struct VisualMdCalloutManifestEntry {
+    /// The title shown instead of the capitalized name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The built-in callout type whose look this one starts from, such as
+    /// `warning`. Without it the callout starts from the generic look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The icon: the name of one of Zed's icons, such as `star`, or the path of
+    /// an `.svg` file inside the extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// The accent color, as a hex string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    /// The background color, as a hex string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
 }
 
 /// An editor command provided through `[visual_md.commands.<id>]`.
@@ -150,6 +208,21 @@ pub struct VisualMdCommandManifestEntry {
 }
 
 impl VisualMdManifestEntry {
+    /// The paths, relative to the extension's directory, of the `.svg` files
+    /// its callouts use as icons. They have to ship with the extension.
+    pub fn callout_icon_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .callouts
+            .values()
+            .filter_map(|callout| callout.icon.as_deref())
+            .filter(|icon| icon.ends_with(".svg"))
+            .map(PathBuf::from)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
     /// Checks the entry, returning one message for each problem found. The
     /// extension's hooks should not be registered when there are any.
     pub fn validate(&self) -> Vec<String> {
@@ -179,7 +252,142 @@ impl VisualMdManifestEntry {
                 problems.push(format!("command {id:?} has no title"));
             }
         }
+        self.validate_syntax_rules(&mut problems);
+        self.validate_callouts(&mut problems);
         problems
+    }
+
+    fn validate_syntax_rules(&self, problems: &mut Vec<String>) {
+        let mut seen_ids = BTreeSet::new();
+        for rule in &self.syntax_rules {
+            let id = &rule.id;
+            let is_valid_id = !id.is_empty()
+                && id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character));
+            if !is_valid_id {
+                problems.push(format!(
+                    "syntax rule id {id:?} may only contain letters, digits, `-` and `_`"
+                ));
+            }
+            if !seen_ids.insert(id.clone()) {
+                problems.push(format!("syntax rule id {id:?} is used more than once"));
+            }
+
+            match (&rule.pattern, &rule.node) {
+                (Some(pattern), None) if pattern.is_empty() => {
+                    problems.push(format!("syntax rule {id:?} has an empty pattern"));
+                }
+                (Some(_), None) => {}
+                (None, Some(node)) => {
+                    if !VISUAL_MD_RULE_NODE_KINDS.contains(&node.as_str()) {
+                        problems.push(format!(
+                            "syntax rule {id:?} matches `{node}`, which is not one of: {}",
+                            VISUAL_MD_RULE_NODE_KINDS.join(", ")
+                        ));
+                    }
+                    if !rule.hide.is_empty() {
+                        problems.push(format!(
+                            "syntax rule {id:?} hides capture groups, which only a `pattern` has"
+                        ));
+                    }
+                }
+                _ => problems.push(format!(
+                    "syntax rule {id:?} must have exactly one of `pattern` and `node`"
+                )),
+            }
+
+            if rule.style.is_none() && rule.hide.is_empty() && !rule.dynamic {
+                problems.push(format!(
+                    "syntax rule {id:?} does nothing: it needs a `style`, `hide` or `dynamic = true`"
+                ));
+            }
+            if let Some(style) = &rule.style {
+                validate_span_style(&format!("syntax rule {id:?}"), style, problems);
+            }
+        }
+    }
+
+    fn validate_callouts(&self, problems: &mut Vec<String>) {
+        for (name, callout) in &self.callouts {
+            let is_valid_name = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character));
+            if !is_valid_name {
+                problems.push(format!(
+                    "callout name {name:?} may only contain letters, digits, `-` and `_`"
+                ));
+            }
+            let context = format!("callout {name:?}");
+            for (field, value) in [("title", &callout.title), ("kind", &callout.kind)] {
+                if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+                    problems.push(format!("{context} has an empty {field}"));
+                }
+            }
+            for (field, value) in [
+                ("accent", &callout.accent),
+                ("background", &callout.background),
+            ] {
+                if let Some(value) = value
+                    && !is_hex_color(value)
+                {
+                    problems.push(format!(
+                        "{context} has {field} {value:?}, which is not a hex color"
+                    ));
+                }
+            }
+            if let Some(icon) = &callout.icon {
+                if let Some(path) = icon.strip_suffix(".svg") {
+                    let path = std::path::Path::new(path);
+                    let stays_inside = !path.as_os_str().is_empty()
+                        && path
+                            .components()
+                            .all(|component| matches!(component, std::path::Component::Normal(_)));
+                    if !stays_inside {
+                        problems.push(format!(
+                            "{context} has icon {icon:?}, which is not a path inside the extension"
+                        ));
+                    }
+                } else if icon.is_empty()
+                    || !icon
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    problems.push(format!(
+                        "{context} has icon {icon:?}, which is neither an icon name nor an `.svg` path"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_span_style(context: &str, style: &VisualMdSpanStyle, problems: &mut Vec<String>) {
+    for (field, value) in [
+        ("color", &style.color),
+        ("background_color", &style.background_color),
+    ] {
+        if let Some(value) = value
+            && !is_hex_color(value)
+        {
+            problems.push(format!(
+                "{context} has {field} {value:?}, which is not a hex color"
+            ));
+        }
+    }
+    if style
+        .font_weight
+        .is_some_and(|weight| !(100..=900).contains(&weight))
+    {
+        problems.push(format!("{context} has a font_weight outside 100 to 900"));
+    }
+    if style
+        .theme_token
+        .as_ref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        problems.push(format!("{context} has an empty theme_token"));
     }
 }
 
@@ -658,6 +866,7 @@ title = "Insert Today's Date"
                     },
                 ),
             ]),
+            ..Default::default()
         };
 
         let problems = entry.validate();
@@ -790,5 +999,321 @@ title = "Insert Today's Date"
         "#};
         let manifest: ExtensionManifest = toml::from_str(&content).expect("manifest should parse");
         assert_eq!(manifest.languages, vec![rel_path_buf("foo/bar")]);
+    }
+
+    const VISUAL_MD_RULES_MANIFEST: &str = r##"
+id = "notes"
+name = "Notes"
+version = "1.0.0"
+schema_version = 1
+
+[visual_md]
+
+[[visual_md.syntax_rules]]
+id = "mention"
+pattern = '@(\w+)'
+style = { color = "#3b82f6", font_weight = 600 }
+
+[[visual_md.syntax_rules]]
+id = "emoji"
+pattern = '(:)(\w+)(:)'
+hide = [1, 3]
+dynamic = true
+
+[[visual_md.syntax_rules]]
+id = "comment"
+node = "html_tag"
+style = { theme_token = "comment", italic = true }
+
+[visual_md.callouts.sample]
+title = "Sample"
+kind = "tip"
+icon = "star"
+accent = "#a855f7"
+background = "#a855f71a"
+
+[visual_md.callouts.drawn]
+icon = "icons/drawn.svg"
+"##;
+
+    #[test]
+    fn test_visual_md_rules_and_callouts_are_parsed() {
+        let manifest: ExtensionManifest = toml::from_str(VISUAL_MD_RULES_MANIFEST).unwrap();
+        let visual_md = manifest.visual_md.as_ref().unwrap();
+
+        assert_eq!(visual_md.syntax_rules.len(), 3);
+        let mention = &visual_md.syntax_rules[0];
+        assert_eq!(mention.id.as_ref(), "mention");
+        assert_eq!(mention.pattern.as_deref(), Some(r"@(\w+)"));
+        assert_eq!(mention.node, None);
+        assert_eq!(mention.hide, Vec::<usize>::new());
+        assert!(!mention.dynamic);
+        assert_eq!(
+            mention.style,
+            Some(VisualMdSpanStyle {
+                color: Some("#3b82f6".to_string()),
+                font_weight: Some(600),
+                ..Default::default()
+            })
+        );
+
+        let emoji = &visual_md.syntax_rules[1];
+        assert_eq!(emoji.hide, vec![1, 3]);
+        assert!(emoji.dynamic);
+        assert_eq!(emoji.style, None);
+
+        let comment = &visual_md.syntax_rules[2];
+        assert_eq!(comment.node.as_deref(), Some("html_tag"));
+        assert_eq!(
+            comment.style.as_ref().and_then(|style| style.italic),
+            Some(true)
+        );
+
+        assert_eq!(visual_md.callouts.len(), 2);
+        assert_eq!(
+            visual_md.callouts.get("sample"),
+            Some(&VisualMdCalloutManifestEntry {
+                title: Some("Sample".to_string()),
+                kind: Some("tip".to_string()),
+                icon: Some("star".to_string()),
+                accent: Some("#a855f7".to_string()),
+                background: Some("#a855f71a".to_string()),
+            })
+        );
+        assert_eq!(visual_md.validate(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_visual_md_rules_and_callouts_round_trip() {
+        let manifest: ExtensionManifest = toml::from_str(VISUAL_MD_RULES_MANIFEST).unwrap();
+        let serialized = toml::to_string(&manifest).unwrap();
+        let reparsed: ExtensionManifest = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(reparsed.visual_md, manifest.visual_md);
+    }
+
+    fn rule(id: &str) -> VisualMdSyntaxRuleManifestEntry {
+        VisualMdSyntaxRuleManifestEntry {
+            id: id.into(),
+            pattern: Some("x".to_string()),
+            style: Some(VisualMdSpanStyle {
+                italic: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn problems_with(rules: Vec<VisualMdSyntaxRuleManifestEntry>) -> Vec<String> {
+        VisualMdManifestEntry {
+            syntax_rules: rules,
+            ..Default::default()
+        }
+        .validate()
+    }
+
+    #[test]
+    fn test_a_valid_rule_has_no_problems() {
+        assert_eq!(problems_with(vec![rule("fine-id_1")]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_rule_ids_must_be_valid_and_unique() {
+        let problems = problems_with(vec![rule("a"), rule("a"), rule("has space"), rule("")]);
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("more than once"))
+        );
+    }
+
+    #[test]
+    fn test_a_rule_needs_exactly_one_of_pattern_and_node() {
+        let neither = VisualMdSyntaxRuleManifestEntry {
+            pattern: None,
+            ..rule("neither")
+        };
+        let both = VisualMdSyntaxRuleManifestEntry {
+            node: Some("html_tag".to_string()),
+            ..rule("both")
+        };
+        let empty_pattern = VisualMdSyntaxRuleManifestEntry {
+            pattern: Some(String::new()),
+            ..rule("empty")
+        };
+
+        let problems = problems_with(vec![neither, both, empty_pattern]);
+
+        assert_eq!(problems.len(), 3, "{problems:?}");
+    }
+
+    #[test]
+    fn test_a_node_rule_must_name_an_allowed_kind_and_cannot_hide_groups() {
+        let node_rule = |node: &str, hide: Vec<usize>| VisualMdSyntaxRuleManifestEntry {
+            pattern: None,
+            node: Some(node.to_string()),
+            hide,
+            ..rule("node")
+        };
+
+        assert_eq!(
+            problems_with(vec![node_rule("html_tag", vec![])]),
+            Vec::<String>::new()
+        );
+        assert_eq!(problems_with(vec![node_rule("heading", vec![])]).len(), 1);
+        assert_eq!(problems_with(vec![node_rule("html_tag", vec![0])]).len(), 1);
+    }
+
+    #[test]
+    fn test_a_rule_must_do_something() {
+        let idle = VisualMdSyntaxRuleManifestEntry {
+            style: None,
+            ..rule("idle")
+        };
+        let hides = VisualMdSyntaxRuleManifestEntry {
+            style: None,
+            hide: vec![0],
+            ..rule("hides")
+        };
+        let dynamic = VisualMdSyntaxRuleManifestEntry {
+            style: None,
+            dynamic: true,
+            ..rule("dynamic")
+        };
+
+        let problems = problems_with(vec![idle, hides, dynamic]);
+
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("does nothing"));
+    }
+
+    #[test]
+    fn test_rule_styles_are_checked() {
+        let styled = |style: VisualMdSpanStyle| VisualMdSyntaxRuleManifestEntry {
+            style: Some(style),
+            ..rule("styled")
+        };
+        let valid_color = styled(VisualMdSpanStyle {
+            color: Some("#abc".to_string()),
+            background_color: Some("#aabbccdd".to_string()),
+            font_weight: Some(900),
+            ..Default::default()
+        });
+        let bad_color = styled(VisualMdSpanStyle {
+            color: Some("red".to_string()),
+            background_color: Some("#12345".to_string()),
+            ..Default::default()
+        });
+        let bad_weight = styled(VisualMdSpanStyle {
+            font_weight: Some(50),
+            ..Default::default()
+        });
+        let bad_token = styled(VisualMdSpanStyle {
+            theme_token: Some(" ".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(problems_with(vec![valid_color]), Vec::<String>::new());
+        assert_eq!(problems_with(vec![bad_color]).len(), 2);
+        assert_eq!(problems_with(vec![bad_weight]).len(), 1);
+        assert_eq!(problems_with(vec![bad_token]).len(), 1);
+    }
+
+    #[test]
+    fn test_callouts_are_checked() {
+        let callout = |name: &str, entry: VisualMdCalloutManifestEntry| VisualMdManifestEntry {
+            callouts: BTreeMap::from([(Arc::from(name), entry)]),
+            ..Default::default()
+        };
+        let problems =
+            |name: &str, entry: VisualMdCalloutManifestEntry| callout(name, entry).validate();
+        let with_icon = |icon: &str| VisualMdCalloutManifestEntry {
+            icon: Some(icon.to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(problems("fine", with_icon("star")), Vec::<String>::new());
+        assert_eq!(
+            problems("fine", with_icon("icons/star.svg")),
+            Vec::<String>::new()
+        );
+        assert_eq!(problems("two words", Default::default()).len(), 1);
+        for bad_icon in [
+            "../star.svg",
+            "/etc/star.svg",
+            ".svg",
+            "a/../../b.svg",
+            "star icon",
+            "",
+        ] {
+            assert_eq!(
+                problems("fine", with_icon(bad_icon)).len(),
+                1,
+                "icon {bad_icon:?} should be refused"
+            );
+        }
+        let bad_colors = VisualMdCalloutManifestEntry {
+            accent: Some("purple".to_string()),
+            background: Some("#zzz".to_string()),
+            title: Some(" ".to_string()),
+            kind: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(problems("fine", bad_colors).len(), 4);
+    }
+
+    #[test]
+    fn test_hex_colors() {
+        for color in ["#fff", "#ffff", "#ffffff", "#ffffffff", "#AbC123"] {
+            assert!(is_hex_color(color), "{color}");
+        }
+        for color in ["fff", "#ff", "#fffff", "#fffffffff", "#ggg", "red", "", "#"] {
+            assert!(!is_hex_color(color), "{color}");
+        }
+    }
+
+    #[test]
+    fn test_callout_icon_paths_lists_each_svg_once() {
+        let entry = VisualMdManifestEntry {
+            callouts: BTreeMap::from([
+                (
+                    Arc::from("a"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("icons/b.svg".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Arc::from("b"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("icons/b.svg".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Arc::from("c"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("icons/a.svg".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    Arc::from("d"),
+                    VisualMdCalloutManifestEntry {
+                        icon: Some("star".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (Arc::from("e"), VisualMdCalloutManifestEntry::default()),
+            ]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            entry.callout_icon_paths(),
+            vec![PathBuf::from("icons/a.svg"), PathBuf::from("icons/b.svg")]
+        );
     }
 }

@@ -125,4 +125,36 @@ interface visual-md {
         /// A message for the user.
         message: option<string>,
     }
+
+    /// A piece of text that matched one of the extension's `dynamic` syntax rules.
+    record rule-match {
+        /// The matched text. For a rule that matches a syntax node, the node's text.
+        text: string,
+        /// The range of each capture group of the rule's pattern within `text`,
+        /// group 0, the whole match, first. A group that took no part in the
+        /// match is `none`. A rule that matches a syntax node has only group 0.
+        captures: list<option<range>>,
+    }
+
+    /// Text to show in place of a range of a match.
+    record replacement {
+        /// The range to replace, in the coordinates of the matched text. It must
+        /// not be empty and must not contain a line break.
+        range: range,
+        /// What to show instead. It must not contain a line break.
+        text: string,
+    }
+
+    /// What a dynamic rule makes of one match. Every range is in UTF-8 bytes of
+    /// that match's text, so the same output serves the same text wherever it
+    /// appears in a document.
+    record rule-output {
+        /// Styles to apply.
+        spans: list<styled-span>,
+        /// Ranges to hide while the cursor is away from the match. They must not
+        /// contain a line break.
+        hidden: list<range>,
+        /// Text to show in place of ranges while the cursor is away from the match.
+        replacements: list<replacement>,
+    }
 }

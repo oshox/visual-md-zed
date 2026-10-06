@@ -22,7 +22,7 @@ purpose even though the app is branded Zed MD.
 | M12 | Inline images | Done |
 | M13 | Turn the editor off globally or per project, in settings.json and the settings UI | Done |
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
-| M15 | Extension hooks on par with Obsidian, Notion and Logseq | In progress: fence renderers and editor commands |
+| M15 | Extension hooks on par with Obsidian, Notion and Logseq | In progress: fence renderers, editor commands, syntax rules and callouts |
 
 ## M13: On/off switch at global and project level
 

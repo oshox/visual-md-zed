@@ -13,7 +13,10 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
+use extension::VisualMdSpanStyle;
 use tree_sitter::{Node, Parser, Tree};
+
+use crate::rules::{self, DynamicKey, DynamicResult, RuleHit, RuleSet};
 
 /// A persistent style to apply to a content span (never to its markers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +60,18 @@ impl CalloutKind {
             Self::Warning => "warning",
             Self::Danger => "danger",
             Self::Other => "other",
+        }
+    }
+
+    /// The kind a manifest names, by its canonical name or an alias, or `None`
+    /// for a name that is neither.
+    pub fn from_declared_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "other" => Some(Self::Other),
+            known => match Self::from_type_name(known) {
+                Self::Other => None,
+                kind => Some(kind),
+            },
         }
     }
 
@@ -222,6 +237,29 @@ pub struct Plan {
     /// selection does not touch. Such a block gets neither borders nor
     /// `code_fence_content`: the extension's output stands in for all of it.
     pub rendered_fences: Vec<RenderedFence>,
+    /// Styles that extensions' syntax rules give to ranges of text.
+    pub extension_styled: Vec<(Range<usize>, VisualMdSpanStyle)>,
+    /// Ranges that extensions' syntax rules replace with other text while no
+    /// selection touches their match. Each is on one line.
+    pub extension_replacements: Vec<(Range<usize>, String)>,
+    /// Matches of dynamic rules that no extension has answered for yet, once
+    /// each, for the caller to ask about.
+    pub missing_rule_inputs: Vec<MissingRuleInput>,
+    /// Scratch for the three lists below: what extensions' rules want hidden,
+    /// dimmed and replaced, filled in while walking and resolved against Zed
+    /// MD's own decorations before the plan is returned, which leaves them empty.
+    candidate_hidden: Vec<Range<usize>>,
+    candidate_dimmed: Vec<Range<usize>>,
+    candidate_replacements: Vec<(Range<usize>, String)>,
+}
+
+/// A match of a dynamic rule waiting for an extension's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingRuleInput {
+    pub key: DynamicKey,
+    /// The capture groups as they were where the match was first found. An
+    /// answer is filed under the match's text alone, so the first one wins.
+    pub captures: Vec<Option<Range<usize>>>,
 }
 
 /// A fenced code block that an extension renders, see `Plan::rendered_fences`.
@@ -387,6 +425,8 @@ pub struct PlanExtensions {
     /// The lowercased language tags of fenced code blocks that an extension
     /// renders in place of the block.
     pub rendered_fence_languages: HashSet<String>,
+    /// The syntax rules in force, and what extensions have answered for them.
+    pub rules: RuleSet,
 }
 
 /// [`plan_viewport_with_tree`], also planning what `extensions` claim.
@@ -419,6 +459,11 @@ pub fn plan_viewport_with_extensions(
         &mut plan,
     );
 
+    // Standalone images are planned before the extension candidates are
+    // resolved, since their rows are among the ranges extensions must stay off.
+    plan_images(text, selections, &visible_range, &mut plan);
+    resolve_extension_candidates(&mut plan);
+
     // Nested constructs (`***bold italic***`, and the grammar's own
     // self-nested `~~strikethrough~~` representation) each contribute their
     // own marker ranges independently, so an outer and inner construct can
@@ -434,7 +479,9 @@ pub fn plan_viewport_with_extensions(
     plan.dimmed_markers = merge_ranges(plan.dimmed_markers);
     plan.hidden_markers = subtract_ranges(&plan.hidden_markers, &plan.dimmed_markers);
 
-    plan_images(text, selections, &visible_range, &mut plan);
+    let mut seen_inputs = HashSet::new();
+    plan.missing_rule_inputs
+        .retain(|input| seen_inputs.insert(input.key.clone()));
 
     plan
 }
@@ -573,6 +620,167 @@ fn subtract_ranges(ranges: &[Range<usize>], subtract: &[Range<usize>]) -> Vec<Ra
     result
 }
 
+/// Turns one match of an extension's syntax rule into what the plan holds: its
+/// style, the capture groups it hides, and whatever the extension has answered
+/// for it, which is asked about if it has not been yet. While a selection
+/// touches the match, what would be hidden is dimmed instead and nothing is
+/// replaced, so the source can be edited.
+fn plan_rule_hit(hit: RuleHit, selections: &[Range<usize>], rule_set: &RuleSet, plan: &mut Plan) {
+    let visible_length = hit.text.trim_end_matches(['\n', '\r']).len();
+    let touched = touches_selection(
+        &(hit.range.start..hit.range.start + visible_length),
+        selections,
+    );
+    let shift_to_document =
+        |range: &Range<usize>| (range.start + hit.range.start)..(range.end + hit.range.start);
+    let hide = |plan: &mut Plan, range: Range<usize>| {
+        if touched {
+            plan.candidate_dimmed.push(range);
+        } else {
+            plan.candidate_hidden.push(range);
+        }
+    };
+
+    if let Some(style) = &hit.rule.style {
+        plan.extension_styled
+            .push((hit.range.clone(), style.clone()));
+    }
+    for group in &hit.rule.hide {
+        if let Some(Some(range)) = hit.captures.get(*group)
+            && !range.is_empty()
+        {
+            hide(plan, shift_to_document(range));
+        }
+    }
+
+    if !hit.rule.dynamic {
+        return;
+    }
+    let key = DynamicKey {
+        extension_id: hit.rule.extension_id.clone(),
+        generation: hit.rule.generation,
+        rule: hit.rule.id.clone(),
+        text: hit.text.clone(),
+    };
+    match rule_set.results.get(&key) {
+        Some(DynamicResult::Ready(effects)) => {
+            for (range, style) in &effects.styled {
+                plan.extension_styled
+                    .push((shift_to_document(range), style.clone()));
+            }
+            for range in &effects.hidden {
+                hide(plan, shift_to_document(range));
+            }
+            if !touched {
+                for (range, replacement) in &effects.replacements {
+                    plan.candidate_replacements
+                        .push((shift_to_document(range), replacement.clone()));
+                }
+            }
+        }
+        Some(DynamicResult::Failed) => {}
+        None => plan.missing_rule_inputs.push(MissingRuleInput {
+            key,
+            captures: hit.captures.clone(),
+        }),
+    }
+}
+
+/// Sorts `ranges` and drops the empty ones and any that overlap an earlier one.
+fn without_overlaps<T>(mut items: Vec<(Range<usize>, T)>) -> Vec<(Range<usize>, T)> {
+    items.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut covered_until = 0;
+    items.retain(|(range, _)| {
+        let keep = !range.is_empty() && range.start >= covered_until;
+        if keep {
+            covered_until = range.end;
+        }
+        keep
+    });
+    items
+}
+
+fn overlaps_any(sorted_disjoint: &[Range<usize>], range: &Range<usize>) -> bool {
+    let first = sorted_disjoint.partition_point(|candidate| candidate.end <= range.start);
+    sorted_disjoint
+        .get(first)
+        .is_some_and(|candidate| candidate.start < range.end)
+}
+
+/// Settles what extensions' rules wanted hidden, dimmed and replaced against
+/// everything Zed MD's own decorations occupy. Zed MD's win: a range of an
+/// extension that overlaps one of them is dropped, because two folds over the
+/// same text would panic the editor and a hidden marker must not be revealed by
+/// someone else's styling. Among extensions' own ranges, the leftmost wins.
+fn resolve_extension_candidates(plan: &mut Plan) {
+    let hidden = std::mem::take(&mut plan.candidate_hidden);
+    let dimmed = std::mem::take(&mut plan.candidate_dimmed);
+    let replacements = std::mem::take(&mut plan.candidate_replacements);
+    if hidden.is_empty() && dimmed.is_empty() && replacements.is_empty() {
+        return;
+    }
+
+    let mut occupied: Vec<Range<usize>> = plan
+        .hidden_markers
+        .iter()
+        .chain(&plan.dimmed_markers)
+        .chain(&plan.horizontal_rules)
+        .cloned()
+        .chain(plan.glyph_markers.iter().map(|(range, _)| range.clone()))
+        .chain(plan.checkboxes.iter().map(|(range, _)| range.clone()))
+        .chain(
+            plan.code_fence_borders
+                .iter()
+                .map(|(range, _)| range.clone()),
+        )
+        .chain(plan.images.iter().map(|image| image.range.clone()))
+        .chain(plan.rendered_fences.iter().map(|fence| fence.range.clone()))
+        .collect();
+    for callout in &plan.callouts {
+        occupied.push(callout.marker_range.clone());
+        if callout.fold.is_collapsed() {
+            occupied.push(callout.body_range.clone());
+        }
+    }
+    for table in &plan.tables {
+        occupied.extend(table.delimiter_line.iter().cloned());
+        for cell in table.rows.iter().flatten() {
+            occupied.push(cell.leading_gap.clone());
+            occupied.push(cell.trailing_gap.clone());
+        }
+    }
+    let occupied = merge_ranges(occupied);
+    let is_clear = |range: &Range<usize>| !overlaps_any(&occupied, range);
+
+    let hidden = without_overlaps(
+        hidden
+            .into_iter()
+            .filter(is_clear)
+            .map(|range| (range, ()))
+            .collect(),
+    );
+    let dimmed = without_overlaps(
+        dimmed
+            .into_iter()
+            .filter(is_clear)
+            .map(|range| (range, ()))
+            .collect(),
+    );
+    let hidden: Vec<Range<usize>> = hidden.into_iter().map(|(range, ())| range).collect();
+    let dimmed: Vec<Range<usize>> = dimmed.into_iter().map(|(range, ())| range).collect();
+    let touches_extension_range =
+        |range: &Range<usize>| overlaps_any(&hidden, range) || overlaps_any(&dimmed, range);
+
+    plan.extension_replacements = without_overlaps(
+        replacements
+            .into_iter()
+            .filter(|(range, _)| is_clear(range) && !touches_extension_range(range))
+            .collect(),
+    );
+    plan.hidden_markers.extend(hidden);
+    plan.dimmed_markers.extend(dimmed);
+}
+
 fn hash_text(text: &str) -> u64 {
     use std::hash::{DefaultHasher, Hasher};
 
@@ -606,13 +814,18 @@ fn walk_block(
     if !overlaps(&node.byte_range(), visible_range) {
         return;
     }
+    for rule in extensions.rules.node_rules(node.kind()) {
+        if let Some(hit) = rules::node_hit(rule, node.byte_range(), text) {
+            plan_rule_hit(hit, selections, &extensions.rules, plan);
+        }
+    }
     match node.kind() {
         "atx_heading" => {
-            plan_heading(node, text, selections, inline_parser, plan);
+            plan_heading(node, text, selections, inline_parser, extensions, plan);
             return;
         }
         "inline" | "pipe_table_cell" => {
-            plan_inline(node, text, selections, inline_parser, plan);
+            plan_inline(node, text, selections, inline_parser, extensions, plan);
             return;
         }
         "list" => {
@@ -709,6 +922,7 @@ fn plan_heading(
     text: &str,
     selections: &[Range<usize>],
     inline_parser: &mut Parser,
+    extensions: &PlanExtensions,
     plan: &mut Plan,
 ) {
     let Some(level) = heading_level(node) else {
@@ -733,7 +947,7 @@ fn plan_heading(
             plan.styled_spans
                 .push((content_range, SpanStyle::Heading(level)));
         }
-        plan_inline(content, text, selections, inline_parser, plan);
+        plan_inline(content, text, selections, inline_parser, extensions, plan);
     }
 }
 
@@ -1221,6 +1435,7 @@ fn plan_inline(
     text: &str,
     selections: &[Range<usize>],
     inline_parser: &mut Parser,
+    extensions: &PlanExtensions,
     plan: &mut Plan,
 ) {
     let range = inline_node.byte_range();
@@ -1269,8 +1484,15 @@ fn plan_inline(
         selections,
         plan,
         &mut code_ranges,
+        &extensions.rules,
+        &inline_text,
     );
     plan_highlight_marks(&inline_text, range.start, &code_ranges, selections, plan);
+
+    for hit in rules::find_pattern_hits(&extensions.rules, &inline_text, range.start, &code_ranges)
+    {
+        plan_rule_hit(hit, selections, &extensions.rules, plan);
+    }
 }
 
 fn walk_inline(
@@ -1279,7 +1501,22 @@ fn walk_inline(
     selections: &[Range<usize>],
     plan: &mut Plan,
     code_ranges: &mut Vec<Range<usize>>,
+    rule_set: &RuleSet,
+    inline_text: &str,
 ) {
+    for rule in rule_set.node_rules(node.kind()) {
+        let range = shift(node.byte_range(), offset);
+        let node_text = inline_text.get(node.byte_range());
+        if let Some(hit) = node_text.and_then(|node_text| {
+            rules::node_hit(rule, 0..node_text.len(), node_text).map(|mut hit| {
+                hit.range = range;
+                hit
+            })
+        }) {
+            plan_rule_hit(hit, selections, rule_set, plan);
+        }
+    }
+
     match node.kind() {
         "inline_link" => {
             plan_link(node, offset, selections, plan);
@@ -1316,7 +1553,15 @@ fn walk_inline(
         if node.kind() != "code_span" {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                walk_inline(child, offset, selections, plan, code_ranges);
+                walk_inline(
+                    child,
+                    offset,
+                    selections,
+                    plan,
+                    code_ranges,
+                    rule_set,
+                    inline_text,
+                );
             }
         }
         return;
@@ -1324,7 +1569,15 @@ fn walk_inline(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_inline(child, offset, selections, plan, code_ranges);
+        walk_inline(
+            child,
+            offset,
+            selections,
+            plan,
+            code_ranges,
+            rule_set,
+            inline_text,
+        );
     }
 }
 
@@ -2046,6 +2299,12 @@ mod tests {
             .cloned()
             .chain(result.checkboxes.iter().map(|(range, _)| range.clone()))
             .chain(result.glyph_markers.iter().map(|(range, _)| range.clone()))
+            .chain(
+                result
+                    .extension_replacements
+                    .iter()
+                    .map(|(range, _)| range.clone()),
+            )
             .collect();
         all.sort_by_key(|range| range.start);
         all
@@ -2522,6 +2781,7 @@ mod tests {
                 .iter()
                 .map(|language| language.to_string())
                 .collect(),
+            ..Default::default()
         };
         plan_viewport_with_extensions(text, &tree, selections, 0..text.len(), &extensions)
     }
@@ -2870,5 +3130,513 @@ mod tests {
         let result = plan_viewport(text, &[], 0..12);
         assert_eq!(result.images.len(), 1);
         assert_eq!(result.images[0].target, "x.png");
+    }
+
+    mod extension_rules {
+        use std::sync::Arc;
+
+        use extension::{VisualMdSpanStyle, VisualMdSyntaxRuleManifestEntry};
+
+        use super::*;
+        use crate::rules::{CompiledRule, RuleEffects};
+
+        fn italic() -> VisualMdSpanStyle {
+            VisualMdSpanStyle {
+                italic: Some(true),
+                ..Default::default()
+            }
+        }
+
+        fn pattern_rule(id: &str, pattern: &str) -> VisualMdSyntaxRuleManifestEntry {
+            VisualMdSyntaxRuleManifestEntry {
+                id: id.into(),
+                pattern: Some(pattern.to_string()),
+                style: Some(italic()),
+                ..Default::default()
+            }
+        }
+
+        fn hiding_rule(id: &str, pattern: &str, hide: &[usize]) -> VisualMdSyntaxRuleManifestEntry {
+            VisualMdSyntaxRuleManifestEntry {
+                style: None,
+                hide: hide.to_vec(),
+                ..pattern_rule(id, pattern)
+            }
+        }
+
+        fn node_rule(id: &str, node: &str) -> VisualMdSyntaxRuleManifestEntry {
+            VisualMdSyntaxRuleManifestEntry {
+                pattern: None,
+                node: Some(node.to_string()),
+                ..pattern_rule(id, "")
+            }
+        }
+
+        fn dynamic_rule(id: &str, pattern: &str) -> VisualMdSyntaxRuleManifestEntry {
+            VisualMdSyntaxRuleManifestEntry {
+                style: None,
+                dynamic: true,
+                ..pattern_rule(id, pattern)
+            }
+        }
+
+        fn rule_set(entries: &[VisualMdSyntaxRuleManifestEntry]) -> RuleSet {
+            RuleSet {
+                rules: entries
+                    .iter()
+                    .map(|entry| {
+                        Arc::new(
+                            CompiledRule::compile("notes".into(), 1, entry)
+                                .expect("the rule compiles"),
+                        )
+                    })
+                    .collect(),
+                results: Arc::default(),
+            }
+        }
+
+        fn plan_with(text: &str, selections: &[Range<usize>], rules: RuleSet) -> Plan {
+            plan_visible(text, selections, 0..text.len(), rules)
+        }
+
+        fn plan_visible(
+            text: &str,
+            selections: &[Range<usize>],
+            visible: Range<usize>,
+            rules: RuleSet,
+        ) -> Plan {
+            let tree = parse_blocks(text).expect("the document should parse");
+            let extensions = PlanExtensions {
+                rules,
+                ..Default::default()
+            };
+            plan_viewport_with_extensions(text, &tree, selections, visible, &extensions)
+        }
+
+        fn styled_ranges(plan: &Plan) -> Vec<Range<usize>> {
+            plan.extension_styled
+                .iter()
+                .map(|(range, _)| range.clone())
+                .collect()
+        }
+
+        fn missing_keys(plan: &Plan) -> Vec<DynamicKey> {
+            plan.missing_rule_inputs
+                .iter()
+                .map(|input| input.key.clone())
+                .collect()
+        }
+
+        fn key(rule: &str, text: &str) -> DynamicKey {
+            DynamicKey {
+                extension_id: "notes".into(),
+                generation: 1,
+                rule: rule.into(),
+                text: text.to_string(),
+            }
+        }
+
+        fn with_result(mut rules: RuleSet, key: DynamicKey, result: DynamicResult) -> RuleSet {
+            let mut results = (*rules.results).clone();
+            results.insert(key, result);
+            rules.results = Arc::new(results);
+            rules
+        }
+
+        fn ready(effects: RuleEffects) -> DynamicResult {
+            DynamicResult::Ready(Arc::new(effects))
+        }
+
+        #[test]
+        fn a_rule_styles_every_match() {
+            let result = plan_with(
+                "hi @ada and @bob\n",
+                &[],
+                rule_set(&[pattern_rule("mention", r"@\w+")]),
+            );
+
+            assert_eq!(styled_ranges(&result), vec![3..7, 12..16]);
+            assert_eq!(result.extension_styled[0].1, italic());
+        }
+
+        #[test]
+        fn without_rules_the_plan_is_what_it_always_was() {
+            let text = "# H\n\nhi @ada, **bold** and `code`\n\n- [ ] task\n";
+
+            assert_eq!(plan_with(text, &[], RuleSet::default()), plan(text, &[]));
+        }
+
+        #[test]
+        fn rules_apply_in_headings_lists_quotes_and_table_cells() {
+            let text = "# @head\n\n- @item\n\n> @quote\n\n| a | b |\n|---|---|\n| @cell | x |\n";
+
+            let result = plan_with(text, &[], rule_set(&[pattern_rule("m", r"@\w+")]));
+
+            let matched: Vec<&str> = styled_ranges(&result)
+                .into_iter()
+                .filter_map(|range| text.get(range))
+                .collect();
+            assert_eq!(matched, vec!["@head", "@item", "@quote", "@cell"]);
+        }
+
+        #[test]
+        fn rules_leave_inline_code_alone() {
+            let text = "`@ada` and @bob and `x @cy z`\n";
+
+            let result = plan_with(text, &[], rule_set(&[pattern_rule("m", r"@\w+")]));
+
+            assert_eq!(styled_ranges(&result), vec![11..15]);
+        }
+
+        #[test]
+        fn a_match_never_spans_a_line_break() {
+            let text = "one\ntwo\n";
+
+            let result = plan_with(text, &[], rule_set(&[pattern_rule("m", r"one\s+two")]));
+
+            assert!(result.extension_styled.is_empty());
+        }
+
+        #[test]
+        fn hidden_groups_are_hidden_until_a_selection_touches_the_match() {
+            let text = "say :smile: now\n";
+            let rules = rule_set(&[hiding_rule("emoji", r"(:)(\w+)(:)", &[1, 3])]);
+
+            let untouched = plan_with(text, &[], rules.clone());
+            assert_eq!(untouched.hidden_markers, vec![4..5, 10..11]);
+            assert!(untouched.dimmed_markers.is_empty());
+
+            let touched = plan_with(text, &[7..7], rules.clone());
+            assert!(touched.hidden_markers.is_empty());
+            assert_eq!(touched.dimmed_markers, vec![4..5, 10..11]);
+
+            let at_the_edge = plan_with(text, &[11..11], rules.clone());
+            assert_eq!(at_the_edge.dimmed_markers, vec![4..5, 10..11]);
+            let past_it = plan_with(text, &[12..12], rules);
+            assert_eq!(past_it.hidden_markers, vec![4..5, 10..11]);
+        }
+
+        #[test]
+        fn a_rule_may_hide_the_whole_match() {
+            let result = plan_with(
+                "a %% b\n",
+                &[],
+                rule_set(&[hiding_rule("gone", "%%", &[0])]),
+            );
+
+            assert_eq!(result.hidden_markers, vec![2..4]);
+        }
+
+        #[test]
+        fn extensions_never_override_zed_mds_own_hidden_markers() {
+            let text = "some **bold** text\n";
+            let rules = rule_set(&[hiding_rule("stars", r"\*\*bold\*\*", &[0])]);
+
+            let with_rule = plan_with(text, &[], rules);
+
+            assert_eq!(with_rule.hidden_markers, plan(text, &[]).hidden_markers);
+        }
+
+        #[test]
+        fn extensions_stay_off_bullets_checkboxes_and_callout_titles() {
+            for (text, pattern) in [
+                ("- item\n", "- item"),
+                ("1. item\n", r"1\. item"),
+                ("- [ ] task\n", r"\[ \]"),
+                ("> quote\n", "> quote"),
+                ("> [!note] title\n> body\n", r"\[!note\]"),
+            ] {
+                let with_rule = plan_with(text, &[], rule_set(&[hiding_rule("r", pattern, &[0])]));
+
+                assert_eq!(
+                    with_rule.hidden_markers,
+                    plan(text, &[]).hidden_markers,
+                    "{pattern} on {text:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn extensions_stay_off_table_gaps_and_the_delimiter_row() {
+            let text = "| a | b |\n|---|---|\n| c | d |\n";
+            let rules = rule_set(&[hiding_rule("r", r"[ -]+", &[0])]);
+
+            let with_rule = plan_with(text, &[], rules);
+
+            assert_eq!(with_rule.hidden_markers, plan(text, &[]).hidden_markers);
+        }
+
+        #[test]
+        fn overlapping_hides_from_rules_leave_the_leftmost() {
+            let rules = rule_set(&[
+                hiding_rule("wide", "abcd", &[0]),
+                hiding_rule("narrow", "cdef", &[0]),
+            ]);
+
+            let result = plan_with("abcdef\n", &[], rules);
+
+            assert_eq!(result.hidden_markers, vec![0..4]);
+        }
+
+        #[test]
+        fn a_missing_answer_is_asked_for_once_per_distinct_text() {
+            let rules = rule_set(&[dynamic_rule("emoji", r":\w+:")]);
+
+            let result = plan_with(":a: :b: :a:\n", &[], rules);
+
+            assert_eq!(
+                missing_keys(&result),
+                vec![key("emoji", ":a:"), key("emoji", ":b:")]
+            );
+        }
+
+        #[test]
+        fn an_answer_is_placed_at_each_match_and_not_asked_for_again() {
+            let effects = RuleEffects {
+                styled: vec![(1..3, italic())],
+                hidden: vec![0..1],
+                replacements: vec![(1..6, "🙂".to_string())],
+            };
+            let rules = with_result(
+                rule_set(&[dynamic_rule("emoji", r":\w+:")]),
+                key("emoji", ":smile:"),
+                ready(effects),
+            );
+
+            let result = plan_with("a :smile: b :smile:\n", &[], rules);
+
+            assert!(result.missing_rule_inputs.is_empty());
+            assert_eq!(styled_ranges(&result), vec![3..5, 13..15]);
+            assert_eq!(result.hidden_markers, vec![2..3, 12..13]);
+            assert_eq!(
+                result.extension_replacements,
+                vec![(3..8, "🙂".to_string()), (13..18, "🙂".to_string())]
+            );
+        }
+
+        #[test]
+        fn touching_a_match_dims_its_hidden_ranges_and_skips_its_replacements() {
+            let effects = RuleEffects {
+                styled: vec![(1..3, italic())],
+                hidden: vec![0..1],
+                replacements: vec![(1..6, "🙂".to_string())],
+            };
+            let rules = with_result(
+                rule_set(&[dynamic_rule("emoji", r":\w+:")]),
+                key("emoji", ":smile:"),
+                ready(effects),
+            );
+
+            let result = plan_with("a :smile: b\n", &[5..5], rules);
+
+            assert_eq!(styled_ranges(&result), vec![3..5], "the style stays");
+            assert!(result.hidden_markers.is_empty());
+            assert_eq!(result.dimmed_markers, vec![2..3]);
+            assert!(result.extension_replacements.is_empty());
+        }
+
+        #[test]
+        fn a_failed_answer_is_neither_applied_nor_asked_for_again() {
+            let rules = with_result(
+                rule_set(&[dynamic_rule("emoji", r":\w+:")]),
+                key("emoji", ":smile:"),
+                DynamicResult::Failed,
+            );
+
+            let result = plan_with("a :smile: b\n", &[], rules);
+
+            assert!(result.missing_rule_inputs.is_empty());
+            assert!(result.extension_styled.is_empty());
+            assert!(result.hidden_markers.is_empty());
+        }
+
+        #[test]
+        fn an_answer_for_another_build_of_the_extension_is_not_used() {
+            // The rule is from build 2 of the extension, the answer from build 1.
+            let rule = CompiledRule::compile("notes".into(), 2, &dynamic_rule("emoji", r":\w+:"))
+                .expect("the rule compiles");
+            let rules = with_result(
+                RuleSet {
+                    rules: Arc::from([Arc::new(rule)]),
+                    results: Arc::default(),
+                },
+                key("emoji", ":smile:"),
+                ready(RuleEffects {
+                    hidden: vec![0..1],
+                    ..Default::default()
+                }),
+            );
+
+            let result = plan_with(":smile:\n", &[], rules);
+
+            assert!(result.hidden_markers.is_empty());
+            assert_eq!(result.missing_rule_inputs.len(), 1);
+            assert_eq!(result.missing_rule_inputs[0].key.generation, 2);
+        }
+
+        #[test]
+        fn an_answer_cannot_replace_text_that_zed_md_has_folded() {
+            let effects = RuleEffects {
+                replacements: vec![(0..1, "x".to_string())],
+                ..Default::default()
+            };
+            let rules = with_result(
+                rule_set(&[dynamic_rule("task", r"\[ \] task")]),
+                key("task", "[ ] task"),
+                ready(effects),
+            );
+
+            let result = plan_with("- [ ] task\n", &[], rules);
+
+            assert!(result.extension_replacements.is_empty());
+        }
+
+        #[test]
+        fn rules_only_match_what_is_in_view() {
+            let text = "@first\n\n@second\n";
+            let second = text.find("@second").expect("the text has it");
+
+            let result = plan_visible(
+                text,
+                &[],
+                second..text.len(),
+                rule_set(&[pattern_rule("m", r"@\w+")]),
+            );
+
+            assert_eq!(styled_ranges(&result), vec![second..second + 7]);
+        }
+
+        #[test]
+        fn a_node_rule_styles_each_node_of_its_kind() {
+            let text = "see <b>bold</b> now\n";
+
+            let result = plan_with(text, &[], rule_set(&[node_rule("tags", "html_tag")]));
+
+            let tags: Vec<&str> = styled_ranges(&result)
+                .into_iter()
+                .filter_map(|range| text.get(range))
+                .collect();
+            assert_eq!(tags, vec!["<b>", "</b>"]);
+        }
+
+        /// The kinds a rule may name are the ones tree-sitter-md really emits for
+        /// the constructs below, checked against the grammar itself.
+        #[test]
+        fn every_allowed_node_kind_is_one_the_grammar_produces() {
+            let documents = [
+                ("html_tag", "see <b>bold</b>\n"),
+                (
+                    "full_reference_link",
+                    "a [text][1] b\n\n[1]: https://example.com\n",
+                ),
+                (
+                    "collapsed_reference_link",
+                    "a [text][] b\n\n[text]: https://example.com\n",
+                ),
+                (
+                    "shortcut_link",
+                    "a [text] b\n\n[text]: https://example.com\n",
+                ),
+                ("html_block", "<div>\nhello\n</div>\n"),
+                ("link_reference_definition", "[1]: https://example.com\n"),
+                ("minus_metadata", "---\ntitle: x\n---\n\nbody\n"),
+                ("plus_metadata", "+++\na = 1\n+++\n\nbody\n"),
+            ];
+            assert_eq!(
+                documents.len(),
+                extension::VISUAL_MD_RULE_NODE_KINDS.len(),
+                "a document for every allowed kind"
+            );
+            for (kind, text) in documents {
+                assert!(extension::VISUAL_MD_RULE_NODE_KINDS.contains(&kind));
+
+                let result = plan_with(text, &[], rule_set(&[node_rule("r", kind)]));
+
+                assert!(
+                    !result.extension_styled.is_empty(),
+                    "the grammar produced no `{kind}` for {text:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_node_rule_touched_by_the_selection_still_styles_but_dims_its_effects() {
+            let text = "see <b>bold</b> now\n";
+            let effects = RuleEffects {
+                hidden: vec![0..1],
+                ..Default::default()
+            };
+            let rules = with_result(
+                rule_set(&[VisualMdSyntaxRuleManifestEntry {
+                    dynamic: true,
+                    ..node_rule("tags", "html_tag")
+                }]),
+                key("tags", "<b>"),
+                ready(effects),
+            );
+
+            let untouched = plan_with(text, &[], rules.clone());
+            assert_eq!(untouched.hidden_markers, vec![4..5]);
+
+            let touched = plan_with(text, &[5..5], rules);
+            assert_eq!(touched.dimmed_markers, vec![4..5]);
+        }
+
+        #[test]
+        fn extension_ranges_in_random_documents_never_overlap_anything_or_panic() {
+            let mut rng = Rng(0x7a3b_91c4_5d2e_8f01);
+            let entries = [
+                pattern_rule("word", r"[a-z]{3,}"),
+                hiding_rule("pair", r"(\*)(\w+)(\*)", &[1, 3]),
+                hiding_rule("mark", r"[=\-|>]+", &[0]),
+                hiding_rule("bracket", r"\[[ x]\]", &[0]),
+                dynamic_rule("any", r"\w+"),
+                node_rule("tag", "html_tag"),
+            ];
+            let text_pool = ["bold", "tag", "other"];
+            for _ in 0..200 {
+                let lines = 1 + rng.below(30);
+                let text = random_document(&mut rng, lines);
+                let mut rules = rule_set(&entries);
+                // Answer some dynamic matches so their hides and replacements get exercised.
+                for word in text_pool {
+                    let effects = RuleEffects {
+                        styled: vec![(0..1, italic())],
+                        hidden: vec![0..1],
+                        replacements: vec![(1..word.len().clamp(2, 3), "x".to_string())],
+                    };
+                    rules = with_result(rules, key("any", word), ready(effects));
+                }
+                let selections = if rng.below(2) == 0 {
+                    vec![]
+                } else {
+                    let start = rng.below(text.len() + 1);
+                    let end = start + rng.below(text.len() + 1 - start);
+                    vec![start..end]
+                };
+
+                let result = plan_with(&text, &selections, rules);
+
+                assert_no_overlaps(&fold_inducing_ranges(&result), &text);
+                for range in fold_inducing_ranges(&result) {
+                    assert!(range.end <= text.len(), "{range:?} for {text:?}");
+                    assert!(
+                        !text[range.clone()].contains('\n'),
+                        "a fold over a line break at {range:?} for {text:?}"
+                    );
+                }
+                for (range, _) in &result.extension_styled {
+                    assert!(range.end <= text.len() && text.is_char_boundary(range.start));
+                }
+                assert!(
+                    result
+                        .extension_replacements
+                        .iter()
+                        .all(|(range, replacement)| {
+                            !replacement.contains('\n') && !range.is_empty()
+                        })
+                );
+            }
+        }
     }
 }

@@ -388,6 +388,35 @@ async fn copy_extension_resources(
         .await?;
     }
 
+    if let Some(visual_md) = manifest.visual_md.as_ref() {
+        futures::future::try_join_all(visual_md.callout_icon_paths().into_iter().map(
+            |icon_path| {
+                let fs = fs.clone();
+                async move {
+                    if let Some(parent) = icon_path
+                        .parent()
+                        .filter(|parent| parent.components().next().is_some())
+                    {
+                        fs.create_dir(&output_dir.join(parent)).await?;
+                    }
+                    fs.copy_file(
+                        &extension_path.join(&icon_path),
+                        &output_dir.join(&icon_path),
+                        CopyOptions {
+                            overwrite: true,
+                            ignore_if_exists: false,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("failed to copy callout icon '{}'", icon_path.display())
+                    })
+                }
+            },
+        ))
+        .await?;
+    }
+
     Ok(())
 }
 

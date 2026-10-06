@@ -10,7 +10,7 @@ stages, and each stage adds its hooks here.
 | ------------------------------ | --------- |
 | Fenced code block renderers    | Available |
 | Editor commands                | Available |
-| Syntax rules and callouts      | Planned   |
+| Syntax rules and callouts      | Available |
 | Events, outline, link provider | Planned   |
 | `/` and `[[` completions       | Planned   |
 | Extension settings             | Planned   |
@@ -130,6 +130,8 @@ Everything lives under `[visual_md]` in `extension.toml`.
 | --- | --- |
 | `fence_renderers` | Language tags of the fenced code blocks the extension renders. Any case. |
 | `[visual_md.commands.<id>]` | An editor command. `title` is required, `description` is optional. |
+| `[[visual_md.syntax_rules]]` | A rule that styles, hides or replaces text. See below. |
+| `[visual_md.callouts.<name>]` | A callout type, written `> [!name]`. See below. |
 
 Command ids may contain letters, digits, `-` and `_`. A command is run as
 `<extension id>.<command id>`. An invalid `[visual_md]` section is logged and the
@@ -138,7 +140,8 @@ language, the one whose id sorts first renders it.
 
 A `[visual_md]` section in an extension with no wasm registers its
 declarations but has nothing to run, so a declared renderer or command reports
-that it has no code. Later stages add declarations that need no code.
+that it has no code. Syntax rules without `dynamic = true`, and callouts, need
+no code, so an extension can be only a manifest.
 
 ## Fenced code block renderers
 
@@ -241,6 +244,115 @@ or bind it in a keymap:
 }
 ```
 
+## Syntax rules
+
+A syntax rule styles, hides or replaces text that matches a pattern.
+
+```toml
+[[visual_md.syntax_rules]]
+id = "mention"
+pattern = '@\w+'
+style = { color = "#3b82f6", font_weight = 600 }
+
+[[visual_md.syntax_rules]]
+id = "emoji"
+pattern = '(:)([a-z_]+)(:)'
+dynamic = true
+```
+
+| Key | Meaning |
+| --- | --- |
+| `id` | Names the rule. Letters, digits, `-` and `_`, unique in the extension. |
+| `pattern` | A regular expression in the syntax of Rust's `regex` crate. |
+| `node` | Instead of `pattern`, a kind of syntax node to match. See below. |
+| `style` | How to style every match: `color` and `background_color` as hex, `theme_token`, `font_weight`, `italic`, `underline`, `strikethrough`. |
+| `hide` | Capture groups of `pattern` to hide. Group 0 is the whole match. |
+| `dynamic` | Ask the extension what to do with each match. See below. |
+
+A rule has exactly one of `pattern` and `node`, and must do something: it needs
+a `style`, a `hide` or `dynamic = true`. A pattern must not match the empty
+string, and a pattern too large to compile, or one that hides a group it does
+not have, is logged and the rule left out.
+
+A `pattern` is matched against the text of paragraphs, headings, list items,
+quotes and table cells, outside inline code. A match never spans a line break.
+A `node` is one of `html_tag`, `full_reference_link`, `collapsed_reference_link`,
+`shortcut_link`, `html_block`, `link_reference_definition`, `minus_metadata` (a
+`---` front matter block) or `plus_metadata` (`+++`). They are the constructs
+Zed MD's Markdown grammar produces and Zed MD does not itself decorate.
+
+Hidden text comes back, dimmed, while a selection touches the match, so that it
+can be edited, and the match shows its source again. A style stays. An
+extension's style is drawn over Zed MD's own where it sets the same thing.
+
+Zed MD's own decorations win. Text an extension asks to hide or replace is left
+alone when it overlaps anything Zed MD folds or reveals itself: its hidden
+markers, bullets, checkboxes, callout titles, table pipes, spacing and
+delimiter rows, rules, images and fenced blocks. Where two extensions' ranges
+overlap, the leftmost wins.
+
+### Dynamic rules
+
+With `dynamic = true` the extension is asked about the matches, on top of the
+rule's `style` and `hide`:
+
+```wit
+export visual-md-apply-rule: func(
+    rule: string,
+    matches: list<rule-match>,
+) -> result<list<rule-output>, string>;
+```
+
+A `rule-match` has the matched `text` and the range of each capture group
+within it, group 0 first (`none` for a group that took no part). Answer with one
+`rule-output` per match, in order: `spans` (styles), `hidden` ranges and
+`replacements` (a range and the text to show in its place). Every range is in
+the coordinates of the match's text, so one answer serves the same text wherever
+it appears; it is filed under the extension build, the rule and the text, and
+the first place a text was seen supplies the capture groups.
+
+Until the answer arrives the match shows as written; the answer is applied
+when it lands. Hidden ranges and replacements are only applied while no
+selection touches the match. Whatever cannot be used is dropped and the rest
+kept: ranges that are empty, out of bounds, off a character boundary or
+overlapping an earlier one, hidden ranges and replacements with a line break,
+replacements over 200 characters, and replacements that overlap a hidden range.
+A call that fails, times out or returns the wrong number of outputs leaves all
+its matches as written, and they are not asked about again until the extension
+is reloaded.
+
+## Callouts
+
+```toml
+[visual_md.callouts.todo]
+title = "To do"
+kind = "tip"
+icon = "icons/todo.svg"
+accent = "#a855f7"
+background = "#a855f71a"
+```
+
+`> [!todo]` then shows as a callout box like the built-in ones. Names ignore
+case, and when two extensions register one, the one whose id sorts first wins.
+Every key is optional.
+
+- `title` is shown instead of the capitalized name.
+- `kind` is the built-in callout a type starts from: `note`, `tip`, `warning`
+  or `danger`, or an alias such as `info`, `success`, `caution` or `error`. It
+  decides the defaults for what is not set. It replaces the generic kind of a
+  name Zed MD does not know, and never changes a built-in name's kind. An
+  unknown kind is logged and the callout left out.
+- `icon` is the name of one of Zed's icons, such as `star`, or the path of an
+  `.svg` file inside the extension. An unknown icon name falls back to the
+  kind's icon.
+- `accent` and `background` are hex colors.
+
+What the user sets for the name in `visual_md.callouts` or
+`visual_md.colors.callout`, and what the theme sets in a
+`visual_md.callout.<name>` token, still win over the extension. The extension
+wins over what is set for the kind and over the kind's defaults. SVG files
+declared as icons are packaged with the extension.
+
 ## Limits
 
 An extension runs in the same process as Zed, one call at a time, so Zed guards
@@ -250,6 +362,9 @@ every call into it:
 | --- | --- |
 | Time for a fence render | 5 seconds |
 | Time for a command | 10 seconds |
+| Time for a dynamic rule call | 1 second |
+| Matches in one dynamic rule call | 256, each distinct text once |
+| Replacement text | 200 characters, one line |
 | Calls in flight per extension | 4. More wait their turn. |
 | Text output | 1 MB for Markdown, SVG and styled text |
 | Image output | 16 MB |

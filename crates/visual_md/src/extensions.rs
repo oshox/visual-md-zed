@@ -6,6 +6,7 @@
 //! finishes, the way `ensure_code_languages_loaded` does for grammars.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -14,14 +15,24 @@ use anyhow::Result;
 use extension::{
     Extension, ExtensionHostProxy, ExtensionManifest, ExtensionVisualMdProxy,
     VisualMdCommandContext, VisualMdCommandResult, VisualMdFenceRequest, VisualMdFenceResult,
-    VisualMdManifestEntry,
+    VisualMdManifestEntry, VisualMdRuleMatch, VisualMdRuleOutput,
 };
 use futures::FutureExt as _;
 use futures::future::{BoxFuture, Either, select};
-use gpui::{App, AppContext as _, BorrowAppContext as _, Global, Task};
+use gpui::{App, AppContext as _, AsyncApp, BorrowAppContext as _, Global, Task};
+
+use crate::plan::CalloutKind;
+use crate::rules::CompiledRule;
 
 pub const FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RULE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// An extension answers "busy" while it has several requests running, which
+/// happens when a document needs more of them at once than it may have. A
+/// request waits its turn instead of failing.
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(100);
+const BUSY_RETRIES: usize = 100;
 
 const MAX_IN_FLIGHT_CALLS_PER_EXTENSION: usize = 4;
 const FAILURES_BEFORE_DISABLING: usize = 3;
@@ -40,6 +51,12 @@ pub trait VisualMdHooks: Send + Sync + 'static {
         command: String,
         context: VisualMdCommandContext,
     ) -> BoxFuture<'static, Result<VisualMdCommandResult>>;
+
+    fn apply_rule(
+        &self,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+    ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>>;
 }
 
 struct ExtensionHooks(Arc<dyn Extension>);
@@ -61,6 +78,15 @@ impl VisualMdHooks for ExtensionHooks {
     ) -> BoxFuture<'static, Result<VisualMdCommandResult>> {
         let extension = self.0.clone();
         async move { extension.visual_md_run_command(command, context).await }.boxed()
+    }
+
+    fn apply_rule(
+        &self,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+    ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>> {
+        let extension = self.0.clone();
+        async move { extension.visual_md_apply_rule(rule, matches).await }.boxed()
     }
 }
 
@@ -128,9 +154,32 @@ impl Drop for InFlightCall {
 struct RegisteredExtension {
     name: String,
     entry: VisualMdManifestEntry,
+    rules: Vec<Arc<CompiledRule>>,
+    callouts: BTreeMap<String, ExtensionCallout>,
     hooks: Option<Arc<dyn VisualMdHooks>>,
     health: Arc<Health>,
     generation: u64,
+}
+
+/// Where a callout's icon comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionCalloutIcon {
+    /// The name of one of Zed's own icons.
+    Name(String),
+    /// An `.svg` file in the extension's directory.
+    Svg(PathBuf),
+}
+
+/// A callout type an extension registered. The fields are as the manifest gave
+/// them, except that the kind is known to be valid; the colors and the icon
+/// name are checked when a look is built from them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionCallout {
+    pub title: Option<String>,
+    pub kind: Option<CalloutKind>,
+    pub icon: Option<ExtensionCalloutIcon>,
+    pub accent: Option<String>,
+    pub background: Option<String>,
 }
 
 /// A renderer an extension registered for a fenced code block language.
@@ -185,11 +234,12 @@ impl ExtensionVisualMdProxy for VisualMdProxy {
     fn register_visual_md_extension(
         &self,
         manifest: Arc<ExtensionManifest>,
+        extension_dir: PathBuf,
         extension: Option<Arc<dyn Extension>>,
         cx: &mut App,
     ) {
         let hooks = extension.map(|extension| Arc::new(ExtensionHooks(extension)) as _);
-        VisualMdExtensions::register(&manifest, hooks, cx);
+        VisualMdExtensions::register(&manifest, &extension_dir, hooks, cx);
     }
 
     fn unregister_visual_md_extension(&self, extension_id: Arc<str>, cx: &mut App) {
@@ -203,6 +253,7 @@ impl VisualMdExtensions {
     /// registered at all.
     pub fn register(
         manifest: &ExtensionManifest,
+        extension_dir: &Path,
         hooks: Option<Arc<dyn VisualMdHooks>>,
         cx: &mut App,
     ) {
@@ -240,15 +291,68 @@ impl VisualMdExtensions {
                     );
                 }
             }
+            let generation = registry.registrations;
+            let rules = entry
+                .syntax_rules
+                .iter()
+                .filter_map(|rule| {
+                    match CompiledRule::compile(extension_id.clone(), generation, rule) {
+                        Ok(rule) => Some(Arc::new(rule)),
+                        Err(error) => {
+                            log::error!(
+                                "not using syntax rule {} of extension {extension_id}: {error}",
+                                rule.id
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
+            let callouts = entry
+                .callouts
+                .iter()
+                .filter_map(|(callout_name, callout)| {
+                    let kind = match callout.kind.as_deref().map(CalloutKind::from_declared_name) {
+                        Some(None) => {
+                            log::error!(
+                                "not using callout {callout_name} of extension {extension_id}: \
+                                {:?} is not a callout kind",
+                                callout.kind
+                            );
+                            return None;
+                        }
+                        Some(Some(kind)) => Some(kind),
+                        None => None,
+                    };
+                    Some((
+                        callout_name.to_lowercase(),
+                        ExtensionCallout {
+                            title: callout.title.clone(),
+                            kind,
+                            icon: callout.icon.as_ref().map(|icon| {
+                                if icon.ends_with(".svg") {
+                                    ExtensionCalloutIcon::Svg(extension_dir.join(icon))
+                                } else {
+                                    ExtensionCalloutIcon::Name(icon.clone())
+                                }
+                            }),
+                            accent: callout.accent.clone(),
+                            background: callout.background.clone(),
+                        },
+                    ))
+                })
+                .collect();
             let health = Arc::new(Health::new(extension_id.clone()));
             registry.extensions.insert(
                 extension_id,
                 RegisteredExtension {
                     name,
                     entry,
+                    rules,
+                    callouts,
                     hooks,
                     health,
-                    generation: registry.registrations,
+                    generation,
                 },
             );
         });
@@ -291,6 +395,29 @@ impl VisualMdExtensions {
                     renderer: renderer.clone(),
                 })
             })
+    }
+
+    /// The syntax rules of every extension, by extension id and then in the
+    /// order they were declared. A rule that could not be compiled is left out.
+    pub fn syntax_rules(&self) -> Vec<Arc<CompiledRule>> {
+        self.extensions
+            .values()
+            .flat_map(|extension| extension.rules.iter().cloned())
+            .collect()
+    }
+
+    /// The callout types extensions registered, by lowercased name. When more
+    /// than one extension registers a name, the one whose id sorts first wins.
+    pub fn callouts(&self) -> BTreeMap<String, ExtensionCallout> {
+        let mut callouts = BTreeMap::new();
+        for extension in self.extensions.values() {
+            for (name, callout) in &extension.callouts {
+                callouts
+                    .entry(name.clone())
+                    .or_insert_with(|| callout.clone());
+            }
+        }
+        callouts
     }
 
     pub fn commands(&self) -> Vec<ExtensionCommand> {
@@ -345,6 +472,18 @@ impl VisualMdExtensions {
         })
     }
 
+    pub fn apply_rule(
+        &self,
+        extension_id: &str,
+        rule: String,
+        matches: Vec<VisualMdRuleMatch>,
+        cx: &App,
+    ) -> Task<Result<Vec<VisualMdRuleOutput>, HookError>> {
+        self.call(extension_id, RULE_TIMEOUT, cx, move |hooks| {
+            hooks.apply_rule(rule, matches)
+        })
+    }
+
     /// Calls into an extension with the limits every hook shares: a timeout, at
     /// most a few requests in flight, and no calls at all once the extension
     /// has failed several times in a row.
@@ -394,6 +533,25 @@ impl VisualMdExtensions {
     }
 }
 
+/// Makes a call into an extension, starting it again for as long as the
+/// extension refuses it as busy, for a bounded time.
+pub(crate) async fn when_not_busy<T: Send + 'static>(
+    cx: &mut AsyncApp,
+    mut start: impl FnMut(&App) -> Task<Result<T, HookError>>,
+) -> Result<T, HookError> {
+    let mut retries = 0;
+    loop {
+        let call = cx.update(|cx| start(cx));
+        match call.await {
+            Err(HookError::Busy(_)) if retries < BUSY_RETRIES => {
+                retries += 1;
+                cx.background_executor().timer(BUSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Mutex;
@@ -403,6 +561,8 @@ pub(crate) mod test_support {
     use gpui::BackgroundExecutor;
 
     use super::*;
+
+    type RuleResponder = Box<dyn Fn(&VisualMdRuleMatch) -> VisualMdRuleOutput + Send + Sync>;
 
     #[derive(Clone)]
     pub(crate) enum Behavior {
@@ -421,6 +581,10 @@ pub(crate) mod test_support {
         calls: AtomicUsize,
         fence_requests: Mutex<Vec<VisualMdFenceRequest>>,
         command_contexts: Mutex<Vec<VisualMdCommandContext>>,
+        rule_responder: Mutex<RuleResponder>,
+        rule_requests: Mutex<Vec<(String, Vec<VisualMdRuleMatch>)>>,
+        /// How many outputs to leave off an answer, to test a short one.
+        rule_outputs_to_drop: AtomicUsize,
     }
 
     impl FakeHooks {
@@ -433,6 +597,9 @@ pub(crate) mod test_support {
                 calls: AtomicUsize::new(0),
                 fence_requests: Mutex::new(Vec::new()),
                 command_contexts: Mutex::new(Vec::new()),
+                rule_responder: Mutex::new(Box::new(|_| VisualMdRuleOutput::default())),
+                rule_requests: Mutex::new(Vec::new()),
+                rule_outputs_to_drop: AtomicUsize::new(0),
             })
         }
 
@@ -452,6 +619,27 @@ pub(crate) mod test_support {
                 .command_result
                 .lock()
                 .expect("the test lock is not poisoned") = result;
+        }
+
+        pub(crate) fn set_rule_responder(
+            &self,
+            responder: impl Fn(&VisualMdRuleMatch) -> VisualMdRuleOutput + Send + Sync + 'static,
+        ) {
+            *self
+                .rule_responder
+                .lock()
+                .expect("the test lock is not poisoned") = Box::new(responder);
+        }
+
+        pub(crate) fn drop_rule_outputs(&self, count: usize) {
+            self.rule_outputs_to_drop.store(count, Ordering::Relaxed);
+        }
+
+        pub(crate) fn rule_requests(&self) -> Vec<(String, Vec<VisualMdRuleMatch>)> {
+            self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .clone()
         }
 
         pub(crate) fn command_contexts(&self) -> Vec<VisualMdCommandContext> {
@@ -531,6 +719,33 @@ pub(crate) mod test_support {
                 .clone();
             self.respond(result)
         }
+
+        fn apply_rule(
+            &self,
+            rule: String,
+            matches: Vec<VisualMdRuleMatch>,
+        ) -> BoxFuture<'static, Result<Vec<VisualMdRuleOutput>>> {
+            let mut outputs: Vec<VisualMdRuleOutput> = {
+                let responder = self
+                    .rule_responder
+                    .lock()
+                    .expect("the test lock is not poisoned");
+                matches
+                    .iter()
+                    .map(|rule_match| responder(rule_match))
+                    .collect()
+            };
+            outputs.truncate(
+                outputs
+                    .len()
+                    .saturating_sub(self.rule_outputs_to_drop.load(Ordering::Relaxed)),
+            );
+            self.rule_requests
+                .lock()
+                .expect("the test lock is not poisoned")
+                .push((rule, matches));
+            self.respond(outputs)
+        }
     }
 
     pub(crate) fn manifest(id: &str, visual_md: &str) -> ExtensionManifest {
@@ -551,6 +766,7 @@ pub(crate) mod test_support {
         cx.update(|cx| {
             VisualMdExtensions::register(
                 &manifest,
+                Path::new("/extensions/installed").join(id).as_path(),
                 hooks.map(|hooks| hooks as Arc<dyn VisualMdHooks>),
                 cx,
             )
@@ -878,7 +1094,12 @@ mod tests {
 
         cx.update(|cx| {
             let proxy = ExtensionHostProxy::default_global(cx);
-            proxy.register_visual_md_extension(manifest, None, cx);
+            proxy.register_visual_md_extension(
+                manifest,
+                PathBuf::from("/extensions/notes"),
+                None,
+                cx,
+            );
             assert!(
                 cx.global::<VisualMdExtensions>()
                     .renderer_for_language("flow")

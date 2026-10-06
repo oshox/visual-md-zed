@@ -35,6 +35,17 @@ impl zed::Extension for VisualMdSample {
         }
     }
 
+    fn visual_md_apply_rule(
+        &self,
+        rule: String,
+        matches: Vec<visual_md::RuleMatch>,
+    ) -> Result<Vec<visual_md::RuleOutput>, String> {
+        match rule.as_str() {
+            "emoji" => Ok(matches.iter().map(apply_emoji).collect()),
+            other => Err(format!("this extension has no rule `{other}`")),
+        }
+    }
+
     fn visual_md_run_command(
         &self,
         command: String,
@@ -48,6 +59,52 @@ impl zed::Extension for VisualMdSample {
 }
 
 zed::register_extension!(VisualMdSample);
+
+/// The emoji `:name:` stands for, if the sample knows it.
+fn emoji_for(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "smile" => "🙂",
+        "grin" => "😀",
+        "heart" => "❤️",
+        "tada" => "🎉",
+        "rocket" => "🚀",
+        "thumbsup" => "👍",
+        "warning" => "⚠️",
+        _ => return None,
+    })
+}
+
+/// Hides the colons of a known `:name:` and shows its emoji in place of the
+/// name. A name it does not know is left as written.
+fn apply_emoji(rule_match: &visual_md::RuleMatch) -> visual_md::RuleOutput {
+    let capture = |index: usize| rule_match.captures.get(index).copied().flatten();
+    let (Some(opening), Some(name), Some(closing)) = (capture(1), capture(2), capture(3)) else {
+        return empty_output();
+    };
+    let Some(emoji) = rule_match
+        .text
+        .get(name.start as usize..name.end as usize)
+        .and_then(emoji_for)
+    else {
+        return empty_output();
+    };
+    visual_md::RuleOutput {
+        spans: Vec::new(),
+        hidden: vec![opening, closing],
+        replacements: vec![visual_md::Replacement {
+            range: name,
+            text: emoji.to_string(),
+        }],
+    }
+}
+
+fn empty_output() -> visual_md::RuleOutput {
+    visual_md::RuleOutput {
+        spans: Vec::new(),
+        hidden: Vec::new(),
+        replacements: Vec::new(),
+    }
+}
 
 fn escape_xml(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
@@ -430,6 +487,60 @@ mod tests {
         assert_eq!(styled_words, vec!["42", "FAILED", "#ci"]);
         assert_eq!(styled.spans[0].style.theme_token.as_deref(), Some("number"));
         assert_eq!(styled.spans[1].style.font_weight, Some(700));
+    }
+
+    fn emoji_match(text: &str) -> visual_md::RuleMatch {
+        let length = text.len() as u32;
+        let range = |start: u32, end: u32| Some(zed::Range { start, end });
+        visual_md::RuleMatch {
+            text: text.to_string(),
+            captures: vec![
+                range(0, length),
+                range(0, 1),
+                range(1, length - 1),
+                range(length - 1, length),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_a_known_emoji_hides_its_colons_and_replaces_its_name() {
+        let output = apply_emoji(&emoji_match(":smile:"));
+
+        assert_eq!(
+            output
+                .hidden
+                .iter()
+                .map(|range| (range.start, range.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (6, 7)]
+        );
+        assert_eq!(output.replacements.len(), 1);
+        assert_eq!(
+            (
+                output.replacements[0].range.start,
+                output.replacements[0].range.end
+            ),
+            (1, 6)
+        );
+        assert_eq!(output.replacements[0].text, "🙂");
+    }
+
+    #[test]
+    fn test_an_unknown_emoji_is_left_as_written() {
+        let output = apply_emoji(&emoji_match(":nonsense:"));
+
+        assert!(output.hidden.is_empty() && output.replacements.is_empty());
+    }
+
+    #[test]
+    fn test_a_match_without_its_groups_is_left_alone() {
+        let output = apply_emoji(&visual_md::RuleMatch {
+            text: ":smile:".to_string(),
+            captures: vec![Some(zed::Range { start: 0, end: 7 })],
+        });
+
+        assert!(output.hidden.is_empty() && output.replacements.is_empty());
     }
 
     fn context(text: &str, selections: &[Range<u32>]) -> visual_md::CommandContext {

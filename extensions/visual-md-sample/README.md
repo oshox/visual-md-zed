@@ -10,6 +10,9 @@ preview. It is the worked example for `docs/visual-md-extensions.md`.
 | Fenced code block         | `sample-flow`   | Draws `a -> b -> c` lines as boxes joined by arrows, as an SVG.     |
 | Fenced code block         | `sample-table`  | Turns comma separated rows into a Markdown table.                   |
 | Fenced code block         | `sample-styled` | Picks out numbers, SHOUTING words and `#tags` with styled text.     |
+| Syntax rule               | `mention`       | Styles `@names` in blue and bold. No code needed.                   |
+| Dynamic syntax rule       | `emoji`         | Shows `:smile:`, `:tada:` and a few more as emoji.                  |
+| Callout                   | `sample`        | `> [!sample]` as a purple callout titled "Sample" with its own icon. |
 | Editor command            | `uppercase`     | Uppercases the selection, or the current line with nothing selected. |
 
 ````markdown

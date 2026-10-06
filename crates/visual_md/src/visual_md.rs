@@ -234,11 +234,13 @@
 //! single keystroke or cursor move touches only what changed.
 
 mod commands;
+pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
 mod list_continuation;
 mod plan;
+pub mod rules;
 mod style;
 
 use std::any::Any;
@@ -268,7 +270,7 @@ use gpui::{
 use language::{Language, Rope};
 use plan::{CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment};
 use settings::Settings;
-use style::ResolvedStyle;
+use style::{CalloutIcon, ResolvedStyle};
 use util::ResultExt;
 
 actions!(
@@ -289,6 +291,7 @@ actions!(
 pub fn init(cx: &mut App) {
     extensions::init(cx);
     fence_render::init(cx);
+    dynamic_rules::init(cx);
     commands::init(cx);
     cx.observe_new(register_editor).detach();
 }
@@ -347,6 +350,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         ))),
         saved_text_style_refinement: None,
         callout_key_count: 0,
+        extension_key_count: 0,
     });
     refresh(editor, window, cx);
 
@@ -674,6 +678,9 @@ struct VisualMdAddon {
     /// How many `KEY_CALLOUT_FIRST` keys the last refresh used, so the ones a
     /// later refresh no longer needs can be cleared.
     callout_key_count: usize,
+    /// How many `HighlightKey::VisualMdExtension` keys the last refresh used,
+    /// for the same reason.
+    extension_key_count: usize,
 }
 
 struct ParsedDocument {
@@ -713,7 +720,7 @@ impl Addon for VisualMdAddon {
 
 struct VisualMdState {
     editor: WeakEntity<Editor>,
-    _subscriptions: [Subscription; 6],
+    _subscriptions: [Subscription; 7],
 }
 
 impl VisualMdState {
@@ -817,6 +824,22 @@ impl VisualMdState {
                             .log_err();
                     },
                 ),
+                // An extension answering about the matches of a dynamic rule
+                // changes what those matches look like, which the plan holds
+                // only as a list of what was still waiting.
+                cx.observe_global_in::<dynamic_rules::DynamicRuleResults>(
+                    window,
+                    |state, window, cx| {
+                        state
+                            .editor
+                            .update(cx, |editor, cx| {
+                                if is_waiting_for_rule_answers(editor) {
+                                    force_refresh(editor, window, cx)
+                                }
+                            })
+                            .log_err();
+                    },
+                ),
                 // Font settings live in `ThemeSettings`, so a change to them
                 // does not alter the buffer's own language settings.
                 cx.observe_global_in::<settings::SettingsStore>(window, |state, window, cx| {
@@ -846,6 +869,15 @@ impl VisualMdState {
             ],
         })
     }
+}
+
+/// Whether the plan `editor` last applied had matches of dynamic rules that no
+/// extension had answered for yet.
+fn is_waiting_for_rule_answers(editor: &Editor) -> bool {
+    editor
+        .addon::<VisualMdAddon>()
+        .and_then(|addon| addon.last_applied.as_ref())
+        .is_some_and(|(_, plan)| !plan.missing_rule_inputs.is_empty())
 }
 
 /// Whether live preview is currently decorating `editor`. Global observers
@@ -1061,6 +1093,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     if unchanged {
         return;
     }
+    dynamic_rules::request_missing(computed.missing_rule_inputs.clone(), cx);
 
     let editor_handle = cx.weak_entity();
     // The `String` alongside each range is a content key, not just an
@@ -1119,8 +1152,14 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 (
                     callout.marker_range.clone(),
                     format!(
-                        "callout-title:{:?}:{:?}:{}",
-                        callout.kind, callout.fold, callout.raw_type_name
+                        "callout-title:{:?}:{:?}:{}:{}",
+                        callout.kind,
+                        callout.fold,
+                        callout.raw_type_name,
+                        style
+                            .callout_look(callout.kind, &callout.raw_type_name)
+                            .title
+                            .unwrap_or_default()
                     ),
                     callout_title_placeholder(
                         editor_handle.clone(),
@@ -1153,6 +1192,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     folds.extend(table_alignment_spacer_folds(
         &computed, &text, &style, window, cx,
     ));
+    folds.extend(computed.extension_replacements.iter().map(|(range, text)| {
+        (
+            range.clone(),
+            format!("ext:{text}"),
+            ordinal_placeholder(text.clone()),
+        )
+    }));
 
     apply_folds(editor, &snapshot, folds, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
@@ -1168,6 +1214,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .collect();
     ensure_code_languages_loaded(editor, window, cx, code_languages);
     apply_code_syntax_highlights(editor, &snapshot, &text, &computed, cx);
+    apply_extension_highlights(editor, &snapshot, &computed, cx);
 
     if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
         addon.last_applied = Some((edit_count, computed));
@@ -1176,11 +1223,64 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
 /// What extensions currently claim, as far as the planner needs to know.
 fn plan_extensions(cx: &App) -> plan::PlanExtensions {
+    let Some(registry) = cx.try_global::<extensions::VisualMdExtensions>() else {
+        return plan::PlanExtensions::default();
+    };
     plan::PlanExtensions {
-        rendered_fence_languages: cx
-            .try_global::<extensions::VisualMdExtensions>()
-            .map(|registry| registry.fence_languages().into_iter().collect())
-            .unwrap_or_default(),
+        rendered_fence_languages: registry.fence_languages().into_iter().collect(),
+        rules: rules::RuleSet {
+            rules: registry.syntax_rules().into(),
+            results: cx
+                .try_global::<dynamic_rules::DynamicRuleResults>()
+                .map(|results| results.answers())
+                .unwrap_or_default(),
+        },
+    }
+}
+
+/// Gives the text that extensions' syntax rules style its style. Each distinct
+/// style gets a highlight key of its own, so the editor merges them in a fixed
+/// order and a style that is no longer wanted can be cleared by its key.
+fn apply_extension_highlights(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    computed: &Plan,
+    cx: &mut Context<Editor>,
+) {
+    let syntax_theme = {
+        use theme::ActiveTheme;
+        cx.theme().syntax().clone()
+    };
+    let mut groups: Vec<(&extension::VisualMdSpanStyle, Vec<Range<Anchor>>)> = Vec::new();
+    for (range, style) in &computed.extension_styled {
+        let anchors = to_anchor_range(snapshot, range);
+        match groups.iter_mut().find(|(known, _)| *known == style) {
+            Some((_, ranges)) => ranges.push(anchors),
+            None => groups.push((style, vec![anchors])),
+        }
+    }
+
+    let previous_count = editor
+        .addon_mut::<VisualMdAddon>()
+        .map(|addon| std::mem::replace(&mut addon.extension_key_count, groups.len()))
+        .unwrap_or_default();
+    for index in groups.len()..previous_count {
+        editor.highlight_text_key(
+            HighlightKey::VisualMdExtension(index),
+            Vec::new(),
+            HighlightStyle::default(),
+            false,
+            cx,
+        );
+    }
+    for (index, (style, ranges)) in groups.into_iter().enumerate() {
+        editor.highlight_text_key(
+            HighlightKey::VisualMdExtension(index),
+            ranges,
+            fence_render::highlight_style(style, &syntax_theme),
+            false,
+            cx,
+        );
     }
 }
 
@@ -1588,7 +1688,11 @@ fn callout_title_placeholder(
     style: Arc<ArcSwap<ResolvedStyle>>,
 ) -> editor::FoldPlaceholder {
     let collapsed = fold.is_collapsed();
-    let label = SharedString::from(capitalize(&raw_type_name));
+    let label = style
+        .load()
+        .callout_look(kind, &raw_type_name)
+        .title
+        .unwrap_or_else(|| SharedString::from(capitalize(&raw_type_name)));
     let collapsed_text = label.clone();
     editor::FoldPlaceholder {
         render: std::sync::Arc::new(move |fold_id, _range, _| {
@@ -1596,7 +1700,7 @@ fn callout_title_placeholder(
             let suffix_range = suffix_range.clone();
             let label = label.clone();
             let look = style.load().callout_look(kind, &raw_type_name);
-            let (icon_path, color) = (look.icon_path, look.accent);
+            let (icon, color) = (look.icon, look.accent);
             let chevron_path = if collapsed {
                 "icons/chevron_right.svg"
             } else {
@@ -1628,7 +1732,7 @@ fn callout_title_placeholder(
                                 .log_err();
                         }),
                 )
-                .child(svg().path(icon_path).size(px(13.)).text_color(color))
+                .child(callout_icon(&icon).size(px(13.)).text_color(color))
                 .child(
                     div()
                         .text_color(color)
@@ -1644,6 +1748,15 @@ fn callout_title_placeholder(
         // tests asserting on `display_text()`.
         collapsed_text: Some(collapsed_text),
         ..base_placeholder()
+    }
+}
+
+/// The element that draws a callout's icon: one of the app's own, or an `.svg`
+/// file an extension ships.
+fn callout_icon(icon: &CalloutIcon) -> gpui::Svg {
+    match icon {
+        CalloutIcon::Asset(path) => svg().path(path.clone()),
+        CalloutIcon::External(path) => svg().external_path(path.clone()),
     }
 }
 
@@ -4314,7 +4427,11 @@ mod integration_tests {
                 ResolvedStyle::resolve(&Default::default(), cx).callout_look(kind, type_name)
             });
             assert_eq!(
-                (look.icon_path.as_ref(), look.accent, look.background),
+                (
+                    look.icon.asset_path().unwrap_or_default(),
+                    look.accent,
+                    look.background
+                ),
                 (icon, accent, background),
                 "{needle}"
             );
@@ -4746,8 +4863,8 @@ mod integration_tests {
                 .callout_look(CalloutKind::Other, "custom")
         });
         assert_eq!(
-            look.icon_path.as_ref(),
-            icons::IconName::Star.path().as_ref()
+            look.icon.asset_path(),
+            Some(icons::IconName::Star.path().as_ref())
         );
         assert_eq!(look.accent, hex("#ff0000"));
 
@@ -4780,7 +4897,7 @@ mod integration_tests {
             ResolvedStyle::resolve(&content, cx).callout_look(CalloutKind::Note, "note")
         });
 
-        assert_eq!(look.icon_path.as_ref(), "icons/info.svg");
+        assert_eq!(look.icon.asset_path(), Some("icons/info.svg"));
     }
 
     /// Exercises the M11 callout title widget through a real `refresh()`,

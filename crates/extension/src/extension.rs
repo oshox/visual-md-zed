@@ -168,6 +168,16 @@ pub trait Extension: Send + Sync + 'static {
         bail!("this extension does not provide editor commands")
     }
 
+    /// Applies one of this extension's dynamic syntax rules to the pieces of
+    /// text that matched it, returning what to do with each, in order.
+    async fn visual_md_apply_rule(
+        &self,
+        _rule: String,
+        _matches: Vec<VisualMdRuleMatch>,
+    ) -> Result<Vec<VisualMdRuleOutput>> {
+        bail!("this extension does not apply syntax rules")
+    }
+
     async fn suggest_docs_packages(&self, provider: Arc<str>) -> Result<Vec<String>>;
 
     async fn index_docs(

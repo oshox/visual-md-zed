@@ -1721,8 +1721,9 @@ impl ExtensionStore {
                                 None
                             }
                         });
+                    let extension_dir = root_dir.join(manifest.id.as_ref());
                     this.proxy
-                        .register_visual_md_extension(manifest, extension, cx);
+                        .register_visual_md_extension(manifest, extension_dir, extension, cx);
                 }
 
                 this.wasm_extensions.extend(wasm_extensions);
