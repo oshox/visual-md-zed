@@ -18,7 +18,7 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
+        let folded = self.is_line_collapsed(buffer_row);
         let mut is_foldable = false;
 
         if let Some(crease) = self
@@ -91,7 +91,7 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
+        let folded = self.is_line_collapsed(buffer_row);
         if let Crease::Inline { render_trailer, .. } = self
             .crease_snapshot
             .query_row(buffer_row, self.buffer_snapshot())?
@@ -124,7 +124,7 @@ impl Editor {
             } else {
                 selection.range()
             };
-            if display_map.folds_in_range(range).next().is_some() {
+            if display_map.has_collapsed_fold_in_range(range) {
                 self.unfold_lines(&Default::default(), window, cx)
             } else {
                 self.fold(&Default::default(), window, cx)
@@ -169,7 +169,7 @@ impl Editor {
         } else {
             selection.range()
         };
-        if display_map.folds_in_range(range).next().is_some() {
+        if display_map.has_collapsed_fold_in_range(range) {
             self.unfold_recursive(&Default::default(), window, cx)
         } else {
             self.fold_recursive(&Default::default(), window, cx)
@@ -238,10 +238,9 @@ impl Editor {
     ) {
         let has_folds = if self.buffer.read(cx).is_singleton() {
             let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-            let has_folds = display_map
-                .folds_in_range(MultiBufferOffset(0)..display_map.buffer_snapshot().len())
-                .next()
-                .is_some();
+            let has_folds = display_map.has_collapsed_fold_in_range(
+                MultiBufferOffset(0)..display_map.buffer_snapshot().len(),
+            );
             has_folds
         } else {
             let snapshot = self.buffer.read(cx).snapshot(cx);
@@ -837,6 +836,7 @@ impl Editor {
         };
         let inmemory_folds = display_snapshot
             .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .filter(|fold| fold.placeholder.is_saved_with_file())
             .map(|fold| {
                 let start = fold.range.start.text_anchor_in(buffer_snapshot);
                 let end = fold.range.end.text_anchor_in(buffer_snapshot);
@@ -863,6 +863,7 @@ impl Editor {
         const FINGERPRINT_LEN: usize = 32;
         let db_folds = display_snapshot
             .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .filter(|fold| fold.placeholder.is_saved_with_file())
             .map(|fold| {
                 let start = fold
                     .range

@@ -50,7 +50,26 @@ impl Default for FoldPlaceholder {
     }
 }
 
+/// The `type_tag` of a fold that is a permanent text replacement, such as a
+/// Markdown marker hidden by Zed MD, and not a region the user collapsed. It is
+/// left out when asking whether a line is folded, left alone by the unfold
+/// commands, and not saved with the file.
+pub struct DecorativeFold;
+
+/// The `type_tag` of a fold that collapses a region and lasts for the session,
+/// such as a Markdown section folded in Zed MD. It is not saved with the file.
+pub struct TransientFold;
+
 impl FoldPlaceholder {
+    pub fn is_decorative(&self) -> bool {
+        self.type_tag == Some(TypeId::of::<DecorativeFold>())
+    }
+
+    /// Whether the fold is restored the next time the file is opened.
+    pub fn is_saved_with_file(&self) -> bool {
+        !self.is_decorative() && self.type_tag != Some(TypeId::of::<TransientFold>())
+    }
+
     /// Returns a styled `Div` container with the standard fold‐placeholder
     /// look (background, hover, active, rounded corners, full size).
     /// Callers add children and event handlers on top.
@@ -248,14 +267,15 @@ impl FoldMapWriter<'_> {
         )
     }
 
-    /// Removes any folds whose ranges intersect the given ranges.
+    /// Removes any folds whose ranges intersect the given ranges, except
+    /// [`DecorativeFold`]s, which `remove_folds` takes away by their type.
     #[ztracing::instrument(skip_all)]
     pub(crate) fn unfold_intersecting<T: ToOffset>(
         &mut self,
         ranges: impl IntoIterator<Item = Range<T>>,
         inclusive: bool,
     ) -> (FoldSnapshot, Vec<FoldEdit>) {
-        self.remove_folds_with(ranges, |_| true, inclusive)
+        self.remove_folds_with(ranges, |fold| !fold.placeholder.is_decorative(), inclusive)
     }
 
     /// Removes any folds that intersect the given ranges and for which the given predicate

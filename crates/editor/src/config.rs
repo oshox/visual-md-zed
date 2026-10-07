@@ -204,6 +204,24 @@ impl Editor {
         cx.notify();
     }
 
+    /// Whether a row can be folded because the lines after it are indented
+    /// further, as opposed to only where a crease is.
+    pub fn set_indent_folding(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.display_map
+            .update(cx, |map, _| map.indent_folding_disabled = !enabled);
+        cx.notify();
+    }
+
+    /// Whether unfolding a range also removes the blocks that replace rows in
+    /// it. On by default, which is how a folded diff hunk is expanded; an
+    /// editor that uses replacing blocks only to decorate text turns it off, so
+    /// that unfolding does not take its decoration away.
+    pub fn set_unfold_removes_replace_blocks(&mut self, removes: bool, cx: &mut Context<Self>) {
+        self.display_map
+            .update(cx, |map, _| map.unfold_removes_replace_blocks = removes);
+        cx.notify();
+    }
+
     pub fn disable_expand_excerpt_buttons(&mut self, cx: &mut Context<Self>) {
         self.disable_expand_excerpt_buttons = true;
         cx.notify();
