@@ -237,6 +237,7 @@ mod document_events;
 pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
+mod fold_ranges;
 mod format_toggle;
 mod inline_scan;
 mod links;
@@ -413,6 +414,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         enabled_override: None,
         active: false,
         folded_markers: Vec::new(),
+        section_creases: Vec::new(),
+        sections_applied: None,
         hr_blocks: Vec::new(),
         image_blocks: Vec::new(),
         rendered_fence_blocks: Vec::new(),
@@ -774,6 +777,11 @@ struct VisualMdAddon {
     /// while visual_md is actually decorating this buffer.
     active: bool,
     folded_markers: Vec<(Range<usize>, String, CreaseId)>,
+    /// The creases that let a heading or a list item fold (see
+    /// `apply_sections`), with the anchors they were made with.
+    section_creases: Vec<(Range<Anchor>, CreaseId)>,
+    /// The edit count and planned range `apply_sections` last worked against.
+    sections_applied: Option<(usize, Range<usize>)>,
     /// Horizontal-rule block decorations currently inserted (see
     /// `apply_horizontal_rules`). Unlike `folded_markers`, no content-key
     /// string travels alongside the range: a horizontal rule's rendering
@@ -865,6 +873,8 @@ struct ParsedDocument {
     edit_count: usize,
     text: Arc<str>,
     block_tree: tree_sitter::Tree,
+    /// What can be folded, in document order (see [`fold_ranges`]).
+    foldable: Arc<[Range<usize>]>,
 }
 
 impl Addon for VisualMdAddon {
@@ -1226,15 +1236,20 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     apply_text_style_refinement(editor, enabled, &style, cx);
 
     if enabled != was_active {
-        // Line numbers don't fit the live-preview reading experience, and
-        // "foldable" isn't meaningful there either (including the
-        // indentation-heuristic fold affordance, which fires independently
-        // of any crease visual_md made), so both are hidden only while
-        // visual_md is decorating this buffer and restored to the user's
-        // global preference otherwise.
+        // Line numbers don't fit the live-preview reading experience, so they
+        // are hidden only while visual_md is decorating this buffer and
+        // restored to the user's global preference otherwise. Headings and
+        // list items fold through creases of their own (see `apply_sections`),
+        // so the fold arrows stay on, but the editor's guess that any line
+        // followed by a more indented one can fold is turned off: in prose it
+        // is every wrapped or nested line.
         let gutter = editor::EditorSettings::get_global(cx).gutter;
         editor.set_show_line_numbers(if enabled { false } else { gutter.line_numbers }, cx);
-        editor.set_show_fold_indicators(if enabled { false } else { gutter.folds }, cx);
+        editor.set_show_fold_indicators(gutter.folds, cx);
+        editor.set_indent_folding(!enabled, cx);
+        // Its rules, fences, tables and images are blocks that replace rows,
+        // and unfolding a section over them must not take them away.
+        editor.set_unfold_removes_replace_blocks(!enabled, cx);
     }
 
     if enabled {
@@ -1298,7 +1313,10 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             .and_then(|addon| addon.last_applied.as_ref())
             .is_some_and(|(applied_edit_count, applied)| {
                 *applied_edit_count == edit_count && *applied == computed
-            });
+            })
+        && editor
+            .addon::<VisualMdAddon>()
+            .is_some_and(|addon| addon.sections_applied == addon.planned);
     if unchanged {
         return;
     }
@@ -1418,6 +1436,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     }));
 
     apply_folds(editor, &snapshot, folds, window, cx);
+    apply_sections(editor, &snapshot, enabled, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_images(editor, &snapshot, &computed, cx);
@@ -1654,6 +1673,7 @@ fn parsed_document(
         addon.parsed = block_tree.clone().map(|block_tree| ParsedDocument {
             edit_count,
             text: text.clone(),
+            foldable: fold_ranges::foldable_ranges(&text, &block_tree).into(),
             block_tree,
         });
     }
@@ -1733,6 +1753,7 @@ fn base_placeholder() -> editor::FoldPlaceholder {
     editor::FoldPlaceholder {
         constrain_width: false,
         merge_adjacent: false,
+        type_tag: Some(std::any::TypeId::of::<editor::DecorativeFold>()),
         ..editor::FoldPlaceholder::default()
     }
 }
@@ -2133,22 +2154,21 @@ fn apply_folds(
             .into_iter()
             .map(|(_, range)| range)
             .collect();
-        // `inclusive: false`, not `true`: `unfold_ranges` unfolds every fold
-        // that *intersects* the given ranges, and with `inclusive: true`
-        // that includes folds merely touching a range's boundary, not just
-        // ones overlapping it. visual_md's own folds routinely sit right next
-        // to each other byte-for-byte (e.g. a task item's hidden bullet
-        // ending exactly where its checkbox crease begins), so
-        // `inclusive: true` here was unfolding a perfectly valid *adjacent*
-        // crease every time a neighboring one went stale — e.g. every
-        // checkbox toggle spuriously unfolded the task's own bullet marker,
-        // even though that crease's id was never in `stale_ids` and
-        // `addon.folded_markers` still (incorrectly) believed it was folded.
-        // The removed ranges here always come from creases that genuinely,
-        // strictly overlap themselves (they're each fold's own exact range),
-        // so `inclusive: false` still finds and removes exactly the stale
-        // folds without also catching their neighbors.
-        editor.unfold_ranges(&removed_ranges, false, false, cx);
+        // Removed by overlap and not touching, which is how
+        // `remove_folds_with_type` works: visual_md's own folds routinely sit
+        // right next to each other byte-for-byte (e.g. a task item's hidden
+        // bullet ending exactly where its checkbox crease begins), and
+        // unfolding by touching unfolded a perfectly valid adjacent crease
+        // every time a neighbor went stale, so every checkbox toggle
+        // spuriously unfolded the task's own bullet marker while
+        // `addon.folded_markers` still believed it was folded. Only these
+        // folds go: a section the user folded over them stays folded.
+        editor.remove_folds_with_type(
+            &removed_ranges,
+            std::any::TypeId::of::<editor::DecorativeFold>(),
+            false,
+            cx,
+        );
     }
 
     let already_kept: HashSet<(Range<usize>, String)> = kept
@@ -2192,6 +2212,209 @@ fn apply_folds(
 
     if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
         addon.folded_markers = kept;
+    }
+}
+
+/// The most foldable headings and items a document can have and still get a
+/// crease on every one of them, so that "fold all" reaches the whole document.
+/// A longer one only gets creases near what is on screen and on what is folded.
+const WHOLE_DOCUMENT_FOLD_LIMIT: usize = 2_000;
+
+/// Gives every heading and list item that has something under it a crease, so
+/// the editor's fold arrow, `Fold` and `FoldAll` find it, and keeps the sections
+/// the user folded folded.
+///
+/// What is folded is only in the editor's fold map: folds are anchored, so they
+/// follow edits above them, and a section whose range is unchanged after an
+/// edit keeps its crease and its fold. One whose range changed is made again,
+/// and folded again if the section that started in the same place was folded.
+/// Folded sections are also kept when they scroll out of view, which a
+/// viewport-only crease list would forget.
+fn apply_sections(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    enabled: bool,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let (foldable, planned, previous) = match editor.addon_mut::<VisualMdAddon>() {
+        Some(addon) => {
+            let foldable = match (&addon.parsed, enabled) {
+                (Some(parsed), true) => parsed.foldable.clone(),
+                _ => Arc::default(),
+            };
+            (
+                foldable,
+                addon.planned.clone(),
+                std::mem::take(&mut addon.section_creases),
+            )
+        }
+        None => return,
+    };
+    let visible = planned
+        .as_ref()
+        .map_or(0..snapshot.len().0, |(_, range)| range.clone());
+
+    use editor::ToOffset as _;
+
+    let transient_fold = std::any::TypeId::of::<editor::TransientFold>();
+    let folded_ranges = |editor: &Editor, cx: &mut Context<Editor>| -> HashSet<Range<usize>> {
+        let display_snapshot = editor.display_snapshot(cx);
+        display_snapshot
+            .folds_in_range(MultiBufferOffset(0)..snapshot.len())
+            .filter(|fold| fold.placeholder.type_tag == Some(transient_fold))
+            .map(|fold| {
+                fold.range.start.to_offset(snapshot).0..fold.range.end.to_offset(snapshot).0
+            })
+            .collect()
+    };
+    let folded = folded_ranges(editor, cx);
+
+    let previous: Vec<(Range<usize>, Range<Anchor>, CreaseId)> = previous
+        .into_iter()
+        .map(|(anchors, id)| {
+            let range = anchors.start.to_offset(snapshot).0..anchors.end.to_offset(snapshot).0;
+            (range, anchors, id)
+        })
+        .collect();
+    let previous_ranges: HashSet<&Range<usize>> =
+        previous.iter().map(|(range, _, _)| range).collect();
+    let refold_starts: HashSet<usize> = previous
+        .iter()
+        .filter(|(range, _, _)| folded.contains(range))
+        .map(|(range, _, _)| range.start)
+        .collect();
+
+    let whole_document = foldable.len() <= WHOLE_DOCUMENT_FOLD_LIMIT;
+    let wanted: Vec<Range<usize>> = foldable
+        .iter()
+        .filter(|range| {
+            whole_document
+                || (range.start < visible.end && range.end > visible.start)
+                || refold_starts.contains(&range.start)
+        })
+        .cloned()
+        .collect();
+    let wanted_set: HashSet<&Range<usize>> = wanted.iter().collect();
+
+    let should_fold: HashSet<Range<usize>> = wanted
+        .iter()
+        .filter(|range| {
+            folded.contains(*range)
+                || (!previous_ranges.contains(range) && refold_starts.contains(&range.start))
+        })
+        .cloned()
+        .collect();
+
+    let mut kept: Vec<(Range<Anchor>, CreaseId)> = Vec::new();
+    let mut kept_ranges: HashSet<Range<usize>> = HashSet::new();
+    let mut stale_ids = Vec::new();
+    let mut stale_folded: Vec<Range<MultiBufferOffset>> = Vec::new();
+    for (range, anchors, id) in &previous {
+        if wanted_set.contains(range) {
+            kept.push((anchors.clone(), *id));
+            kept_ranges.insert(range.clone());
+        } else {
+            stale_ids.push(*id);
+            if folded.contains(range) {
+                stale_folded.push(MultiBufferOffset(range.start)..MultiBufferOffset(range.end));
+            }
+        }
+    }
+    if !stale_ids.is_empty() {
+        editor.remove_creases(stale_ids, cx);
+    }
+    if !stale_folded.is_empty() {
+        editor.remove_folds_with_type(&stale_folded, transient_fold, false, cx);
+    }
+
+    let editor_handle = cx.weak_entity();
+    let anchors_of = |range: &Range<usize>| {
+        snapshot.anchor_after(MultiBufferOffset(range.start))
+            ..snapshot.anchor_before(MultiBufferOffset(range.end))
+    };
+    let new_ranges: Vec<&Range<usize>> = wanted
+        .iter()
+        .filter(|range| !kept_ranges.contains(*range))
+        .collect();
+    if !new_ranges.is_empty() {
+        let creases: Vec<Crease<Anchor>> = new_ranges
+            .iter()
+            .map(|range| {
+                Crease::simple(
+                    anchors_of(range),
+                    section_placeholder(editor_handle.clone()),
+                )
+            })
+            .collect();
+        let ids = editor.insert_creases(creases.clone(), cx);
+        kept.extend(
+            creases
+                .iter()
+                .zip(ids)
+                .map(|(crease, id)| (crease.range().clone(), id)),
+        );
+    }
+
+    // Removing a stale fold also removes any fold inside it, which may belong
+    // to a section that stays, so what should be folded is looked at again.
+    let still_folded = folded_ranges(editor, cx);
+    let to_fold: Vec<Crease<Anchor>> = wanted
+        .iter()
+        .filter(|range| should_fold.contains(*range) && !still_folded.contains(*range))
+        .map(|range| {
+            Crease::simple(
+                anchors_of(range),
+                section_placeholder(editor_handle.clone()),
+            )
+        })
+        .collect();
+    editor.fold_creases(to_fold, false, window, cx);
+
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+        addon.section_creases = kept;
+        addon.sections_applied = planned;
+    }
+}
+
+/// The "⋯" a folded heading or item ends in. Clicking it unfolds the section.
+fn section_placeholder(editor: WeakEntity<Editor>) -> editor::FoldPlaceholder {
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(move |fold_id, fold_range, cx| {
+            let editor = editor.clone();
+            let colors = {
+                use theme::ActiveTheme;
+                cx.theme().colors().clone()
+            };
+            div()
+                .id(fold_id)
+                .px(px(4.))
+                .rounded(px(3.))
+                .text_color(colors.text_placeholder)
+                .bg(colors.ghost_element_background)
+                .hover(|style| style.bg(colors.ghost_element_hover))
+                .cursor_pointer()
+                .child("⋯")
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, _window, cx| {
+                    editor
+                        .update(cx, |editor, cx| {
+                            editor.unfold_ranges(
+                                &[fold_range.start..fold_range.end],
+                                true,
+                                false,
+                                cx,
+                            );
+                            cx.stop_propagation();
+                        })
+                        .log_err();
+                })
+                .into_any_element()
+        }),
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(std::any::TypeId::of::<editor::TransientFold>()),
+        collapsed_text: None,
     }
 }
 
@@ -3228,6 +3451,8 @@ mod integration_tests {
             let store = settings::SettingsStore::test(cx);
             cx.set_global(store);
             theme::init(theme::LoadThemes::JustBase, cx);
+            // The gutter draws fold arrows, which read the UI font settings.
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
             // Registers the real `cx.observe_new::<Editor>` wiring so
@@ -4757,6 +4982,290 @@ mod integration_tests {
         cx.set_state("a «wordˇ» b\n");
         cx.simulate_input("_");
         cx.assert_editor_state("a _«wordˇ»_ b\n");
+    }
+
+    fn section_crease_count(cx: &mut EditorTestContext) -> usize {
+        cx.update_editor(|editor, _, _| {
+            editor
+                .addon::<VisualMdAddon>()
+                .map_or(0, |addon| addon.section_creases.len())
+        })
+    }
+
+    #[gpui::test]
+    async fn fold_hides_what_is_under_a_heading_and_unfold_leaves_the_markers_hidden(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx =
+            markdown_editor_with(cx, "# One\nbody ˇone\n\n## Sub\nsub body\n\n# Two\ntwo\n").await;
+        assert_eq!(section_crease_count(&mut cx), 3);
+
+        cx.dispatch_action(editor::actions::Fold);
+        assert_eq!(cx.display_text(), " One⋯\n\n Two\ntwo\n");
+
+        cx.dispatch_action(editor::actions::UnfoldLines);
+        assert_eq!(
+            cx.display_text(),
+            " One\nbody one\n\n Sub\nsub body\n\n Two\ntwo\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_nested_heading_folds_inside_its_parent(cx: &mut TestAppContext) {
+        let mut cx =
+            markdown_editor_with(cx, "# One\nbody\n\n## Sub\nsub ˇbody\n\n# Two\ntwo\n").await;
+
+        cx.dispatch_action(editor::actions::Fold);
+        assert_eq!(cx.display_text(), " One\nbody\n\n Sub⋯\n\n Two\ntwo\n");
+    }
+
+    #[gpui::test]
+    async fn a_list_item_folds_what_is_nested_under_it(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "- oˇne\n  - two\n    - three\n- four\n").await;
+
+        cx.dispatch_action(editor::actions::Fold);
+        let folded = cx.display_text();
+        assert!(folded.contains("one⋯"), "{folded:?}");
+        assert!(
+            !folded.contains("two") && !folded.contains("three"),
+            "{folded:?}"
+        );
+        assert!(folded.contains("four"), "{folded:?}");
+
+        cx.dispatch_action(editor::actions::UnfoldLines);
+        let unfolded = cx.display_text();
+        assert!(unfolded.contains("three"), "{unfolded:?}");
+    }
+
+    #[gpui::test]
+    async fn a_folded_section_stays_folded_through_edits_around_it(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "# One\nbody\n\n# Two\ntwˇo\n").await;
+        cx.update_editor(|editor, window, cx| {
+            editor.fold_at(multi_buffer::MultiBufferRow(0), window, cx)
+        });
+        assert_eq!(cx.display_text(), " One⋯\n\n Two\ntwo\n");
+
+        cx.simulate_input("X");
+        assert_eq!(cx.display_text(), " One⋯\n\n Two\ntwXo\n");
+
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(0)..MultiBufferOffset(0)]);
+            });
+            editor.insert("intro\n\n", window, cx);
+        });
+        cx.run_until_parked();
+        // The cursor is on the heading now, which shows its marker.
+        assert_eq!(cx.display_text(), "intro\n\n# One⋯\n\n Two\ntwXo\n");
+    }
+
+    #[gpui::test]
+    async fn a_folded_section_is_made_again_when_its_text_changes(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "# One\nbody\n\n# Two\ntwˇo\n").await;
+        cx.update_editor(|editor, window, cx| {
+            editor.fold_at(multi_buffer::MultiBufferRow(0), window, cx)
+        });
+
+        cx.update_editor(|editor, _, cx| {
+            // At the very end of the section, where the fold's end does not grow.
+            editor.edit(
+                [(MultiBufferOffset(10)..MultiBufferOffset(10), " and more")],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(cx.display_text(), " One⋯\n\n Two\ntwo\n");
+        assert_eq!(section_crease_count(&mut cx), 2);
+    }
+
+    #[gpui::test]
+    async fn a_section_folded_inside_another_stays_folded_when_the_outer_one_is_made_again(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "# One\n## Sub\nsub body\n## Other\nother body\n\n# Two\ntwˇo\n";
+        let mut cx = markdown_editor_with(cx, text).await;
+        cx.update_editor(|editor, window, cx| {
+            editor.fold_at(multi_buffer::MultiBufferRow(1), window, cx);
+            editor.fold_at(multi_buffer::MultiBufferRow(0), window, cx);
+        });
+
+        let end_of_other = text.find("other body").unwrap_or_default() + "other body".len();
+        cx.update_editor(|editor, _, cx| {
+            editor.edit(
+                [(
+                    MultiBufferOffset(end_of_other)..MultiBufferOffset(end_of_other),
+                    " more",
+                )],
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.display_text(), " One⋯\n\n Two\ntwo\n");
+
+        cx.update_editor(|editor, window, cx| {
+            editor.unfold_at(multi_buffer::MultiBufferRow(0), window, cx)
+        });
+        let displayed = cx.display_text();
+        assert!(displayed.contains("Sub⋯"), "{displayed:?}");
+        assert!(!displayed.contains("sub body"), "{displayed:?}");
+        assert!(displayed.contains("other body more"), "{displayed:?}");
+    }
+
+    #[gpui::test]
+    async fn typing_at_the_end_of_a_folded_heading_stays_outside_the_fold(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "# One\nbody\n\n# Two\ntwˇo\n").await;
+        cx.update_editor(|editor, window, cx| {
+            editor.fold_at(multi_buffer::MultiBufferRow(0), window, cx);
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(5)..MultiBufferOffset(5)]);
+            });
+        });
+        cx.simulate_input(" more");
+
+        assert_eq!(cx.display_text(), "# One more⋯\n\n Two\ntwo\n");
+    }
+
+    #[gpui::test]
+    async fn fold_all_folds_every_section_and_unfold_all_shows_them(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "# One\nbody\n\n# Two\nˇtwo\n").await;
+
+        cx.dispatch_action(editor::actions::FoldAll);
+        assert_eq!(cx.display_text(), " One⋯\n\n Two⋯\n");
+
+        cx.dispatch_action(editor::actions::UnfoldAll);
+        assert_eq!(cx.display_text(), " One\nbody\n\n Two\ntwo\n");
+    }
+
+    #[gpui::test]
+    async fn toggle_fold_on_a_heading_folds_and_unfolds_it(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "# Oˇne\nbody\n\n# Two\ntwo\n").await;
+
+        cx.dispatch_action(editor::actions::ToggleFold);
+        assert_eq!(cx.display_text(), "# One⋯\n\n Two\ntwo\n");
+        cx.dispatch_action(editor::actions::ToggleFold);
+        assert_eq!(cx.display_text(), "# One\nbody\n\n Two\ntwo\n");
+    }
+
+    #[gpui::test]
+    async fn folding_sections_over_every_construct_does_not_panic_and_turning_live_preview_off_unfolds(
+        cx: &mut TestAppContext,
+    ) {
+        let text = concat!(
+            "# One\n\n",
+            "Some **bold** text and `code`.\n\n",
+            "```rust\nfn main() {}\n```\n\n",
+            "---\n\n",
+            "| a | b |\n| - | - |\n| 1 | 2 |\n\n",
+            "- [ ] a task\n  - [x] nested\n\n",
+            "> [!note] A callout\n> body\n\n",
+            "## Two\n\nmore text\n",
+        );
+        let mut cx = markdown_editor_with(cx, &format!("ˇ{text}")).await;
+
+        let before = cx.display_text();
+        cx.dispatch_action(editor::actions::FoldAll);
+        let folded = cx.display_text();
+        assert!(folded.contains('⋯'), "{folded:?}");
+        assert!(!folded.contains("fn main"), "{folded:?}");
+        assert!(!folded.contains("nested"), "{folded:?}");
+
+        cx.dispatch_action(editor::actions::UnfoldAll);
+        assert_eq!(cx.display_text(), before);
+
+        let rows = text.lines().count() as u32;
+        for row in 0..rows {
+            cx.update_editor(|editor, window, cx| {
+                editor.fold_at(multi_buffer::MultiBufferRow(row), window, cx)
+            });
+        }
+        cx.dispatch_action(ToggleLivePreview);
+        assert_eq!(cx.display_text(), text);
+        assert_eq!(section_crease_count(&mut cx), 0);
+    }
+
+    #[gpui::test]
+    async fn a_long_document_keeps_folds_that_scroll_away_and_makes_creases_near_the_view(
+        cx: &mut TestAppContext,
+    ) {
+        let sections = WHOLE_DOCUMENT_FOLD_LIMIT + 100;
+        let mut text = String::from("ˇ");
+        for index in 0..sections {
+            text.push_str(&format!("# Section {index}\nbody\n\n"));
+        }
+        let mut cx = markdown_editor_with(cx, &text).await;
+        assert!(section_crease_count(&mut cx) < sections / 2);
+
+        cx.update_editor(|editor, window, cx| {
+            editor.fold_at(multi_buffer::MultiBufferRow(0), window, cx)
+        });
+        let last_row = (sections as u32 - 1) * 3;
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(gpui::Point::new(0.0, f64::from(last_row)), window, cx);
+            refresh(editor, window, cx);
+        });
+
+        assert!(cx.display_text().starts_with("# Section 0⋯\n"));
+
+        let end_of_first_body = "# Section 0\nbody".len();
+        cx.update_editor(|editor, window, cx| {
+            editor.edit(
+                [(
+                    MultiBufferOffset(end_of_first_body)..MultiBufferOffset(end_of_first_body),
+                    " and more",
+                )],
+                cx,
+            );
+            refresh(editor, window, cx);
+        });
+        assert!(cx.display_text().starts_with("# Section 0⋯\n"));
+        let last_has_a_crease = cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            snapshot
+                .crease_for_buffer_row(multi_buffer::MultiBufferRow(last_row))
+                .is_some()
+        });
+        assert!(last_has_a_crease);
+    }
+
+    #[gpui::test]
+    async fn sections_get_no_creases_outside_live_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("# One\nbˇody\n");
+        cx.run_until_parked();
+
+        assert_eq!(section_crease_count(&mut cx), 0);
+    }
+
+    #[gpui::test]
+    async fn the_gutter_offers_a_fold_arrow_for_a_heading_and_not_for_prose(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = markdown_editor_with(
+            cx,
+            "# One\nbody ˇone\n    indented prose\n\nplain\n    more indented\n",
+        )
+        .await;
+
+        let arrows = cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let entity = cx.entity();
+            (0..6)
+                .map(|row| {
+                    snapshot
+                        .render_crease_toggle(
+                            multi_buffer::MultiBufferRow(row),
+                            true,
+                            entity.clone(),
+                            window,
+                            cx,
+                        )
+                        .is_some()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(arrows, [true, false, false, false, false, false]);
     }
 
     #[gpui::test]

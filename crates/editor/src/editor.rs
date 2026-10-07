@@ -86,8 +86,8 @@ pub(crate) use completions::split_words;
 use diagnostics::{ActiveDiagnostic, GlobalDiagnosticRenderer, InlineDiagnostic};
 pub use diagnostics::{DiagnosticRenderer, set_diagnostic_renderer};
 pub use display_map::{
-    ChunkRenderer, ChunkRendererContext, DisplayPoint, FoldPlaceholder, HighlightKey,
-    NavigationOverlayKey, SemanticTokenHighlight,
+    ChunkRenderer, ChunkRendererContext, DecorativeFold, DisplayPoint, FoldPlaceholder,
+    HighlightKey, NavigationOverlayKey, SemanticTokenHighlight, TransientFold,
 };
 pub use edit_prediction::make_suggestion_styles;
 pub(crate) use edit_prediction::{

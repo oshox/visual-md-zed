@@ -46,7 +46,9 @@ impl CreaseSnapshot {
         self.creases.iter().map(|item| (item.id, &item.crease))
     }
 
-    /// Returns the first Crease starting on the specified buffer row.
+    /// Returns the first Crease starting on the specified buffer row, leaving
+    /// out one that hides its gutter toggle (a decorative replacement) in favor
+    /// of a later one that does not, which is the one that can be folded.
     #[ztracing::instrument(skip_all)]
     pub fn query_row<'a>(
         &'a self,
@@ -56,12 +58,24 @@ impl CreaseSnapshot {
         let start = snapshot.anchor_before(Point::new(row.0, 0));
         let mut cursor = self.creases.cursor::<ItemSummary>(snapshot);
         cursor.seek(&start, Bias::Left);
+        let mut decorative = None;
         while let Some(item) = cursor.item() {
             match Ord::cmp(&item.crease.range().start.to_point(snapshot).row, &row.0) {
                 Ordering::Less => cursor.next(),
                 Ordering::Equal => {
                     if item.crease.range().start.is_valid(snapshot) {
-                        return Some(&item.crease);
+                        if matches!(
+                            item.crease,
+                            Crease::Inline {
+                                hide_gutter_toggle: true,
+                                ..
+                            }
+                        ) {
+                            decorative.get_or_insert(&item.crease);
+                            cursor.next();
+                        } else {
+                            return Some(&item.crease);
+                        }
                     } else {
                         cursor.next();
                     }
@@ -69,7 +83,7 @@ impl CreaseSnapshot {
                 Ordering::Greater => break,
             }
         }
-        None
+        decorative
     }
 
     #[ztracing::instrument(skip_all)]
@@ -505,6 +519,45 @@ mod test {
                 .query_row(MultiBufferRow(3), &snapshot)
                 .is_none()
         );
+    }
+
+    #[gpui::test]
+    fn test_query_row_prefers_a_crease_with_a_gutter_toggle(cx: &mut App) {
+        let text = "# Title\nbody\n";
+        let buffer = MultiBuffer::build_simple(text, cx);
+        let snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+
+        let decorative = || {
+            Crease::simple(
+                snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(0, 2)),
+                FoldPlaceholder::test(),
+            )
+            .without_gutter_toggle()
+        };
+        let collapsible = || {
+            Crease::simple(
+                snapshot.anchor_before(Point::new(0, 7))..snapshot.anchor_after(Point::new(1, 4)),
+                FoldPlaceholder::test(),
+            )
+        };
+        let start_column =
+            |crease: &Crease<Anchor>| crease.range().start.to_point(&snapshot).column;
+
+        let mut crease_map = CreaseMap::new(&snapshot);
+        crease_map.insert([decorative(), collapsible()], &snapshot);
+        let crease_snapshot = crease_map.snapshot();
+        let found = crease_snapshot
+            .query_row(MultiBufferRow(0), &snapshot)
+            .expect("the row has creases");
+        assert_eq!(start_column(found), 7);
+
+        let mut only_decorative = CreaseMap::new(&snapshot);
+        only_decorative.insert([decorative()], &snapshot);
+        let crease_snapshot = only_decorative.snapshot();
+        let found = crease_snapshot
+            .query_row(MultiBufferRow(0), &snapshot)
+            .expect("a decorative crease is still found when it is the only one");
+        assert_eq!(start_column(found), 0);
     }
 
     #[gpui::test]

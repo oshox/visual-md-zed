@@ -1080,16 +1080,24 @@ impl BlockMap {
                     .iter()
                     .filter_map(|block| {
                         let placement = block.placement.to_wrap_row(wrap_snapshot)?;
-                        if !matches!(placement, BlockPlacement::Replace(_))
-                            && wrap_snapshot.intersects_fold(Point::new(
-                                block
-                                    .placement
-                                    .start()
-                                    .to_point(wrap_snapshot.buffer_snapshot())
-                                    .row,
-                                0,
-                            ))
-                        {
+                        let buffer_snapshot = wrap_snapshot.buffer_snapshot();
+                        let start_is_folded = wrap_snapshot.intersects_fold(Point::new(
+                            block.placement.start().to_point(buffer_snapshot).row,
+                            0,
+                        ));
+                        // A block that replaces rows which are all folded away
+                        // has nothing left to replace. Converted to wrap rows it
+                        // would replace the row the fold ends, which still shows.
+                        let hidden = if matches!(placement, BlockPlacement::Replace(_)) {
+                            start_is_folded
+                                && wrap_snapshot.intersects_fold(Point::new(
+                                    block.placement.end().to_point(buffer_snapshot).row,
+                                    0,
+                                ))
+                        } else {
+                            start_is_folded
+                        };
+                        if hidden {
                             return None;
                         }
                         if let BlockPlacement::Above(row) = placement

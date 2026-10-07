@@ -86,7 +86,8 @@ pub use block_map::{
 };
 pub use crease_map::*;
 pub use fold_map::{
-    ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder, FoldPoint,
+    ChunkRenderer, ChunkRendererContext, ChunkRendererId, DecorativeFold, Fold, FoldId,
+    FoldPlaceholder, FoldPoint, TransientFold,
 };
 pub use inlay_map::{InlayOffset, InlayPoint};
 use invisibles::is_standalone_grapheme;
@@ -248,6 +249,13 @@ pub struct DisplayMap {
     pub(crate) fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
     pub(crate) masked: bool,
+    /// When true, a row is foldable only where a crease says so, and not
+    /// wherever the next line is indented further.
+    pub(crate) indent_folding_disabled: bool,
+    /// Whether unfolding a range also removes the blocks that replace rows in
+    /// it, which is how a folded diff hunk is expanded. An editor whose
+    /// replacing blocks are only decoration turns this off.
+    pub(crate) unfold_removes_replace_blocks: bool,
     pub(crate) diagnostics_max_severity: DiagnosticSeverity,
     pub(crate) companion: Option<(WeakEntity<DisplayMap>, Entity<Companion>)>,
     lsp_folding_crease_ids: HashMap<BufferId, Vec<CreaseId>>,
@@ -420,6 +428,8 @@ impl DisplayMap {
             semantic_token_highlights: Default::default(),
             clip_at_line_ends: false,
             masked: false,
+            indent_folding_disabled: false,
+            unfold_removes_replace_blocks: true,
             companion: None,
             lsp_folding_crease_ids: HashMap::default(),
         }
@@ -674,7 +684,8 @@ impl DisplayMap {
             semantic_token_highlights: self.semantic_token_highlights.clone(),
             clip_at_line_ends: self.clip_at_line_ends,
             masked: self.masked,
-            use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty(),
+            use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty()
+                || self.indent_folding_disabled,
             fold_placeholder: self.fold_placeholder.clone(),
         }
     }
@@ -698,7 +709,8 @@ impl DisplayMap {
             semantic_token_highlights: self.semantic_token_highlights.clone(),
             clip_at_line_ends: self.clip_at_line_ends,
             masked: self.masked,
-            use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty(),
+            use_lsp_folding_ranges: !self.lsp_folding_crease_ids.is_empty()
+                || self.indent_folding_disabled,
             fold_placeholder: self.fold_placeholder.clone(),
         }
     }
@@ -861,9 +873,13 @@ impl DisplayMap {
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
 
-        self.block_map
-            .write(self_new_wrap_snapshot.clone(), self_new_wrap_edits, None)
-            .remove_intersecting_replace_blocks(offset_ranges, inclusive);
+        let removes_replace_blocks = self.unfold_removes_replace_blocks;
+        let mut block_writer =
+            self.block_map
+                .write(self_new_wrap_snapshot.clone(), self_new_wrap_edits, None);
+        if removes_replace_blocks {
+            block_writer.remove_intersecting_replace_blocks(offset_ranges, inclusive);
+        }
 
         self_new_wrap_snapshot
     }
@@ -1524,7 +1540,8 @@ pub struct DisplaySnapshot {
     masked: bool,
     diagnostics_max_severity: DiagnosticSeverity,
     pub(crate) fold_placeholder: FoldPlaceholder,
-    /// When true, LSP folding ranges are used via the crease map and the
+    /// When true, folding ranges come only from the crease map (LSP folding
+    /// ranges, or an editor that turned indent folding off) and the
     /// indent-based fallback in `crease_for_buffer_row` is skipped.
     pub(crate) use_lsp_folding_ranges: bool,
 }
@@ -2199,6 +2216,32 @@ impl DisplaySnapshot {
     pub fn is_line_folded(&self, buffer_row: MultiBufferRow) -> bool {
         self.block_snapshot.is_line_replaced(buffer_row)
             || self.fold_snapshot().is_line_folded(buffer_row)
+    }
+
+    /// Whether something the user collapsed is on the row: `is_line_folded`,
+    /// except that folds which only stand in for hidden text (see
+    /// [`DecorativeFold`]) do not count.
+    pub fn is_line_collapsed(&self, buffer_row: MultiBufferRow) -> bool {
+        if !self.is_line_folded(buffer_row) {
+            return false;
+        }
+        if self.block_snapshot.is_line_replaced(buffer_row) {
+            return true;
+        }
+        let start = Point::new(buffer_row.0, 0);
+        let end = Point::new(buffer_row.0 + 1, 0).min(self.buffer_snapshot().max_point());
+        let mut folds = self.folds_in_range(start..end).peekable();
+        folds.peek().is_none() || folds.any(|fold| !fold.placeholder.is_decorative())
+    }
+
+    /// Whether any fold in the range is one the user collapsed, not a
+    /// [`DecorativeFold`].
+    pub fn has_collapsed_fold_in_range<T>(&self, range: Range<T>) -> bool
+    where
+        T: ToOffset,
+    {
+        self.folds_in_range(range)
+            .any(|fold| !fold.placeholder.is_decorative())
     }
 
     pub fn is_block_line(&self, display_row: DisplayRow) -> bool {

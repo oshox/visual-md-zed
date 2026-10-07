@@ -2317,6 +2317,117 @@ fn test_fold_at_level_chain_fold(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// A heading with its marker hidden by a decorative fold and a section crease
+/// under it, which is how Zed MD lays out a foldable heading.
+fn fold_a_heading_with_a_hidden_marker(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let marker = Crease::simple(
+        snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(0, 2)),
+        FoldPlaceholder {
+            type_tag: Some(std::any::TypeId::of::<DecorativeFold>()),
+            merge_adjacent: false,
+            ..FoldPlaceholder::test()
+        },
+    )
+    .without_gutter_toggle();
+    let section = Crease::simple(
+        snapshot.anchor_after(Point::new(0, 7))..snapshot.anchor_after(Point::new(2, 8)),
+        FoldPlaceholder {
+            type_tag: Some(std::any::TypeId::of::<TransientFold>()),
+            merge_adjacent: false,
+            ..FoldPlaceholder::test()
+        },
+    );
+    editor.insert_creases([marker.clone(), section], cx);
+    editor.fold_creases(vec![marker], false, window, cx);
+}
+
+#[gpui::test]
+fn test_a_hidden_marker_does_not_make_its_line_collapsed(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("# Title\nbody one\nbody two\n\n# Next\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            fold_a_heading_with_a_hidden_marker(editor, window, cx);
+            let snapshot = editor.display_snapshot(cx);
+            assert!(snapshot.is_line_folded(MultiBufferRow(0)));
+            assert!(!snapshot.is_line_collapsed(MultiBufferRow(0)));
+
+            let crease = snapshot
+                .crease_for_buffer_row(MultiBufferRow(0))
+                .expect("the heading has a crease");
+            assert_eq!(crease.range().start, Point::new(0, 7));
+
+            editor.fold_at(MultiBufferRow(0), window, cx);
+            assert_eq!(editor.display_text(cx), "⋯Title⋯\n\n# Next\n");
+            let snapshot = editor.display_snapshot(cx);
+            assert!(snapshot.is_line_collapsed(MultiBufferRow(0)));
+            assert!(!snapshot.is_line_collapsed(MultiBufferRow(4)));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn test_toggle_fold_folds_and_unfolds_the_section_and_keeps_the_marker_hidden(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("# Title\nbody one\nbody two\n\n# Next\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            fold_a_heading_with_a_hidden_marker(editor, window, cx);
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 3)..Point::new(0, 3)]);
+            });
+
+            editor.toggle_fold(&actions::ToggleFold, window, cx);
+            assert_eq!(editor.display_text(cx), "⋯Title⋯\n\n# Next\n");
+
+            editor.toggle_fold(&actions::ToggleFold, window, cx);
+            assert_eq!(
+                editor.display_text(cx),
+                "⋯Title\nbody one\nbody two\n\n# Next\n"
+            );
+
+            editor.fold_at(MultiBufferRow(0), window, cx);
+            editor.unfold_all(&actions::UnfoldAll, window, cx);
+            assert_eq!(
+                editor.display_text(cx),
+                "⋯Title\nbody one\nbody two\n\n# Next\n"
+            );
+
+            editor.toggle_fold_all(&actions::ToggleFoldAll, window, cx);
+            assert_eq!(editor.display_text(cx), "⋯Title⋯\n\n# Next\n");
+        })
+        .unwrap();
+}
+
+#[test]
+fn test_only_folds_the_user_collapsed_are_saved_with_the_file() {
+    let tagged = |type_id| FoldPlaceholder {
+        type_tag: Some(type_id),
+        ..FoldPlaceholder::test()
+    };
+    assert!(FoldPlaceholder::test().is_saved_with_file());
+    assert!(!tagged(std::any::TypeId::of::<DecorativeFold>()).is_saved_with_file());
+    assert!(!tagged(std::any::TypeId::of::<TransientFold>()).is_saved_with_file());
+    assert!(tagged(std::any::TypeId::of::<u8>()).is_saved_with_file());
+}
+
 #[gpui::test]
 fn test_fold_at_level_with_single_row_crease(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
@@ -9399,6 +9510,81 @@ async fn test_selections_and_replace_blocks(cx: &mut TestAppContext) {
         "
         .unindent(),
     );
+}
+
+#[gpui::test]
+fn test_a_replace_block_inside_a_fold_leaves_the_row_the_fold_is_on_alone(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    for keep_blocks in [true, false] {
+        let editor = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("zero\none\ntwo\nthree\nfour\n", cx);
+            build_editor(buffer, window, cx)
+        });
+
+        editor
+            .update(cx, |editor, window, cx| {
+                editor.set_unfold_removes_replace_blocks(!keep_blocks, cx);
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                editor.insert_blocks(
+                    [BlockProperties {
+                        placement: BlockPlacement::Replace(
+                            snapshot.anchor_after(Point::new(2, 0))
+                                ..=snapshot.anchor_after(Point::new(2, 3)),
+                        ),
+                        height: Some(1),
+                        style: BlockStyle::Fixed,
+                        render: Arc::new(|_| gpui::div().into_any_element()),
+                        priority: 0,
+                    }],
+                    None,
+                    cx,
+                );
+                assert_eq!(editor.display_text(cx), "zero\none\n\nthree\nfour\n");
+
+                editor.fold_ranges(vec![Point::new(0, 4)..Point::new(3, 5)], false, window, cx);
+                assert_eq!(editor.display_text(cx), "zero⋯\nfour\n");
+
+                editor.unfold_all(&actions::UnfoldAll, window, cx);
+                let expected = if keep_blocks {
+                    "zero\none\n\nthree\nfour\n"
+                } else {
+                    "zero\none\ntwo\nthree\nfour\n"
+                };
+                assert_eq!(editor.display_text(cx), expected);
+            })
+            .unwrap();
+    }
+}
+
+#[gpui::test]
+fn test_a_line_followed_by_an_indented_one_folds_unless_indent_folding_is_off(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("outer\n    inner\nnext\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    editor
+        .update(cx, |editor, _, cx| {
+            let foldable = |editor: &Editor, cx: &mut Context<Editor>| {
+                editor
+                    .display_snapshot(cx)
+                    .crease_for_buffer_row(MultiBufferRow(0))
+                    .is_some()
+            };
+            assert!(foldable(editor, cx));
+
+            editor.set_indent_folding(false, cx);
+            assert!(!foldable(editor, cx));
+
+            editor.set_indent_folding(true, cx);
+            assert!(foldable(editor, cx));
+        })
+        .unwrap();
 }
 
 #[gpui::test]
