@@ -243,6 +243,7 @@ mod inline_scan;
 mod links;
 mod list_continuation;
 mod list_edit;
+mod note_contents;
 mod notes;
 pub mod outline;
 mod plan;

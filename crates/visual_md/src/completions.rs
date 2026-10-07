@@ -1,12 +1,15 @@
 //! Completions Zed MD adds to Markdown editors on top of the editor's own:
-//! the commands of extensions when `/` is typed at the start of a line, and
-//! what extensions suggest after `[[`.
+//! the commands of extensions when `/` is typed at the start of a line, the
+//! notes of the project, their headings and block ids after `[[` (and images
+//! after `![[`), the tags in use after `#`, and what extensions suggest after
+//! `[[` besides.
 //!
 //! The provider wraps whichever one the editor had, forwards everything it does
 //! not handle itself, and hands the original back when live preview stops
 //! showing.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,9 +24,16 @@ use project::{
     lsp_store::CompletionDocumentation,
 };
 
+use util::ResultExt as _;
+
 use crate::VisualMdAddon;
 use crate::commands::RunExtensionCommand;
 use crate::extensions::{ExtensionCommand, HookError, VisualMdExtensions, when_not_busy};
+use crate::note_contents;
+use crate::notes::{self, NoteIndex, Resolution};
+
+/// The most notes, headings or block ids offered at once.
+const MAX_SUGGESTIONS: usize = 1_000;
 
 /// The most Markdown files of the project that go to an extension with a
 /// completion request.
@@ -34,8 +44,11 @@ pub const MAX_FILES_PER_REQUEST: usize = 2_000;
 pub enum Trigger {
     /// `/` at the start of a line, then what was typed after it.
     Slash { query: String },
-    /// `[[` or `![[`, then what was typed after it.
-    Wikilink { query: String },
+    /// `[[` or `![[`, then what was typed after it, which may be a `Note#heading`
+    /// or a `Note#^block`.
+    Wikilink { query: String, embed: bool },
+    /// `#` in the middle of a line, then what was typed after it.
+    Tag { query: String },
 }
 
 /// What `prefix`, the text of a line up to the cursor, asks completions for.
@@ -51,9 +64,40 @@ pub fn trigger_in(prefix: &str) -> Option<Trigger> {
         });
     }
 
-    let open = prefix.rfind("[[")?;
-    let query = prefix.get(open + 2..)?;
-    (!query.contains(['[', ']', '|'])).then(|| Trigger::Wikilink {
+    if let Some(open) = prefix.rfind("[[")
+        && let Some(query) = prefix.get(open + 2..)
+        && !query.contains(['[', ']', '|'])
+    {
+        return Some(Trigger::Wikilink {
+            query: query.to_string(),
+            embed: prefix
+                .get(..open)
+                .is_some_and(|before| before.ends_with('!')),
+        });
+    }
+
+    tag_in(prefix)
+}
+
+fn is_tag_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '/' | '-')
+}
+
+/// The `#tag` being typed at the end of `prefix`. A `#` that is not at the start
+/// of a word is not one (`https://example.com/#top`, `##`), and neither is a `#`
+/// that starts a line with nothing after it yet, which is the start of a heading.
+fn tag_in(prefix: &str) -> Option<Trigger> {
+    let hash = prefix.rfind('#')?;
+    let query = prefix.get(hash + 1..)?;
+    if !query.chars().all(is_tag_character) {
+        return None;
+    }
+    let before = prefix.get(..hash)?;
+    let starts_a_word = before.chars().next_back().is_none_or(|character| {
+        character.is_whitespace() || matches!(character, '(' | '[' | '{' | ',' | ';')
+    });
+    let starts_a_line = before.trim().is_empty();
+    (starts_a_word && !(starts_a_line && query.is_empty())).then(|| Trigger::Tag {
         query: query.to_string(),
     })
 }
@@ -148,15 +192,183 @@ impl VisualMdCompletionProvider {
         }
     }
 
-    /// What the extensions suggest for `query` after `[[`.
+    /// The notes of the project for `query` after `[[`, or after `![[` with
+    /// `embed`, and with a `#` in it the headings or block ids of the note before
+    /// it.
+    fn builtin_wikilink_completions(
+        &self,
+        query: &str,
+        embed: bool,
+        buffer: &Entity<Buffer>,
+        replace_range: &Range<Anchor>,
+        close_brackets: bool,
+        cx: &mut App,
+    ) -> Task<Vec<Completion>> {
+        let Some(project) = self.project.clone() else {
+            return Task::ready(Vec::new());
+        };
+        let index = NoteIndex::for_project(&project, cx);
+        let from = notes::location_of(buffer.read(cx), cx);
+        let closing = if close_brackets { "]]" } else { "" };
+        let match_start = replace_range.start;
+        let completion = |label: String, insert: String, detail: Option<String>| {
+            simple_completion(
+                label,
+                format!("{insert}{closing}"),
+                detail,
+                replace_range.clone(),
+                match_start,
+            )
+        };
+
+        let Some((note, rest)) = query.split_once('#') else {
+            return Task::ready(
+                index
+                    .read(cx)
+                    .suggestions(from.as_ref(), embed)
+                    .into_iter()
+                    .take(MAX_SUGGESTIONS)
+                    .map(|suggestion| {
+                        completion(
+                            suggestion.name.clone(),
+                            suggestion.name,
+                            Some(suggestion.path),
+                        )
+                    })
+                    .collect(),
+            );
+        };
+
+        let note = note.to_string();
+        let wants_blocks = rest.starts_with('^');
+        let text: Task<Option<String>> = if note.trim().is_empty() {
+            Task::ready(Some(buffer.read(cx).text()))
+        } else {
+            match index.read(cx).resolve(&note, from.as_ref()) {
+                Resolution::Found(file) => {
+                    let opened = project.update(cx, |project, cx| {
+                        project.open_buffer(file.project_path(), cx)
+                    });
+                    cx.spawn(async move |cx| {
+                        let buffer = opened.await.log_err()?;
+                        Some(buffer.read_with(cx, |buffer, _| buffer.text()))
+                    })
+                }
+                _ => Task::ready(None),
+            }
+        };
+        let replace_range = replace_range.clone();
+        let closing = closing.to_string();
+        cx.spawn(async move |_| {
+            let Some(text) = text.await else {
+                return Vec::new();
+            };
+            let build = |label: String, detail: String| {
+                simple_completion(
+                    label.clone(),
+                    format!("{label}{closing}"),
+                    Some(detail),
+                    replace_range.clone(),
+                    match_start,
+                )
+            };
+            if wants_blocks {
+                note_contents::block_ids(&text)
+                    .into_iter()
+                    .take(MAX_SUGGESTIONS)
+                    .map(|block| build(format!("{note}#^{}", block.id), block.preview))
+                    .collect()
+            } else {
+                note_contents::headings(&text)
+                    .into_iter()
+                    .take(MAX_SUGGESTIONS)
+                    .map(|heading| {
+                        build(
+                            format!("{note}#{}", heading.text),
+                            format!("Heading {}", heading.level),
+                        )
+                    })
+                    .collect()
+            }
+        })
+    }
+
+    /// The tags in use, the most used first, for a `#` being typed.
+    fn tag_completions(
+        &self,
+        buffer: &Entity<Buffer>,
+        replace_range: Range<Anchor>,
+        cx: &mut App,
+    ) -> Task<CompletionResponse> {
+        // The tag being typed is not one in use: leave it out of the text.
+        let snapshot = buffer.read(cx).snapshot();
+        let typed =
+            replace_range.start.to_offset(&snapshot)..replace_range.end.to_offset(&snapshot);
+        let mut text = snapshot.text();
+        text.replace_range(typed, "");
+        let in_this_note = note_contents::tags(&text);
+        let in_the_project = self
+            .project
+            .as_ref()
+            .map(|project| note_contents::project_tags(project, cx));
+        let match_start = replace_range.start;
+        cx.spawn(async move |_| {
+            let counts = match in_the_project {
+                Some(task) => task.await,
+                None => Default::default(),
+            };
+            let mut seen = HashSet::new();
+            let used: Vec<(String, usize)> = counts
+                .iter()
+                .cloned()
+                .chain(in_this_note.into_iter().map(|name| (name, 1)))
+                .filter(|(name, _)| seen.insert(name.clone()))
+                .take(MAX_SUGGESTIONS)
+                .collect();
+            let completions = used
+                .into_iter()
+                .map(|(name, count)| {
+                    let detail = if count == 1 {
+                        "1 note".to_string()
+                    } else {
+                        format!("{count} notes")
+                    };
+                    simple_completion(
+                        format!("#{name}"),
+                        format!("#{name}"),
+                        Some(detail),
+                        replace_range.clone(),
+                        match_start,
+                    )
+                })
+                .collect();
+            CompletionResponse {
+                completions,
+                display_options: CompletionDisplayOptions::default(),
+                is_incomplete: true,
+            }
+        })
+    }
+
+    /// What the project and the extensions suggest for `query` after `[[`.
     fn wikilink_completions(
         &self,
         query: String,
+        embed: bool,
+        buffer: &Entity<Buffer>,
         document_path: Option<String>,
         replace_range: Range<Anchor>,
         close_brackets: bool,
         cx: &mut App,
     ) -> Task<CompletionResponse> {
+        let builtin = self.builtin_wikilink_completions(
+            &query,
+            embed,
+            buffer,
+            &replace_range,
+            close_brackets,
+            cx,
+        );
         let completers = cx
             .try_global::<VisualMdExtensions>()
             .map(|registry| registry.wikilink_completers())
@@ -172,7 +384,11 @@ impl VisualMdCompletionProvider {
             files,
         };
         cx.spawn(async move |cx| {
-            let mut completions = Vec::new();
+            let mut completions = builtin.await;
+            let mut labels: HashSet<String> = completions
+                .iter()
+                .map(|completion| completion.label.text().to_string())
+                .collect();
             for extension_id in completers {
                 let answer = when_not_busy(cx, |cx| match cx.try_global::<VisualMdExtensions>() {
                     Some(registry) => registry.complete(&extension_id, request.clone(), cx),
@@ -180,11 +396,14 @@ impl VisualMdCompletionProvider {
                 })
                 .await;
                 match answer {
-                    Ok(items) => {
-                        completions.extend(items.into_iter().map(|item| {
-                            completion_for(item, replace_range.clone(), close_brackets)
-                        }))
-                    }
+                    Ok(items) => completions.extend(
+                        items
+                            .into_iter()
+                            .map(|item| completion_for(item, replace_range.clone(), close_brackets))
+                            .filter(|completion| {
+                                labels.insert(completion.label.text().to_string())
+                            }),
+                    ),
                     Err(error) => log::warn!(
                         "extension {extension_id} could not complete a wikilink: {error}"
                     ),
@@ -208,17 +427,33 @@ fn completion_for(
     if close_brackets {
         new_text.push_str("]]");
     }
-    Completion {
-        replace_range: replace_range.clone(),
+    let match_start = replace_range.start;
+    simple_completion(
+        item.label,
         new_text,
-        label: CodeLabel::plain(item.label, None),
-        documentation: item
-            .detail
-            .map(|detail| CompletionDocumentation::SingleLine(detail.into())),
+        item.detail,
+        replace_range,
+        match_start,
+    )
+}
+
+/// A completion that replaces `replace_range` with `new_text`.
+fn simple_completion(
+    label: String,
+    new_text: String,
+    detail: Option<String>,
+    replace_range: Range<Anchor>,
+    match_start: Anchor,
+) -> Completion {
+    Completion {
+        replace_range,
+        new_text,
+        label: CodeLabel::plain(label, None),
+        documentation: detail.map(|detail| CompletionDocumentation::SingleLine(detail.into())),
         source: CompletionSource::Custom,
         icon_path: None,
         icon_color: None,
-        match_start: Some(replace_range.start),
+        match_start: Some(match_start),
         snippet_deduplication_key: None,
         insert_text_mode: None,
         confirm: None,
@@ -247,16 +482,22 @@ impl CompletionProvider for VisualMdCompletionProvider {
         let snapshot = buffer.read(cx).snapshot();
         let cursor = buffer_position.to_offset(&snapshot);
         let query_length = match &trigger {
-            Trigger::Slash { query } | Trigger::Wikilink { query } => query.len(),
+            Trigger::Slash { query } | Trigger::Wikilink { query, .. } | Trigger::Tag { query } => {
+                query.len()
+            }
         };
         let query_start = cursor.saturating_sub(query_length);
+        // The `/` and the `#` are replaced with what is chosen.
         let extra = match &trigger {
-            Trigger::Slash { .. } => 1,
+            Trigger::Slash { .. } | Trigger::Tag { .. } => 1,
             Trigger::Wikilink { .. } => 0,
         };
         let replace_range = snapshot.anchor_before(query_start.saturating_sub(extra))
             ..snapshot.anchor_after(cursor);
-        let match_start = snapshot.anchor_before(query_start);
+        let match_start = match &trigger {
+            Trigger::Tag { .. } => replace_range.start,
+            _ => snapshot.anchor_before(query_start),
+        };
 
         let ours: Task<CompletionResponse> = match trigger {
             Trigger::Slash { query } => Task::ready(Self::slash_completions(
@@ -265,18 +506,21 @@ impl CompletionProvider for VisualMdCompletionProvider {
                 match_start,
                 cx,
             )),
-            Trigger::Wikilink { query } => {
+            Trigger::Wikilink { query, embed } => {
                 let after_cursor: String = snapshot
                     .text_for_range(cursor..(cursor + 2).min(snapshot.len()))
                     .collect();
                 self.wikilink_completions(
                     query,
+                    embed,
+                    buffer,
                     crate::fence_render::buffer_path(buffer, cx),
                     snapshot.anchor_before(query_start)..snapshot.anchor_after(cursor),
                     after_cursor != "]]",
                     cx,
                 )
             }
+            Trigger::Tag { .. } => self.tag_completions(buffer, replace_range, cx),
         };
 
         cx.spawn(async move |_, _| {
@@ -342,7 +586,16 @@ impl CompletionProvider for VisualMdCompletionProvider {
             ),
             "[" => matches!(
                 trigger_in(&Self::line_prefix(buffer, position, cx)),
-                Some(Trigger::Wikilink { query }) if query.is_empty()
+                Some(Trigger::Wikilink { query, .. }) if query.is_empty()
+            ),
+            "#" => match trigger_in(&Self::line_prefix(buffer, position, cx)) {
+                Some(Trigger::Tag { query }) => query.is_empty(),
+                Some(Trigger::Wikilink { query, .. }) => query.ends_with('#'),
+                _ => false,
+            },
+            "^" => matches!(
+                trigger_in(&Self::line_prefix(buffer, position, cx)),
+                Some(Trigger::Wikilink { query, .. }) if query.ends_with("#^")
             ),
             _ => false,
         };
@@ -425,6 +678,20 @@ mod tests {
     fn wikilink(query: &str) -> Option<Trigger> {
         Some(Trigger::Wikilink {
             query: query.to_string(),
+            embed: false,
+        })
+    }
+
+    fn embed(query: &str) -> Option<Trigger> {
+        Some(Trigger::Wikilink {
+            query: query.to_string(),
+            embed: true,
+        })
+    }
+
+    fn tag(query: &str) -> Option<Trigger> {
+        Some(Trigger::Tag {
+            query: query.to_string(),
         })
     }
 
@@ -451,10 +718,37 @@ mod tests {
     fn test_double_brackets_ask_for_names() {
         assert_eq!(trigger_in("[["), wikilink(""));
         assert_eq!(trigger_in("see [[No"), wikilink("No"));
-        assert_eq!(trigger_in("![[pi"), wikilink("pi"));
+        assert_eq!(trigger_in("![[pi"), embed("pi"));
+        assert_eq!(trigger_in("see ![["), embed(""));
+        assert_eq!(trigger_in("[[Note#"), wikilink("Note#"));
+        assert_eq!(trigger_in("[[Note#^ab"), wikilink("Note#^ab"));
+        assert_eq!(trigger_in("[[#Head"), wikilink("#Head"));
         assert_eq!(trigger_in("[[a]] and [[b"), wikilink("b"));
         assert_eq!(trigger_in("[[two words"), wikilink("two words"));
         assert_eq!(trigger_in("- [[é"), wikilink("é"));
+    }
+
+    #[test]
+    fn test_a_hash_in_the_middle_of_a_line_asks_for_tags() {
+        assert_eq!(trigger_in("text #"), tag(""));
+        assert_eq!(trigger_in("text #wo"), tag("wo"));
+        assert_eq!(trigger_in("- item #nested/ta"), tag("nested/ta"));
+        assert_eq!(trigger_in("(#idea"), tag("idea"));
+        assert_eq!(trigger_in("see [[a]] and #t"), tag("t"));
+        assert_eq!(trigger_in("#tag"), tag("tag"));
+        assert_eq!(trigger_in("  #é"), tag("é"));
+    }
+
+    #[test]
+    fn test_a_hash_that_starts_a_heading_or_is_not_a_word_asks_for_nothing() {
+        assert_eq!(trigger_in("#"), None);
+        assert_eq!(trigger_in("## "), None);
+        assert_eq!(trigger_in("##"), None);
+        assert_eq!(trigger_in("# Title"), None);
+        assert_eq!(trigger_in("text https://example.com/#top"), None);
+        assert_eq!(trigger_in("text a#b"), None);
+        assert_eq!(trigger_in("text ##tag"), None);
+        assert_eq!(trigger_in("text #two words"), None);
     }
 
     #[test]
@@ -473,7 +767,7 @@ mod integration_tests {
     use editor::test::editor_test_context::EditorTestContext;
     use extension::{VisualMdCommandResult, VisualMdTextEdit};
     use fs::FakeFs;
-    use gpui::TestAppContext;
+    use gpui::{AppContext as _, Focusable as _, TestAppContext};
     use serde_json::json;
 
     use crate::extensions::test_support::{Behavior, FakeHooks, register};
@@ -699,6 +993,272 @@ mod integration_tests {
         type_text(&mut cx, "[");
         type_text(&mut cx, "[");
         assert!(labels(&mut cx).unwrap_or_default().is_empty());
+    }
+
+    struct ProjectEditor {
+        window: gpui::WindowHandle<Editor>,
+    }
+
+    /// An editor on `path` of a project with `files`, ready to type at the end of it.
+    async fn project_editor(
+        cx: &mut TestAppContext,
+        files: serde_json::Value,
+        path: &str,
+    ) -> ProjectEditor {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/dir", files).await;
+        let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(path, cx))
+            .await
+            .expect("the file opens");
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(markdown_language()), cx)
+        });
+        let multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let window = cx.add_window({
+            let project = project.clone();
+            |window, cx| {
+                Editor::new(
+                    editor::EditorMode::full(),
+                    multi_buffer,
+                    Some(project),
+                    window,
+                    cx,
+                )
+            }
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                crate::refresh(editor, window, cx);
+                window.focus(&editor.focus_handle(cx), cx);
+                let end = editor.buffer().read(cx).len(cx);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([end..end]);
+                });
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+        ProjectEditor { window }
+    }
+
+    impl ProjectEditor {
+        /// Types one character at a time, as a keyboard does: a menu opens on a
+        /// character that triggers one, not on a string that contains it.
+        fn type_text(&self, cx: &mut TestAppContext, text: &str) {
+            for character in text.chars() {
+                self.window
+                    .update(cx, |editor, window, cx| {
+                        editor.handle_input(&character.to_string(), window, cx)
+                    })
+                    .expect("the window is open");
+                cx.run_until_parked();
+            }
+        }
+
+        fn labels(&self, cx: &mut TestAppContext) -> Vec<String> {
+            self.window
+                .read_with(cx, |editor, _| {
+                    editor
+                        .current_completions()
+                        .map(|completions| {
+                            completions
+                                .iter()
+                                .map(|completion| completion.label.text().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .expect("the window is open")
+        }
+
+        async fn confirm(&self, cx: &mut TestAppContext) {
+            let task = self
+                .window
+                .update(cx, |editor, window, cx| {
+                    editor.confirm_completion(&ConfirmCompletion::default(), window, cx)
+                })
+                .expect("the window is open");
+            if let Some(task) = task {
+                task.await.expect("the completion is applied");
+            }
+            cx.run_until_parked();
+        }
+
+        fn text(&self, cx: &mut TestAppContext) -> String {
+            self.window
+                .update(cx, |editor, _, cx| editor.text(cx))
+                .expect("the window is open")
+        }
+    }
+
+    fn notes() -> serde_json::Value {
+        json!({
+            "current.md": "see ",
+            "Plan.md": "# Goals\n\ntext ^goal-1\n\n## Next steps\n\nmore ^next\n",
+            "sub": { "Idea.md": "#work and #idea\n" },
+            "pic.png": "",
+            "docs.txt": "#hidden",
+        })
+    }
+
+    #[gpui::test]
+    async fn test_double_brackets_offer_the_notes_of_the_project(cx: &mut TestAppContext) {
+        setup(cx);
+        let editor = project_editor(cx, notes(), "/dir/current.md").await;
+
+        editor.type_text(cx, "[[");
+
+        assert_eq!(
+            editor.labels(cx),
+            ["Plan", "current", "Idea", "Alpha", "Beta", "Gamma"].map(String::from),
+            "the notes next to this one first, then the extension's"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_choosing_a_note_fills_in_its_name_and_closes_the_brackets(
+        cx: &mut TestAppContext,
+    ) {
+        setup(cx);
+        let editor = project_editor(cx, notes(), "/dir/current.md").await;
+
+        editor.type_text(cx, "[[pl");
+        editor.confirm(cx).await;
+
+        assert_eq!(editor.text(cx), "see [[Plan]]");
+    }
+
+    #[gpui::test]
+    async fn test_an_embed_offers_images_besides_notes(cx: &mut TestAppContext) {
+        setup(cx);
+        let editor = project_editor(cx, notes(), "/dir/current.md").await;
+
+        editor.type_text(cx, "![[");
+
+        let labels = editor.labels(cx);
+        assert!(labels.contains(&"pic.png".to_string()), "{labels:?}");
+        assert!(labels.contains(&"Plan".to_string()), "{labels:?}");
+    }
+
+    #[gpui::test]
+    async fn test_a_note_followed_by_a_hash_offers_its_headings(cx: &mut TestAppContext) {
+        setup(cx);
+        let editor = project_editor(cx, notes(), "/dir/current.md").await;
+
+        editor.type_text(cx, "[[plan#");
+        assert_eq!(
+            editor.labels(cx),
+            ["plan#Goals", "plan#Next steps"].map(String::from)
+        );
+
+        editor.type_text(cx, "nex");
+        editor.confirm(cx).await;
+        assert_eq!(editor.text(cx), "see [[plan#Next steps]]");
+    }
+
+    #[gpui::test]
+    async fn test_a_note_followed_by_a_hash_and_a_caret_offers_its_block_ids(
+        cx: &mut TestAppContext,
+    ) {
+        setup(cx);
+        let editor = project_editor(cx, notes(), "/dir/current.md").await;
+
+        editor.type_text(cx, "[[Plan#^");
+
+        assert_eq!(
+            editor.labels(cx),
+            ["Plan#^goal-1", "Plan#^next"].map(String::from)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_hash_alone_offers_the_headings_of_the_note_being_edited(
+        cx: &mut TestAppContext,
+    ) {
+        setup(cx);
+        let editor = project_editor(
+            cx,
+            json!({ "current.md": "# Top\n\n## Part\n\nsee " }),
+            "/dir/current.md",
+        )
+        .await;
+
+        editor.type_text(cx, "[[#");
+
+        assert_eq!(editor.labels(cx), ["#Top", "#Part"].map(String::from));
+    }
+
+    #[gpui::test]
+    async fn test_a_note_that_is_not_there_offers_no_headings(cx: &mut TestAppContext) {
+        setup(cx);
+        let editor = project_editor(cx, notes(), "/dir/current.md").await;
+
+        editor.type_text(cx, "[[nothing#");
+
+        assert_eq!(editor.labels(cx), Vec::<String>::new());
+    }
+
+    #[gpui::test]
+    async fn test_a_hash_in_a_line_offers_the_tags_in_use_the_most_used_first(
+        cx: &mut TestAppContext,
+    ) {
+        setup(cx);
+        let editor = project_editor(
+            cx,
+            json!({
+                "current.md": "#local and ",
+                "a.md": "#work #idea",
+                "b.md": "#work",
+            }),
+            "/dir/current.md",
+        )
+        .await;
+
+        editor.type_text(cx, "#");
+        assert_eq!(
+            editor.labels(cx),
+            ["#work", "#idea", "#local"].map(String::from)
+        );
+
+        editor.type_text(cx, "wo");
+        editor.confirm(cx).await;
+        assert_eq!(editor.text(cx), "#local and #work");
+    }
+
+    #[gpui::test]
+    async fn test_a_hash_that_starts_a_line_opens_no_menu(cx: &mut TestAppContext) {
+        setup(cx);
+        let editor = project_editor(
+            cx,
+            json!({ "current.md": "text\n", "a.md": "#work" }),
+            "/dir/current.md",
+        )
+        .await;
+
+        editor.type_text(cx, "#");
+
+        assert_eq!(editor.labels(cx), Vec::<String>::new());
+    }
+
+    #[gpui::test]
+    async fn test_what_the_project_and_an_extension_both_suggest_is_listed_once(
+        cx: &mut TestAppContext,
+    ) {
+        setup(cx);
+        let editor = project_editor(
+            cx,
+            json!({ "current.md": "see ", "Alpha.md": "", "Zulu.md": "" }),
+            "/dir/current.md",
+        )
+        .await;
+
+        editor.type_text(cx, "[[");
+
+        assert_eq!(
+            editor.labels(cx),
+            ["Alpha", "Zulu", "current", "Beta", "Gamma"].map(String::from)
+        );
     }
 
     /// A provider that offers one fixed item, to see what Zed MD forwards.
