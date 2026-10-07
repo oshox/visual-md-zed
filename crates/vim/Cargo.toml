@@ -73,5 +73,6 @@ settings_ui.workspace = true
 settings.workspace = true
 perf.workspace = true
 util = { workspace = true, features = ["test-support"] }
+visual_md.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
 search = { workspace = true, features = ["test-support"] }

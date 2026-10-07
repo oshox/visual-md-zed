@@ -50,6 +50,110 @@ async fn test_initially_disabled(cx: &mut gpui::TestAppContext) {
     cx.assert_editor_state("hjklˇ");
 }
 
+/// Vim binds `ctrl-b` and `ctrl-i` in the editor context too, and its
+/// keymap loads last, so in a visual selection it used to win over bold and
+/// italic. Resolves the keys against the real bundled keymaps, with the
+/// contexts the editor has with Vim on and live preview showing.
+#[gpui::test]
+async fn test_zed_md_bold_and_italic_win_in_visual_mode_off_macos(cx: &mut gpui::TestAppContext) {
+    use gpui::{KeyContext, Keymap, Keystroke};
+
+    VimTestContext::init(cx);
+    // Linking the crate is what registers Zed MD's actions, without which its
+    // bindings would be dropped when the keymap is read.
+    let _ = visual_md::init as fn(&mut gpui::App);
+    let action_for = |cx: &mut gpui::TestAppContext, os: &str, editor: &str, key: &str| {
+        cx.update(|cx| {
+            let load = |asset: &str| {
+                settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                    .expect("the keymap loads")
+            };
+            let defaults = match os {
+                "macos" => "keymaps/default-macos.json",
+                "windows" => "keymaps/default-windows.json",
+                _ => "keymaps/default-linux.json",
+            };
+            let mut keymap = Keymap::default();
+            keymap.add_bindings(load(defaults));
+            keymap.add_bindings(load("keymaps/vim.json"));
+            // The editor's own context carries `os`, and a predicate is
+            // matched against the innermost context only.
+            let contexts =
+                [KeyContext::parse(&format!("{editor} os={os}")).expect("a valid context")];
+            let keystroke = Keystroke::parse(key).expect("a valid key");
+            let (bindings, _) = keymap.bindings_for_input(&[keystroke], &contexts);
+            bindings
+                .first()
+                .map(|binding| binding.action().name().to_string())
+        })
+    };
+
+    let visual = "Editor mode=full VimControl vim_mode=visual visual_md";
+    let normal = "Editor mode=full VimControl vim_mode=normal visual_md";
+    let insert = "Editor mode=full vim_mode=insert visual_md";
+    let no_live_preview = "Editor mode=full VimControl vim_mode=visual";
+    for os in ["linux", "windows"] {
+        assert_eq!(
+            action_for(cx, os, visual, "ctrl-b").as_deref(),
+            Some("visual_md::ToggleBold"),
+            "{os}"
+        );
+        assert_eq!(
+            action_for(cx, os, visual, "ctrl-i").as_deref(),
+            Some("visual_md::ToggleItalic"),
+            "{os}"
+        );
+        assert_eq!(
+            action_for(cx, os, normal, "ctrl-b").as_deref(),
+            Some("vim::PageUp"),
+            "normal mode keeps Vim's key on {os}"
+        );
+        assert_eq!(
+            action_for(cx, os, normal, "ctrl-i").as_deref(),
+            Some("pane::GoForward"),
+            "{os}"
+        );
+        assert_eq!(
+            action_for(cx, os, insert, "ctrl-b").as_deref(),
+            Some("visual_md::ToggleBold"),
+            "insert mode never lost it on {os}"
+        );
+        assert_eq!(
+            action_for(cx, os, no_live_preview, "ctrl-b").as_deref(),
+            Some("vim::PageUp"),
+            "without live preview the Vim key stays on {os}"
+        );
+    }
+    assert_eq!(
+        action_for(cx, "macos", visual, "ctrl-b").as_deref(),
+        Some("vim::PageUp"),
+        "on macOS bold is cmd-b, and ctrl-b stays Vim's"
+    );
+    assert_eq!(
+        action_for(cx, "macos", visual, "cmd-b").as_deref(),
+        Some("visual_md::ToggleBold")
+    );
+}
+
+/// With Vim on, Zed MD's bold shortcut wraps a visual selection, which Vim's
+/// own `ctrl-b` used to take.
+#[gpui::test]
+async fn test_zed_md_bold_wraps_a_visual_selection(cx: &mut gpui::TestAppContext) {
+    VimTestContext::init(cx);
+    cx.update(visual_md::init);
+    let mut cx = VimTestContext::new_markdown_with_rust(cx).await;
+    cx.set_state("ˇhello world", Mode::Normal);
+
+    cx.simulate_keystrokes("v e");
+    cx.assert_state("«helloˇ» world", Mode::Visual);
+    cx.simulate_keystrokes("ctrl-b");
+
+    assert_eq!(
+        cx.update_editor(|editor, _, cx| editor.text(cx)),
+        "**hello** world"
+    );
+}
+
 #[gpui::test]
 async fn test_unbound_standalone_modifiers_preserve_operator(cx: &mut TestAppContext) {
     let mut cx = VimTestContext::new(cx, true).await;
