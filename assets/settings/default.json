@@ -192,7 +192,8 @@
     // code_block.background, task.checked, and callout.<type> with accent and
     // background. A color left unset falls back to the `visual_md.*` token of
     // the same name in the active theme's `syntax` map, then to a default
-    // derived from the theme.
+    // derived from the theme. Highlights and inline code have a chip behind
+    // them by default; a transparent color such as "#00000000" takes it away.
     "colors": {},
     // Custom callout types, for example
     // `"todo": { "icon": "check", "accent": "#3b82f6", "background": "#3b82f622" }`.

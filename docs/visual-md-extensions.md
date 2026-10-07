@@ -292,8 +292,9 @@ extension's style is drawn over Zed MD's own where it sets the same thing.
 
 Zed MD's own decorations win. Text an extension asks to hide or replace is left
 alone when it overlaps anything Zed MD folds or reveals itself: its hidden
-markers, bullets, checkboxes, callout titles, table pipes, spacing and
-delimiter rows, rules, images and fenced blocks. Where two extensions' ranges
+markers, bullets, checkboxes and task marks, callout titles, table pipes,
+spacing and delimiter rows, rules, images, fenced blocks, wikilink brackets and
+comments. Where two extensions' ranges
 overlap, the leftmost wins.
 
 ### Dynamic rules
