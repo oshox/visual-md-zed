@@ -1984,7 +1984,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn markdown_live_preview_section() -> [SettingsPageItem; 2] {
+    fn markdown_live_preview_section() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::SectionHeader("Markdown Live Preview"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -2013,6 +2013,23 @@ fn editor_page() -> SettingsPage {
                     },
                 }),
                 metadata: None,
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Attachment Folder",
+                description: "The folder a pasted image is saved in. A path starting with / is from the root of the worktree, any other is from the folder of the note. Leave empty to save the image next to the note.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("visual_md.attachment_folder"),
+                    pick: |settings_content| {
+                        visual_md_settings(settings_content)
+                            .and_then(|visual_md| visual_md.attachment_folder.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        visual_md_settings_mut(settings_content).attachment_folder = value;
+                    },
+                }),
+                metadata: allow_unset(),
                 files: USER | PROJECT,
             }),
         ]

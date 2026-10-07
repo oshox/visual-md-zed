@@ -957,6 +957,13 @@ pub struct VisualMdSettingsContent {
     /// and `i` have a look of their own by default, which an entry here
     /// replaces; any other character listed here gets a checkbox as well.
     pub task_marks: Option<HashMap<String, VisualMdTaskMarkContent>>,
+    /// The folder an image pasted into a Markdown note is saved in. A path that
+    /// starts with `/` is from the root of the worktree, any other is from the
+    /// folder of the note, and `..` goes up a folder. The folder is created if
+    /// it is not there. Leave unset to save the image next to the note.
+    ///
+    /// Default: null
+    pub attachment_folder: Option<String>,
     /// Settings for Zed MD extensions, keyed by extension id. An extension reads
     /// only its own entry, whose shape it defines.
     ///

@@ -204,6 +204,10 @@
     // i are drawn by default, and an entry replaces how one looks; any other
     // character listed gets a checkbox too.
     "task_marks": {},
+    // The folder an image pasted into a note is saved in. "/images" is from the
+    // root of the worktree, "attachments" and "../images" are from the folder of
+    // the note. It is created if it is not there. Default: next to the note.
+    "attachment_folder": null,
     // Settings of Zed MD extensions, keyed by extension id, for example
     // `"my-extension": { "notes": ["Alpha", "Beta"] }`. An extension reads only
     // its own entry, and defines what goes in it.

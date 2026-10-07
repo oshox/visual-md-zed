@@ -231,6 +231,7 @@
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+mod attachments;
 mod commands;
 mod completions;
 mod document_events;
@@ -400,6 +401,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
             }),
         ),
     ];
+    let paste_action = editor.register_action(cx.listener(attachments::intercept_paste));
     let toggle_live_preview_action = editor.register_action(cx.listener(toggle_live_preview));
     let run_extension_command_action =
         editor.register_action(cx.listener(commands::run_extension_command));
@@ -410,6 +412,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         _toggle_italic_action: toggle_italic_action,
         _format_actions: format_actions,
         _list_actions: list_actions,
+        _paste_action: paste_action,
         _toggle_live_preview_action: toggle_live_preview_action,
         _run_extension_command_action: run_extension_command_action,
         enabled_override: None,
@@ -764,6 +767,8 @@ struct VisualMdAddon {
     /// Keeps the list-editing interceptors (`Tab`, `Backtab`, `Backspace`,
     /// `MoveLineUp`, `MoveLineDown`) alive.
     _list_actions: Vec<Subscription>,
+    /// Keeps the `Paste` interceptor alive (see [`attachments`]).
+    _paste_action: Subscription,
     _toggle_live_preview_action: Subscription,
     /// Keeps the handler for extension commands (see `commands`) alive.
     _run_extension_command_action: Subscription,
@@ -5008,6 +5013,50 @@ mod integration_tests {
         cx.set_state("a «wordˇ» b\n");
         cx.simulate_input("_");
         cx.assert_editor_state("a _«wordˇ»_ b\n");
+    }
+
+    /// An editor on `path` of a project holding `files` under `/dir`, showing
+    /// live preview, focused, with the cursor at the end of the text.
+    pub(crate) async fn editor_in_project(
+        cx: &mut TestAppContext,
+        files: serde_json::Value,
+        path: &str,
+    ) -> gpui::WindowHandle<Editor> {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/dir", files).await;
+        let project = project::Project::test(fs, ["/dir".as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(path, cx))
+            .await
+            .expect("the file opens");
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(markdown_language()), cx)
+        });
+        let multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let window = cx.add_window({
+            let project = project.clone();
+            |window, cx| {
+                Editor::new(
+                    editor::EditorMode::full(),
+                    multi_buffer,
+                    Some(project),
+                    window,
+                    cx,
+                )
+            }
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                refresh(editor, window, cx);
+                window.focus(&gpui::Focusable::focus_handle(editor, cx), cx);
+                let end = editor.buffer().read(cx).len(cx);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([end..end]);
+                });
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+        window
     }
 
     fn section_crease_count(cx: &mut EditorTestContext) -> usize {

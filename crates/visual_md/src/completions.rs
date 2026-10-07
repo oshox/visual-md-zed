@@ -767,7 +767,7 @@ mod integration_tests {
     use editor::test::editor_test_context::EditorTestContext;
     use extension::{VisualMdCommandResult, VisualMdTextEdit};
     use fs::FakeFs;
-    use gpui::{AppContext as _, Focusable as _, TestAppContext};
+    use gpui::TestAppContext;
     use serde_json::json;
 
     use crate::extensions::test_support::{Behavior, FakeHooks, register};
@@ -1005,41 +1005,9 @@ mod integration_tests {
         files: serde_json::Value,
         path: &str,
     ) -> ProjectEditor {
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/dir", files).await;
-        let project = Project::test(fs, ["/dir".as_ref()], cx).await;
-        let buffer = project
-            .update(cx, |project, cx| project.open_local_buffer(path, cx))
-            .await
-            .expect("the file opens");
-        buffer.update(cx, |buffer, cx| {
-            buffer.set_language(Some(markdown_language()), cx)
-        });
-        let multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
-        let window = cx.add_window({
-            let project = project.clone();
-            |window, cx| {
-                Editor::new(
-                    editor::EditorMode::full(),
-                    multi_buffer,
-                    Some(project),
-                    window,
-                    cx,
-                )
-            }
-        });
-        window
-            .update(cx, |editor, window, cx| {
-                crate::refresh(editor, window, cx);
-                window.focus(&editor.focus_handle(cx), cx);
-                let end = editor.buffer().read(cx).len(cx);
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    selections.select_ranges([end..end]);
-                });
-            })
-            .expect("the window is open");
-        cx.run_until_parked();
-        ProjectEditor { window }
+        ProjectEditor {
+            window: crate::integration_tests::editor_in_project(cx, files, path).await,
+        }
     }
 
     impl ProjectEditor {
