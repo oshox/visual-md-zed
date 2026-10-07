@@ -23,6 +23,10 @@ purpose even though the app is branded Zed MD.
 | M13 | Turn the editor off globally or per project, in settings.json and the settings UI | Done |
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
+| M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
+| M17 | Editing tools and the outliner | Planned, see the feature audit |
+| M18 | Block syntax: properties panel, footnotes, math, embeds, hover previews | Planned, see the feature audit |
+| M19 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
 ## M13: On/off switch at global and project level
 
@@ -298,3 +302,155 @@ touched here, and whether it happens at the base was not checked.
 - Only the Linux backend compiles here, so nothing was type-checked for macOS
   or Windows, and the extension paths were exercised on Linux only.
 
+## Feature audit: Obsidian and Logseq parity
+
+Written 2026-10-06, after M15, by reading `visual_md` against
+[`visual-md-spec.md`](./visual-md-spec.md) (Obsidian Live Preview) and comparing
+Logseq's editing model. It lists what the editor lacks for parity, **leaving out
+database and knowledge-base (KB) features**, which are meant to come from
+extensions. The line used: anything that needs a vault-wide index or a query
+across documents is KB (backlinks, graph, queries and Dataview, block-reference
+resolution, tag, alias and property pages, flashcards, link refactoring on
+rename, journals and templates as file workflows). Finding a note by file name,
+and reading one other note to show it, are editor features.
+
+**Obsidian.** "Ext" is possible today with the M15 hooks, "Core" needs native
+work, "API" needs new extension API.
+
+| Gap | Where it stood at the audit | Fix |
+| --- | --- | --- |
+| Wikilinks: hidden brackets, alias, `#heading`, `#^id`, link style, unresolved style, ctrl-click | none | Core, **M16** |
+| Tags as chips, click to search | none | Core, **M16** |
+| `%%comments%%` | none | Core, **M16** |
+| `^block-id` dimmed | none | Core, **M16** |
+| Custom task marks `[/]` `[-]` | only `[ ]` and `[x]` | Core, **M16** |
+| Highlight and inline code chips | no background | Core, **M16** |
+| Embeds: `![[Note]]`, `#Heading`, sizes, audio, video, PDF | only a line that is one image | Core, M18 |
+| Hover page preview, footnote hover | none | Core, M18 |
+| Footnotes, math, YAML properties panel, embedded HTML | none | Core, M18 |
+| Callouts: whole-row fold click, right-click type menu, per-type accent bar | chevron click only | Core, M18 |
+| Tables: row lines, per-cell raw reveal | cells always raw | Core, M18 |
+| Folding of headings and list items, saved per file | fold gutter off | Core, M17 |
+| Built-in `[[`, `#`, `![[` autocomplete | extension-supplied names only | Core, M17 |
+| Strike, highlight, code, link shortcuts | bold and italic only | Core, M17 |
+| List editing: Tab to nest, Backspace on a marker, renumbering the source | Enter only | Core, M17 |
+| Drag and drop to link or embed, image paste as `![[...]]` | drop opens a tab | Core, M17 |
+| Reference-style links, Vim `ctrl-b` and `ctrl-i` | not handled, Vim wins | Core, M17 |
+| Spellcheck, word count, export | none | Core or Ext, unscheduled |
+
+**Logseq, beyond that.** Outliner editing (Tab and Shift-Tab move a bullet with
+its children, Alt-Up and Alt-Down move a subtree, collapse, zoom into a block,
+multi-block selection) is Core, M17, and needs folding first. `key:: value`
+property lines, `TODO`/`DOING`/`DONE` markers, `[#A]` priorities, `SCHEDULED:` and
+`^^highlight^^` are Ext through syntax rules, or Core with the properties panel
+in M18. Auto-pairing `[[`, `((`, `**` and `==` is Core, M17. `((block refs))`,
+`{{embed}}`, `{{query}}`, linked references and flashcards are KB. Inline macros
+such as `{{video}}` need an inline widget API. Whiteboards and the graph view are
+panes, out of scope.
+
+**What KB extensions need from core.** An extension is given a note list only
+inside a `[[` completion request, and cannot read other files, open or create a
+file, hear about a rename, show a hover, draw inline or own a panel. Backlinks,
+query results and a graph need all of that, each behind a declared capability:
+listing and reading project files, opening and creating a file, file events,
+hover content, inline widgets and some panel surface. That is M19.
+
+**Roadmap.** M16 below. **M17:** editing tools and the outliner (folding with
+saved state, subtree indent, outdent and move, Tab, Backspace and renumbering,
+formatting shortcuts, auto-pair, paste and drop, built-in autocomplete from a
+project note index, the Vim conflict, reference links). **M18:** block syntax
+(frontmatter and `key::` properties panel, footnotes, math after a renderer
+spike, an HTML subset, note and heading embeds with sizes, hover page preview,
+callout and table polish). **M19:** the extension surface for KB features, with
+a sample backlinks extension as the proof.
+
+## M16: Block layout fixes, native links, tags and cursor-line syntax
+
+**Today:** the audit above found two defects in how blocks are laid out, and
+that wikilinks, tags, comments, block ids and custom task marks have no native
+rendering, so a note-taking document is mostly plain text unless an extension
+styles it.
+
+**Deliverables**
+1. Fence border and rule blocks replace only their own row, and blocks are
+   placed where the text of their row is, under taller heading rows too.
+2. Wikilinks `[[Note]]`, `[[Note|alias]]`, `[[Note#Heading]]` drawn as links,
+   resolved against the project's notes by file name, opened with ctrl-click,
+   and drawn muted with a wavy underline when the note does not exist.
+3. Tags `#tag` and `#nested/tag` as chips that open a project search.
+4. `%%comments%%` hidden away from the cursor and `^block-id` dimmed.
+5. Task marks other than `[ ]` and `[x]` drawn as checkboxes with a symbol,
+   configurable with `visual_md.task_marks`.
+6. Highlights and inline code drawn as chips by default.
+7. Settings for the new colors, in `settings.json` and the settings UI, and the
+   documentation.
+
+**Done when:** a document with every construct renders in the running app with
+fences and rules correct under a heading, resolved and unresolved links look
+different, and ctrl-click opens the right note or searches for the tag.
+
+### As built
+
+**Blocks.** A replace block covers every row up to the row its end is on, and
+the ranges of fence lines and rules ended after their newline, so each
+one-row block hid the next row too: the first line of the code under an opening
+fence, and the line after a closing fence or a rule. The ranges now stop before
+the newline, and a cursor at the start of the next line no longer counts as
+being on the fence. Separately, `layout_blocks` placed a block at
+`row * line_height` while text uses `row_y_offset`, which knows about taller
+rows, so blocks drifted up under a heading; they use `row_y_offset` now. Both
+were found by looking at the running app, and the tests that missed them only
+counted blocks.
+
+**Wikilinks.** They are scanned from text by `inline_scan`, shared with the
+outline extensions are given. The planner treats the brackets like a link's:
+hidden, or dimmed while a selection touches the link. A link to a note the
+project has is drawn in the link color, and one to a note it lacks is muted with
+a wavy underline. The project's notes are indexed by file name (`notes.rs`), once
+per project, off the main thread, and editors are only told when a name came or
+went. `[[Note]]` is `Note.md` wherever it is, in any case, with or without the
+extension; `[[folder/Note]]` picks the note in that folder; with several matches
+the folder of the current note wins, then the shortest path. Nothing is flagged
+while the worktrees are still read, with no project, or for `[[#Heading]]`. An
+extension that resolves wikilinks is asked first, and the project's notes are the
+fallback.
+
+**Tags.** A tag is `#` and a name that is not only digits, at the start of a
+word, outside code and links. Ctrl-click runs a project search for it, through a
+new `HoverLink::Action` in the editor.
+
+**Comments and block ids.** A comment on one line is hidden until a selection
+touches it, then dimmed. One over several lines of a paragraph is only dimmed,
+since a fold cannot span lines. A comment is found within one paragraph, so one
+cut by a blank line is not recognized. Nothing inside a comment is drawn as
+anything else. A block id must end a line and follow whitespace.
+
+**Task marks.** The grammar knows only `[ ]` and `[x]`, so the planner takes the
+set of known marks as an input and claims `[c]` at the start of an item's text
+only for those, followed by a space or the end of the line. The defaults are
+`/ - > < ? ! * "` and `i`. A click on a marked checkbox checks the item.
+
+**Chips.** Highlights use the theme's warning background and inline code its
+element background by default. This reverses an earlier decision that they carry
+no background, and the M14 rule that unset keys match today's rendering no longer
+holds for these two keys; a transparent color turns a chip off, and the change is
+its own commit so it can be dropped.
+
+**Checked in the running app.** On a headless Wayland compositor with
+screenshots: ordinary code fences show every code line with their borders in
+place, the line after a fence and a rule is there, blocks line up under a second
+heading; wikilinks show their text with the brackets hidden, an alias shows
+without its target, `Missing note` is muted with a wavy underline, links to
+existing notes and to a heading of the same note are in the link color, and tags
+are chips, not the one in code and not `#12`. Not checked in the app, because
+there was no way to send a click: ctrl-click on a wikilink and on a tag. Both are
+covered by tests that ask the addon for the link and run its action.
+
+**Limitations.**
+- Clicking a link to a missing note does nothing; Obsidian creates the note.
+- `[[Note#Heading]]` opens `Note` and does not scroll to the heading.
+- `#[[multi word]]` is not a tag of its own; it shows as `#` followed by a link.
+- Headings, block ids and front matter aliases are not looked at: extensions
+  answer for them.
+- A comment cut by a blank line is not recognized.
+- The default chips change how every document already looks.

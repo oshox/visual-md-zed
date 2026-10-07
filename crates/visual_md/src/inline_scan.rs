@@ -1,5 +1,6 @@
 //! Inline syntax from note-taking apps that the Markdown grammar knows nothing
-//! about: `[[wikilinks]]` and `#tags`. They are found by scanning text, and the
+//! about: `[[wikilinks]]`, `#tags`, `%%comments%%` and `^block-ids`. They are
+//! found by scanning text, and the
 //! scanners are shared by the planner, which decorates what they find, and the
 //! outline, which tells extensions about it.
 //!
@@ -108,6 +109,91 @@ pub fn find_wikilinks(
             target: target.to_string(),
             alias,
         });
+    }
+    found
+}
+
+/// A `%%comment%%`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    /// All of it, from the opening `%%` to the closing one.
+    pub range: Range<usize>,
+    /// Whether it runs over more than one line of the text it is in.
+    pub is_multiline: bool,
+}
+
+/// Finds every `%%comment%%` in `inline_text` that does not start inside one of
+/// `excluded`, which are in document coordinates. An empty `%%%%` is not one,
+/// and a `%%` that is never closed is left alone.
+pub fn find_comments(inline_text: &str, offset: usize, excluded: &[Range<usize>]) -> Vec<Comment> {
+    let mut found = Vec::new();
+    let mut search_from = 0;
+    while let Some(open) = inline_text
+        .get(search_from..)
+        .and_then(|rest| rest.find("%%"))
+        .map(|relative| search_from + relative)
+    {
+        search_from = open + 2;
+        if excluded
+            .iter()
+            .any(|range| range.contains(&(open + offset)))
+        {
+            continue;
+        }
+        let Some(close) = inline_text
+            .get(open + 2..)
+            .and_then(|rest| rest.find("%%"))
+            .map(|relative| open + 2 + relative)
+        else {
+            break;
+        };
+        if close == open + 2 {
+            continue;
+        }
+        let end = close + 2;
+        search_from = end;
+        found.push(Comment {
+            range: open + offset..end + offset,
+            is_multiline: inline_text
+                .get(open..end)
+                .is_some_and(|comment| comment.contains('\n')),
+        });
+    }
+    found
+}
+
+/// A block id, the `^id` that ends a line to name that block.
+static BLOCK_ID_PATTERN: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?:^|\s)(\^[A-Za-z0-9-]+)$").ok());
+
+/// Finds the `^block-id` ending each line of `inline_text` that does not overlap
+/// one of `excluded`, which are in document coordinates. It has to follow
+/// whitespace or start the line, so `x^2` is not one.
+pub fn find_block_ids(
+    inline_text: &str,
+    offset: usize,
+    excluded: &[Range<usize>],
+) -> Vec<Range<usize>> {
+    let Some(pattern) = BLOCK_ID_PATTERN.as_ref() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut line_start = 0;
+    for line in inline_text.split('\n') {
+        let trimmed = line.trim_end();
+        if let Some(id) = pattern
+            .captures(trimmed)
+            .and_then(|captures| captures.get(1))
+        {
+            let range = line_start + id.start() + offset..line_start + id.end() + offset;
+            let is_excluded = excluded
+                .iter()
+                .any(|excluded| excluded.start < range.end && range.start < excluded.end);
+            if !is_excluded {
+                found.push(range);
+            }
+        }
+        line_start += line.len() + 1;
     }
     found
 }
@@ -265,6 +351,72 @@ mod tests {
 
         assert_eq!(links[0].range, 100..105);
         assert_eq!(links[0].visible, 102..103);
+    }
+
+    fn comment_texts<'a>(text: &'a str, comments: &[Comment]) -> Vec<&'a str> {
+        comments
+            .iter()
+            .map(|comment| &text[comment.range.clone()])
+            .collect()
+    }
+
+    #[test]
+    fn test_a_comment_runs_from_one_double_percent_to_the_next() {
+        let text = "a %%hidden%% b %%two%% c";
+        let comments = find_comments(text, 0, &[]);
+
+        assert_eq!(
+            comment_texts(text, &comments),
+            vec!["%%hidden%%", "%%two%%"]
+        );
+        assert!(comments.iter().all(|comment| !comment.is_multiline));
+    }
+
+    #[test]
+    fn test_a_comment_may_run_over_lines() {
+        let text = "a %%one\ntwo%% b";
+        let comments = find_comments(text, 0, &[]);
+
+        assert_eq!(comment_texts(text, &comments), vec!["%%one\ntwo%%"]);
+        assert!(comments[0].is_multiline);
+    }
+
+    #[test]
+    fn test_empty_and_unclosed_comments_are_not_comments() {
+        assert!(find_comments("a %%%% b", 0, &[]).is_empty());
+        assert!(find_comments("a %%never closed", 0, &[]).is_empty());
+        assert!(find_comments("100% and 5%", 0, &[]).is_empty());
+    }
+
+    #[test]
+    fn test_a_comment_starting_in_an_excluded_range_is_skipped() {
+        let text = "`%%x%%` and %%y%%";
+        let comments = find_comments(text, 0, &[0..7]);
+
+        assert_eq!(comment_texts(text, &comments), vec!["%%y%%"]);
+        assert_eq!(find_comments("%%a%%", 40, &[])[0].range, 40..45);
+    }
+
+    #[test]
+    fn test_a_block_id_ends_a_line() {
+        let text = "a paragraph ^abc-123\nnext line\n^alone\nx^2 and 2^n";
+        let ids = find_block_ids(text, 0, &[]);
+
+        let found: Vec<&str> = ids.iter().map(|range| &text[range.clone()]).collect();
+        assert_eq!(found, vec!["^abc-123", "^alone"]);
+    }
+
+    #[test]
+    fn test_a_block_id_must_be_last_and_follow_whitespace() {
+        assert!(find_block_ids("a ^id and more", 0, &[]).is_empty());
+        assert!(find_block_ids("a^id", 0, &[]).is_empty());
+        assert!(find_block_ids("a ^not valid", 0, &[]).is_empty());
+        assert_eq!(find_block_ids("trailing ^id   ", 10, &[]), vec![19..22]);
+    }
+
+    #[test]
+    fn test_a_block_id_inside_an_excluded_range_is_skipped() {
+        assert!(find_block_ids("`code ^id`", 0, &[0..10]).is_empty());
     }
 
     fn tags(text: &str) -> Vec<(String, Range<usize>)> {

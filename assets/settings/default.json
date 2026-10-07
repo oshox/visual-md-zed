@@ -192,11 +192,18 @@
     // code_block.background, task.checked, and callout.<type> with accent and
     // background. A color left unset falls back to the `visual_md.*` token of
     // the same name in the active theme's `syntax` map, then to a default
-    // derived from the theme.
+    // derived from the theme. Highlights and inline code have a chip behind
+    // them by default; a transparent color such as "#00000000" takes it away.
     "colors": {},
     // Custom callout types, for example
     // `"todo": { "icon": "check", "accent": "#3b82f6", "background": "#3b82f622" }`.
     "callouts": {},
+    // Checkboxes for task marks other than `[ ]` and `[x]`, keyed by the one
+    // character between the brackets, for example
+    // `"/": { "symbol": "◐", "color": "#d97706" }`. The marks / - > < ? ! * " and
+    // i are drawn by default, and an entry replaces how one looks; any other
+    // character listed gets a checkbox too.
+    "task_marks": {},
     // Settings of Zed MD extensions, keyed by extension id, for example
     // `"my-extension": { "notes": ["Alpha", "Beta"] }`. An extension reads only
     // its own entry, and defines what goes in it.

@@ -276,7 +276,7 @@ use plan::{
     CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment, WikilinkSpan,
 };
 use settings::Settings;
-use style::{CalloutIcon, ResolvedStyle};
+use style::{CalloutIcon, ResolvedStyle, TaskMarkLook};
 use util::ResultExt;
 
 actions!(
@@ -1121,7 +1121,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 block_tree,
                 &selections,
                 visible_range.clone(),
-                &plan_extensions(cx),
+                &plan_extensions(&style, cx),
             );
             if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
                 addon.planned = Some((snapshot.edit_count(), visible_range));
@@ -1192,6 +1192,14 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             format!("checkbox:{checked}"),
             checkbox_placeholder(editor_handle.clone(), *checked, style_handle.clone()),
         )
+    }));
+    folds.extend(computed.task_marks.iter().filter_map(|(range, mark)| {
+        let look = style.task_marks.get(mark)?;
+        Some((
+            range.clone(),
+            format!("task-mark:{mark}:{}:{:?}", look.symbol, look.color),
+            task_mark_placeholder(editor_handle.clone(), look.clone()),
+        ))
     }));
     // An untouched callout's title (see `callout_title_placeholder`'s own
     // doc comment for why a touched one is excluded here -- it reveals as
@@ -1276,11 +1284,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 }
 
 /// What extensions currently claim, as far as the planner needs to know.
-fn plan_extensions(cx: &App) -> plan::PlanExtensions {
+fn plan_extensions(style: &ResolvedStyle, cx: &App) -> plan::PlanExtensions {
+    let task_marks = style.task_marks.keys().copied().collect();
     let Some(registry) = cx.try_global::<extensions::VisualMdExtensions>() else {
-        return plan::PlanExtensions::default();
+        return plan::PlanExtensions {
+            task_marks,
+            ..Default::default()
+        };
     };
     plan::PlanExtensions {
+        task_marks,
         rendered_fence_languages: registry.fence_languages().into_iter().collect(),
         rules: rules::RuleSet {
             rules: registry.syntax_rules().into(),
@@ -1740,6 +1753,50 @@ fn checkbox_placeholder(
                 .into_any_element()
         }),
         collapsed_text: Some(SharedString::from(if checked { "[x]" } else { "[ ]" })),
+        ..base_placeholder()
+    }
+}
+
+/// A task mark other than `[ ]` and `[x]`, such as `[/]`, as a checkbox in its
+/// color with its symbol inside. Clicking it checks the item, the way the
+/// checkbox does; every mark is a task in some state, and `[x]` is the one that
+/// ends it.
+fn task_mark_placeholder(
+    editor: WeakEntity<Editor>,
+    look: TaskMarkLook,
+) -> editor::FoldPlaceholder {
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(move |fold_id, range, _cx| {
+            let editor = editor.clone();
+            div()
+                .id(fold_id)
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(18.))
+                .h_full()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(13.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(look.color)
+                        .text_color(look.color)
+                        .text_size(px(10.))
+                        .child(look.symbol.clone()),
+                )
+                .on_click(move |_event, _window, cx| {
+                    editor
+                        .update(cx, |editor, cx| editor.edit([(range.clone(), "[x]")], cx))
+                        .log_err();
+                })
+                .into_any_element()
+        }),
+        collapsed_text: Some(SharedString::from("[ ]")),
         ..base_placeholder()
     }
 }
@@ -2882,10 +2939,11 @@ fn apply_style_highlights(
 
     apply_callout_backgrounds(editor, snapshot, computed, style, cx);
 
-    // Highlights, inline code and code blocks carry no color or background
-    // unless a setting or theme token supplies one: the live-preview reference
-    // (Obsidian) leaves them untinted, so only the structural styling
-    // (the code font and size) applies by default.
+    // A highlight and inline code are chips by default, with a background taken
+    // from the theme (a transparent color in the settings turns one off), and a
+    // setting or theme token replaces it. Code blocks have no background unless
+    // one is set. Neither adds a text color, so only the code font and size
+    // apply to the text itself.
     let highlight_ranges = if style.highlight_background.is_some() {
         spans_of(SpanStyle::Highlight)
     } else {
@@ -3405,6 +3463,135 @@ mod integration_tests {
             "first\n\nsee [[Some Note|the alias]] and #tag\n",
             "the whole link is raw while the cursor is in it, and a tag never hides anything"
         );
+    }
+
+    fn task_marks(
+        marks: &[(&str, Option<&str>, Option<&str>)],
+    ) -> settings::VisualMdSettingsContent {
+        settings::VisualMdSettingsContent {
+            task_marks: Some(
+                marks
+                    .iter()
+                    .map(|(mark, symbol, color)| {
+                        (
+                            mark.to_string(),
+                            settings::VisualMdTaskMarkContent {
+                                symbol: symbol.map(str::to_string),
+                                color: color.map(|color| color.into()),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// A task mark Zed MD knows gets a checkbox in place of its bullet, and one it
+    /// does not know stays text until a setting names it.
+    #[gpui::test]
+    async fn a_known_task_mark_gets_a_checkbox_and_a_setting_adds_more(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ- [/] doing\n- [~] unknown\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert_eq!(cx.display_text(), " [ ] doing\n• [~] unknown\n");
+
+        set_visual_md(&mut cx, task_marks(&[("~", None, None)]));
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert_eq!(cx.display_text(), " [ ] doing\n [ ] unknown\n");
+
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range = to_anchor_range(&snapshot, &(2..5));
+            editor.edit([(range, "[x]")], cx);
+            refresh(editor, window, cx);
+        });
+        assert_eq!(
+            cx.display_text(),
+            " [x] doing\n [ ] unknown\n",
+            "checking a marked item makes it an ordinary checked one"
+        );
+    }
+
+    #[gpui::test]
+    async fn task_mark_settings_add_to_and_restyle_the_defaults(cx: &mut TestAppContext) {
+        use theme::ActiveTheme as _;
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("ˇ- [/] doing\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        let accent = cx.update(|_window, cx| cx.theme().colors().icon_accent);
+        let marks = |cx: &mut EditorTestContext| {
+            cx.update_editor(|editor, window, cx| {
+                refresh(editor, window, cx);
+                editor
+                    .addon::<VisualMdAddon>()
+                    .map(|addon| addon.style.load().task_marks.clone())
+                    .unwrap_or_default()
+            })
+        };
+
+        let defaults = marks(&mut cx);
+        assert_eq!(
+            defaults.keys().copied().collect::<String>(),
+            "!\"*-/<>?i",
+            "the marks drawn without a setting"
+        );
+        assert_eq!(defaults[&'/'].symbol.as_ref(), "◐");
+
+        set_visual_md(
+            &mut cx,
+            task_marks(&[
+                ("/", Some("X"), Some("#112233")),
+                ("~", None, None),
+                ("ab", Some("no"), None),
+                ("x", Some("no"), None),
+                (" ", Some("no"), None),
+                ("", Some("no"), None),
+                ("-", Some(""), None),
+            ]),
+        );
+        let marks = marks(&mut cx);
+        assert_eq!(marks[&'/'].symbol.as_ref(), "X");
+        assert_eq!(marks[&'/'].color, hex("#112233"));
+        assert_eq!(
+            marks[&'~'].symbol.as_ref(),
+            "~",
+            "a new mark is its own symbol"
+        );
+        assert_eq!(marks[&'~'].color, accent, "and takes the accent color");
+        assert_eq!(
+            marks[&'-'], defaults[&'-'],
+            "an empty symbol keeps the default"
+        );
+        assert_eq!(
+            marks.keys().copied().collect::<String>(),
+            "!\"*-/<>?i~",
+            "`ab`, `x`, a space and nothing are not marks"
+        );
+    }
+
+    /// A comment disappears until the cursor is in it, and a block id stays.
+    #[gpui::test]
+    async fn a_comment_is_hidden_until_the_cursor_is_in_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+
+        cx.set_state("ˇfirst\n\nA %%secret%% and ^id\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        // The comment is one folded space, between the two around it.
+        assert_eq!(cx.display_text(), "first\n\nA   and ^id\n");
+
+        cx.set_state("first\n\nA %%secˇret%% and ^id\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert_eq!(cx.display_text(), "first\n\nA %%secret%% and ^id\n");
     }
 
     /// Creates `name` in the editor's project, so that links can lead to it.
@@ -4707,12 +4894,20 @@ mod integration_tests {
         let inline_code = style_at(&mut cx, "code");
         assert_eq!(family_name(&inline_code), Some(buffer_family.clone()));
         assert_eq!(inline_code.color, None);
-        assert_eq!(inline_code.background_color, None);
+        assert_eq!(
+            inline_code.background_color,
+            Some(cx.update(|_window, cx| cx.theme().colors().element_background)),
+            "inline code is a chip by default"
+        );
         assert_eq!(inline_code.font_size_scale, None);
 
         let marked = style_at(&mut cx, "marked");
         assert_eq!(marked.color, None);
-        assert_eq!(marked.background_color, None);
+        assert_eq!(
+            marked.background_color,
+            Some(cx.update(|_window, cx| cx.theme().status().warning_background)),
+            "a highlight is marked by default"
+        );
 
         let fenced = style_at(&mut cx, "fenced");
         assert_eq!(family_name(&fenced), Some(buffer_family));
@@ -5003,7 +5198,28 @@ mod integration_tests {
             Some(cx.update(|_window, cx| cx.theme().colors().link_text_hover))
         });
         assert_eq!(style_at(&mut cx, "code").color, None);
-        assert_eq!(style_at(&mut cx, "marked").background_color, None);
+        assert_eq!(style_at(&mut cx, "marked").background_color, {
+            use theme::ActiveTheme as _;
+            Some(cx.update(|_window, cx| cx.theme().status().warning_background))
+        });
+    }
+
+    #[gpui::test]
+    async fn a_transparent_color_turns_a_default_chip_off(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                highlight_background: Some("#00000000".into()),
+                inline_code_background: Some("#00000000".into()),
+                ..Default::default()
+            }),
+        );
+
+        let transparent = Some(hex("#00000000"));
+        assert_eq!(style_at(&mut cx, "marked").background_color, transparent);
+        assert_eq!(style_at(&mut cx, "code").background_color, transparent);
     }
 
     #[gpui::test]
