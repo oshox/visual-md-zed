@@ -5,14 +5,20 @@
 //! note's folder. With it unset the editor's own paste runs, which saves the
 //! image next to the note.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use anyhow::Result;
 use editor::actions::Paste;
 use editor::{Editor, MultiBufferOffset, SelectionEffects};
-use gpui::{ClipboardEntry, Context, Image, TaskExt as _, Window};
+use gpui::{App, ClipboardEntry, Context, Entity, ExternalPaths, Image, TaskExt as _, Window};
+use language::Buffer;
+use project::{Project, ProjectPath};
 use util::ResultExt as _;
 use util::rel_path::RelPath;
+use workspace::DraggedSelection;
+
+use crate::notes::{extension_of, is_image_extension, location_of};
 
 /// The folder an image is saved in, as a path from the root of the worktree,
 /// when `setting` is the folder the user chose and `note_folder` is the folder of
@@ -86,6 +92,77 @@ pub fn unused_name(folder: &str, extension: &str, exists: impl Fn(&str) -> bool)
         counter += 1;
     }
     name
+}
+
+/// What a note in `note_folder` writes to link to `file`, both from the root of
+/// the worktree: an image is embedded, anything else is linked by its name, which
+/// for a note leaves out the extension.
+pub fn link_to_file(note_folder: &str, file: &str) -> String {
+    let link = relative_link(note_folder, file);
+    let name = file.rsplit('/').next().unwrap_or(file);
+    match extension_of(name) {
+        Some(extension) if is_image_extension(extension) => format!("![]({link})"),
+        extension => {
+            let shown = match extension {
+                Some(extension) if matches!(extension, "md" | "markdown") => {
+                    name.get(..name.len() - extension.len() - 1).unwrap_or(name)
+                }
+                _ => name,
+            };
+            let shown = shown.replace('[', "\\[").replace(']', "\\]");
+            format!("[{shown}]({link})")
+        }
+    }
+}
+
+/// What dropping `dropped` on the note in `buffer` writes: a link to each of the
+/// files, one to a line. `None` unless every one is a file of the project, in the
+/// same worktree as the note, which is all that is linked to; the rest is for the
+/// pane to do what it does with a drop.
+pub(crate) fn dropped_links(
+    buffer: &Entity<Buffer>,
+    project: &Entity<Project>,
+    dropped: &dyn Any,
+    cx: &App,
+) -> Option<String> {
+    let note = location_of(buffer.read(cx), cx)?;
+    let note_folder = note.path.parent()?.as_unix_str();
+
+    let mut files: Vec<Arc<RelPath>> = Vec::new();
+    if let Some(external) = dropped.downcast_ref::<ExternalPaths>() {
+        for path in external.paths() {
+            let (worktree, relative) = project.read(cx).find_worktree(path, cx)?;
+            if worktree.read(cx).id() != note.worktree_id {
+                return None;
+            }
+            files.push(relative);
+        }
+    } else if let Some(selection) = dropped.downcast_ref::<DraggedSelection>() {
+        for selected in selection.items() {
+            let dropped_path = project.read(cx).path_for_entry(selected.entry_id, cx)?;
+            if dropped_path.worktree_id != note.worktree_id {
+                return None;
+            }
+            files.push(dropped_path.path);
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+
+    let mut links = Vec::with_capacity(files.len());
+    for path in files {
+        let project_path = ProjectPath {
+            worktree_id: note.worktree_id,
+            path,
+        };
+        let entry = project.read(cx).entry_for_path(&project_path, cx)?;
+        if !entry.is_file() {
+            return None;
+        }
+        links.push(link_to_file(note_folder, project_path.path.as_unix_str()));
+    }
+    Some(links.join("\n"))
 }
 
 /// What pasting `image` is going to do.
@@ -230,9 +307,10 @@ fn insert_image_link(
 mod tests {
     use super::*;
     use gpui::{ClipboardItem, ImageFormat, TestAppContext, WindowHandle};
+    use project::Project;
     use serde_json::json;
 
-    use crate::integration_tests::{editor_in_project, init_test};
+    use crate::integration_tests::{editor_in_project, init_test, markdown_language};
 
     #[test]
     fn test_a_folder_from_the_note_is_taken_from_the_notes_folder() {
@@ -330,6 +408,29 @@ mod tests {
         assert_eq!(
             unused_name("", "png", |path| path == "image.png"),
             "image_1.png"
+        );
+    }
+
+    #[test]
+    fn test_an_image_is_embedded_and_other_files_are_linked_by_name() {
+        assert_eq!(link_to_file("notes", "pics/x.PNG"), "![](../pics/x.PNG)");
+        assert_eq!(link_to_file("notes", "notes/Plan.md"), "[Plan](Plan.md)");
+        assert_eq!(
+            link_to_file("notes/2026", "notes/Big plan.markdown"),
+            "[Big plan](../Big%20plan.markdown)"
+        );
+        assert_eq!(
+            link_to_file("", "docs/report.pdf"),
+            "[report.pdf](docs/report.pdf)"
+        );
+        assert_eq!(link_to_file("a", "a/b/c.txt"), "[c.txt](b/c.txt)");
+    }
+
+    #[test]
+    fn test_brackets_in_a_name_are_escaped() {
+        assert_eq!(
+            link_to_file("", "a [draft].md"),
+            "[a \\[draft\\]](a%20[draft].md)"
         );
     }
 
@@ -505,6 +606,165 @@ mod tests {
 
         assert!(file_exists(&window, cx, "notes/image.png").await);
         assert!(!file_exists(&window, cx, "notes/pics/image.png").await);
+    }
+
+    #[gpui::test]
+    async fn test_files_dropped_on_a_note_become_links_at_the_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, project, editor, cx) = open_note(cx).await;
+        let dropped = gpui::ExternalPaths(
+            [
+                std::path::PathBuf::from("/dir/pics/x.png"),
+                std::path::PathBuf::from("/dir/docs/b.md"),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let handled = drop_on_the_pane(&workspace, &dropped, cx);
+
+        assert!(handled);
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.text(cx)),
+            "see ![](../pics/x.png)\n[b](../docs/b.md)"
+        );
+        drop(project);
+    }
+
+    #[gpui::test]
+    async fn test_entries_dragged_from_the_project_panel_become_links(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, project, editor, cx) = open_note(cx).await;
+        let selected = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("the project has a worktree");
+            let worktree = worktree.read(cx);
+            let entry = worktree
+                .entry_for_path(util::rel_path::rel_path("docs/b.md"))
+                .expect("the file is there");
+            workspace::SelectedEntry {
+                worktree_id: worktree.id(),
+                entry_id: entry.id,
+            }
+        });
+        let dropped = DraggedSelection {
+            active_selection: selected,
+            marked_selections: Arc::from([]),
+        };
+
+        let handled = drop_on_the_pane(&workspace, &dropped, cx);
+
+        assert!(handled);
+        assert_eq!(
+            editor.update(cx, |editor, cx| editor.text(cx)),
+            "see [b](../docs/b.md)"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_what_is_not_a_file_of_the_project_is_left_to_the_pane(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, _project, editor, cx) = open_note(cx).await;
+
+        for paths in [
+            vec!["/elsewhere/c.md"],
+            vec!["/dir/pics"],
+            vec!["/dir/docs/b.md", "/elsewhere/c.md"],
+            vec!["/dir/missing.md"],
+        ] {
+            let dropped =
+                gpui::ExternalPaths(paths.into_iter().map(std::path::PathBuf::from).collect());
+            assert!(!drop_on_the_pane(&workspace, &dropped, cx));
+        }
+        assert_eq!(editor.update(cx, |editor, cx| editor.text(cx)), "see ");
+    }
+
+    #[gpui::test]
+    async fn test_a_drop_is_left_to_the_pane_when_live_preview_is_off(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, _project, editor, cx) = open_note(cx).await;
+        editor.update_in(cx, |_, window, cx| {
+            window.dispatch_action(Box::new(crate::ToggleLivePreview), cx);
+        });
+        let dropped = gpui::ExternalPaths(
+            [std::path::PathBuf::from("/dir/docs/b.md")]
+                .into_iter()
+                .collect(),
+        );
+
+        assert!(!drop_on_the_pane(&workspace, &dropped, cx));
+    }
+
+    /// A workspace with `notes/a.md` open, holding `see `, with live preview and
+    /// the cursor at the end, in a project with `pics/x.png` and `docs/b.md`.
+    async fn open_note(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<workspace::Workspace>,
+        Entity<Project>,
+        Entity<Editor>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/dir",
+            json!({
+                "notes": { "a.md": "see " },
+                "pics": { "x.png": "" },
+                "docs": { "b.md": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, ["/dir".as_ref()], cx).await;
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    std::path::PathBuf::from("/dir/notes/a.md"),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("the note opens");
+        let editor = item
+            .downcast::<Editor>()
+            .expect("a Markdown file opens in an editor");
+        editor.update_in(cx, |editor, window, cx| {
+            if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language(Some(markdown_language()), cx)
+                });
+            }
+            crate::refresh(editor, window, cx);
+            let end = editor.buffer().read(cx).len(cx);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([end..end]);
+            });
+        });
+        cx.run_until_parked();
+        (workspace, project, editor, cx)
+    }
+
+    /// Drops `dropped` on the pane the way a pane asks its active item about it,
+    /// and whether the item took it.
+    fn drop_on_the_pane(
+        workspace: &Entity<workspace::Workspace>,
+        dropped: &dyn Any,
+        cx: &mut gpui::VisualTestContext,
+    ) -> bool {
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let handled = pane.update_in(cx, |pane, window, cx| {
+            let item = pane.active_item().expect("the pane has the note open");
+            item.handle_drop(pane, dropped, window, cx)
+        });
+        cx.run_until_parked();
+        handled
     }
 
     #[gpui::test]

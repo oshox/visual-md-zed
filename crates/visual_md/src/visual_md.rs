@@ -406,6 +406,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let run_extension_command_action =
         editor.register_action(cx.listener(commands::run_extension_command));
     editor.register_addon(VisualMdAddon {
+        editor: cx.weak_entity(),
         _state: state,
         _newline_action: newline_action,
         _toggle_bold_action: toggle_bold_action,
@@ -752,6 +753,9 @@ fn toggle_live_preview(
 /// is where the currently-folded marker creases are tracked so `refresh` can
 /// diff against them instead of re-folding everything from scratch.
 struct VisualMdAddon {
+    /// The editor this belongs to, for what has to happen to it after the editor
+    /// has finished handling something (see `Addon::handle_drop`).
+    editor: WeakEntity<Editor>,
     _state: Entity<VisualMdState>,
     /// Keeps the `Newline` interceptor (see [`intercept_newline`]) alive for
     /// as long as this editor is visual_md-managed; dropping it would let
@@ -913,6 +917,31 @@ impl Addon for VisualMdAddon {
             definitions,
             cx,
         )
+    }
+
+    fn handle_drop(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        project: Option<&Entity<project::Project>>,
+        dropped: &dyn Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Some(text) =
+            project.and_then(|project| attachments::dropped_links(buffer, project, dropped, cx))
+        else {
+            return false;
+        };
+        let editor = self.editor.clone();
+        window.defer(cx, move |window, cx| {
+            editor
+                .update(cx, |editor, cx| editor.insert(&text, window, cx))
+                .log_err();
+        });
+        true
     }
 
     fn to_any(&self) -> &dyn Any {
@@ -5314,9 +5343,7 @@ mod integration_tests {
             "a  text  and [nope][none] b\n\n[ref]: https://example.com\n"
         );
 
-        cx.set_state(&format!(
-            "a [teˇxt][ref] and [nope][none] b\n\n[ref]: https://example.com\n"
-        ));
+        cx.set_state("a [teˇxt][ref] and [nope][none] b\n\n[ref]: https://example.com\n");
         cx.run_until_parked();
         assert_eq!(
             cx.display_text(),

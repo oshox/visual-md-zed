@@ -21,6 +21,18 @@ const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
 /// The files `![[name]]` can embed besides notes.
 const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
 
+/// Whether `extension` is one of an image.
+pub(crate) fn is_image_extension(extension: &str) -> bool {
+    IMAGE_EXTENSIONS
+        .iter()
+        .any(|image| extension.eq_ignore_ascii_case(image))
+}
+
+/// The extension of the file name `name`, if it has one.
+pub(crate) fn extension_of(name: &str) -> Option<&str> {
+    split_name(name).1
+}
+
 /// A file a `[[` can name, and what goes between the brackets to name it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteSuggestion {
@@ -157,11 +169,7 @@ impl Entries {
         }
         if embed {
             for (name, images) in &self.by_name {
-                let is_image = split_name(name).1.is_some_and(|extension| {
-                    IMAGE_EXTENSIONS
-                        .iter()
-                        .any(|image| extension.eq_ignore_ascii_case(image))
-                });
+                let is_image = split_name(name).1.is_some_and(is_image_extension);
                 if !is_image {
                     continue;
                 }
