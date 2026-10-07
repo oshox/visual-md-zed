@@ -3901,6 +3901,8 @@ impl EditorElement {
         hitbox: &Hitbox,
         gutter_hitbox: &Hitbox,
         line_height: Pixels,
+        start_row: DisplayRow,
+        line_layouts: &[LineWithInvisibles],
         scroll_position: gpui::Point<ScrollOffset>,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         editor_margins: &EditorMargins,
@@ -3909,12 +3911,18 @@ impl EditorElement {
     ) {
         for block in blocks {
             let mut origin = if let Some(row) = block.row {
+                // Where the text of that row sits, not `row * line_height`: a
+                // row taller than the rest (a Zed MD heading) pushes every row
+                // below it down, and a block has to go with them.
                 hitbox.origin
                     + point(
                         block.x_offset,
-                        Pixels::from(
-                            (row.as_f64() - scroll_position.y)
-                                * ScrollPixelOffset::from(line_height),
+                        LineWithInvisibles::row_y_offset(
+                            row,
+                            line_layouts,
+                            start_row,
+                            scroll_position,
+                            line_height,
                         ),
                     )
             } else {
@@ -9751,6 +9759,8 @@ impl Element for EditorElement {
                             &hitbox,
                             &gutter_hitbox,
                             line_height,
+                            start_row,
+                            &line_layouts,
                             scroll_position,
                             scroll_pixel_position,
                             &editor_margins,
@@ -9762,6 +9772,8 @@ impl Element for EditorElement {
                             &hitbox,
                             &gutter_hitbox,
                             line_height,
+                            start_row,
+                            &line_layouts,
                             scroll_position,
                             scroll_pixel_position,
                             &editor_margins,
