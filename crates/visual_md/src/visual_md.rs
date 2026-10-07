@@ -875,6 +875,8 @@ struct ParsedDocument {
     block_tree: tree_sitter::Tree,
     /// What can be folded, in document order (see [`fold_ranges`]).
     foldable: Arc<[Range<usize>]>,
+    /// The `[label]: destination` definitions, for reference-style links.
+    link_definitions: Arc<HashMap<String, String>>,
 }
 
 impl Addon for VisualMdAddon {
@@ -892,7 +894,19 @@ impl Addon for VisualMdAddon {
         cx: &mut App,
     ) -> Option<Task<Option<(Range<language::Anchor>, editor::hover_links::HoverLink)>>> {
         let note_index = self.note_index.as_ref().map(|(index, _)| index.clone());
-        links::link_at(self.active, buffer, position, project, note_index, cx)
+        let definitions = self
+            .parsed
+            .as_ref()
+            .map(|parsed| parsed.link_definitions.clone());
+        links::link_at(
+            self.active,
+            buffer,
+            position,
+            project,
+            note_index,
+            definitions,
+            cx,
+        )
     }
 
     fn to_any(&self) -> &dyn Any {
@@ -1286,12 +1300,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 VIEWPORT_OVERSCAN_ROWS,
                 cx,
             );
+            let link_definitions = editor
+                .addon::<VisualMdAddon>()
+                .and_then(|addon| addon.parsed.as_ref())
+                .map(|parsed| parsed.link_definitions.clone());
             let plan = plan::plan_viewport_with_extensions(
                 text,
                 block_tree,
                 &selections,
                 visible_range.clone(),
-                &plan_extensions(&style, cx),
+                &plan_extensions(&style, link_definitions, cx),
             );
             if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
                 addon.planned = Some((snapshot.edit_count(), visible_range));
@@ -1458,16 +1476,22 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 }
 
 /// What extensions currently claim, as far as the planner needs to know.
-fn plan_extensions(style: &ResolvedStyle, cx: &App) -> plan::PlanExtensions {
+fn plan_extensions(
+    style: &ResolvedStyle,
+    link_definitions: Option<Arc<HashMap<String, String>>>,
+    cx: &App,
+) -> plan::PlanExtensions {
     let task_marks = style.task_marks.keys().copied().collect();
     let Some(registry) = cx.try_global::<extensions::VisualMdExtensions>() else {
         return plan::PlanExtensions {
             task_marks,
+            link_definitions,
             ..Default::default()
         };
     };
     plan::PlanExtensions {
         task_marks,
+        link_definitions,
         rendered_fence_languages: registry.fence_languages().into_iter().collect(),
         rules: rules::RuleSet {
             rules: registry.syntax_rules().into(),
@@ -1674,6 +1698,7 @@ fn parsed_document(
             edit_count,
             text: text.clone(),
             foldable: fold_ranges::foldable_ranges(&text, &block_tree).into(),
+            link_definitions: Arc::new(plan::link_definitions(&text, &block_tree)),
             block_tree,
         });
     }
@@ -5226,6 +5251,27 @@ mod integration_tests {
                 .is_some()
         });
         assert!(last_has_a_crease);
+    }
+
+    #[gpui::test]
+    async fn a_reference_link_shows_its_text_only_while_the_cursor_is_elsewhere(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "a [text][ref] and [nope][none] b\n\n[ref]: https://example.com\n";
+        let mut cx = markdown_editor_with(cx, &format!("{text}ˇ")).await;
+        assert_eq!(
+            cx.display_text(),
+            "a  text  and [nope][none] b\n\n[ref]: https://example.com\n"
+        );
+
+        cx.set_state(&format!(
+            "a [teˇxt][ref] and [nope][none] b\n\n[ref]: https://example.com\n"
+        ));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.display_text(),
+            "a [text][ref] and [nope][none] b\n\n[ref]: https://example.com\n"
+        );
     }
 
     #[gpui::test]

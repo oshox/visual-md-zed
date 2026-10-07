@@ -6,6 +6,7 @@
 //! detection of URLs, which looks at the text under the pointer, never sees its
 //! destination. Resolving the link here is what makes it clickable.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use workspace::DeploySearch;
 use crate::extensions::{HookError, LinkResolvers, VisualMdExtensions, when_not_busy};
 use crate::notes::{self, NoteIndex};
 use crate::outline;
-use crate::plan::parse_blocks;
+use crate::plan::{self, parse_blocks};
 
 /// A link on one line of text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,39 @@ pub fn link_in_line(line: &str, offset: usize) -> Option<LinkInLine> {
             style: link.style,
             target: link.target,
         })
+}
+
+/// The reference-style link on `line` that covers byte `offset`, when
+/// `definitions` has the label it names, as a link to the destination that label
+/// was defined with.
+pub fn reference_link_in_line(
+    line: &str,
+    offset: usize,
+    definitions: &HashMap<String, String>,
+) -> Option<LinkInLine> {
+    if definitions.is_empty() {
+        return None;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_md::INLINE_LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(line, None)?;
+    let mut node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    while !matches!(
+        node.kind(),
+        "full_reference_link" | "collapsed_reference_link" | "shortcut_link"
+    ) {
+        node = node.parent()?;
+    }
+    let destination =
+        definitions.get(&plan::normalize_label(plan::reference_label(node, line)?))?;
+    Some(LinkInLine {
+        range: node.byte_range(),
+        style: VisualMdLinkStyle::Inline,
+        target: destination.clone(),
+        is_wikilink: false,
+    })
 }
 
 /// The scheme of a link destination, lowercased: letters, digits, `+`, `-` and
@@ -189,6 +223,7 @@ pub(crate) fn link_at(
     position: Anchor,
     project: Option<&Entity<Project>>,
     note_index: Option<Entity<NoteIndex>>,
+    definitions: Option<Arc<HashMap<String, String>>>,
     cx: &mut App,
 ) -> Option<Task<Option<(Range<Anchor>, HoverLink)>>> {
     if !active {
@@ -201,7 +236,12 @@ pub(crate) fn link_at(
     let line_end = snapshot.point_to_offset(Point::new(row, snapshot.line_len(row)));
     let line: String = snapshot.text_for_range(line_start..line_end).collect();
     let relative_offset = offset.checked_sub(line_start)?;
-    let Some(link) = link_in_line(&line, relative_offset) else {
+    let link = link_in_line(&line, relative_offset).or_else(|| {
+        definitions
+            .as_deref()
+            .and_then(|definitions| reference_link_in_line(&line, relative_offset, definitions))
+    });
+    let Some(link) = link else {
         return tag_search_link(&line, relative_offset, line_start, &snapshot);
     };
     let range = snapshot.anchor_before(line_start + link.range.start)
@@ -345,6 +385,44 @@ mod tests {
             target: target.to_string(),
             is_wikilink,
         }
+    }
+
+    fn definitions(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(label, destination)| (plan::normalize_label(label), destination.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_a_reference_link_leads_where_its_label_was_defined() {
+        let defined = definitions(&[("ref", "https://a.example"), ("Text", "b.md")]);
+        for (line, offset, range, target) in [
+            ("see [the docs][REF] now", 8, 4..19, "https://a.example"),
+            ("see [text][] now", 6, 4..12, "b.md"),
+            ("see [ref] now", 5, 4..9, "https://a.example"),
+        ] {
+            let link = reference_link_in_line(line, offset, &defined).expect(line);
+            assert_eq!(link.range, range, "for {line:?}");
+            assert_eq!(link.target, target, "for {line:?}");
+            assert!(!link.is_wikilink);
+        }
+    }
+
+    #[test]
+    fn test_a_reference_link_is_nothing_without_its_definition_or_off_the_link() {
+        let defined = definitions(&[("ref", "https://a.example")]);
+        assert_eq!(
+            reference_link_in_line("see [text][nope]", 6, &defined),
+            None
+        );
+        assert_eq!(reference_link_in_line("see [ref] now", 11, &defined), None);
+        assert_eq!(
+            reference_link_in_line("see [ref] now", 6, &HashMap::new()),
+            None
+        );
+        assert_eq!(reference_link_in_line("see `[ref]` now", 7, &defined), None);
+        assert_eq!(reference_link_in_line("see [[ref]] now", 7, &defined), None);
     }
 
     #[test]
@@ -669,6 +747,39 @@ mod integration_tests {
             "[the docs](https://example.com/docs)"
         );
         assert_eq!(link, "url https://example.com/docs");
+    }
+
+    #[gpui::test]
+    async fn test_a_reference_link_opens_the_destination_of_its_definition(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let text = "see [the docs][docs] and [other] now\n\n[docs]: https://example.com/docs\n[other]: other.md\n";
+        let document = open(
+            cx,
+            json!({ "a.md": text, "other.md": "o" }),
+            "/dir/a.md",
+            true,
+        )
+        .await;
+
+        let (range, link) = link_for(cx, &document, text.find("docs]").unwrap_or(0))
+            .await
+            .expect("a link");
+        assert_eq!(text_of(text, range), "[the docs][docs]");
+        assert_eq!(link, "url https://example.com/docs");
+
+        let (range, link) = link_for(cx, &document, text.find("other]").unwrap_or(0))
+            .await
+            .expect("a link");
+        assert_eq!(text_of(text, range), "[other]");
+        assert_eq!(link, "file other.md");
+
+        assert!(
+            link_for(cx, &document, text.find("now").unwrap_or(0))
+                .await
+                .is_none()
+        );
     }
 
     #[gpui::test]
