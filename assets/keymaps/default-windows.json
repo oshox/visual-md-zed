@@ -614,6 +614,10 @@
     "bindings": {
       "ctrl-b": "visual_md::ToggleBold",
       "ctrl-i": "visual_md::ToggleItalic",
+      "ctrl-alt-x": "visual_md::ToggleStrikethrough",
+      "ctrl-alt-u": "visual_md::ToggleHighlight",
+      "ctrl-alt-t": "visual_md::ToggleCode",
+      "ctrl-alt-n": "visual_md::ToggleLink",
     },
   },
   {

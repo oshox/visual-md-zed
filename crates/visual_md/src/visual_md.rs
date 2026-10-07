@@ -241,6 +241,7 @@ mod format_toggle;
 mod inline_scan;
 mod links;
 mod list_continuation;
+mod list_edit;
 mod notes;
 pub mod outline;
 mod plan;
@@ -254,7 +255,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 pub use commands::RunExtensionCommand;
-use editor::actions::Newline;
+use editor::actions::{Backspace, Backtab, MoveLineDown, MoveLineUp, Newline, Tab};
 use editor::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId,
     DisplayPoint, DisplayRow, DisplaySnapshot,
@@ -288,6 +289,18 @@ actions!(
         /// Toggles `*italic*` on the selection, the same way `ToggleBold`
         /// does for bold — see `intercept_toggle_italic`.
         ToggleItalic,
+        /// Toggles `~~strikethrough~~` on the selection, the same way
+        /// `ToggleBold` does for bold.
+        ToggleStrikethrough,
+        /// Toggles `==highlight==` on the selection, the same way `ToggleBold`
+        /// does for bold.
+        ToggleHighlight,
+        /// Toggles `` `code` `` on the selection, the same way `ToggleBold`
+        /// does for bold.
+        ToggleCode,
+        /// Makes the selection the text of a `[link](url)` and selects the
+        /// `url`, or unwraps the link the selection is in.
+        ToggleLink,
         /// Toggles Markdown live preview in this editor only, without
         /// changing any settings file — see `toggle_live_preview`.
         ToggleLivePreview,
@@ -324,6 +337,67 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let newline_action = editor.register_action(cx.listener(intercept_newline));
     let toggle_bold_action = editor.register_action(cx.listener(intercept_toggle_bold));
     let toggle_italic_action = editor.register_action(cx.listener(intercept_toggle_italic));
+    let format_actions = vec![
+        editor.register_action(cx.listener(
+            |editor: &mut Editor, _: &ToggleStrikethrough, window, cx| {
+                intercept_toggle(editor, Emphasis::Strikethrough, window, cx)
+            },
+        )),
+        editor.register_action(cx.listener(
+            |editor: &mut Editor, _: &ToggleHighlight, window, cx| {
+                intercept_toggle(editor, Emphasis::Highlight, window, cx)
+            },
+        )),
+        editor.register_action(
+            cx.listener(|editor: &mut Editor, _: &ToggleCode, window, cx| {
+                intercept_toggle(editor, Emphasis::Code, window, cx)
+            }),
+        ),
+        editor.register_action(
+            cx.listener(|editor: &mut Editor, _: &ToggleLink, window, cx| {
+                apply_format(editor, window, cx, format_toggle::toggle_link)
+            }),
+        ),
+    ];
+    let list_actions = vec![
+        editor.register_action(cx.listener(|editor: &mut Editor, _: &Tab, window, cx| {
+            if editor.move_to_next_snippet_tabstop(window, cx) {
+                return;
+            }
+            apply_list_edit(editor, window, cx, list_edit::nest);
+        })),
+        editor.register_action(cx.listener(|editor: &mut Editor, _: &Backtab, window, cx| {
+            if editor.move_to_prev_snippet_tabstop(window, cx) {
+                return;
+            }
+            apply_list_edit(editor, window, cx, list_edit::outdent);
+        })),
+        editor.register_action(
+            cx.listener(|editor: &mut Editor, _: &Backspace, window, cx| {
+                apply_list_edit(editor, window, cx, |text, selection| {
+                    if selection.is_empty() {
+                        list_edit::backspace(text, selection.start)
+                    } else {
+                        None
+                    }
+                })
+            }),
+        ),
+        editor.register_action(
+            cx.listener(|editor: &mut Editor, _: &MoveLineUp, window, cx| {
+                apply_list_edit(editor, window, cx, |text, selection| {
+                    list_edit::move_item(text, selection, list_edit::Direction::Up)
+                })
+            }),
+        ),
+        editor.register_action(
+            cx.listener(|editor: &mut Editor, _: &MoveLineDown, window, cx| {
+                apply_list_edit(editor, window, cx, |text, selection| {
+                    list_edit::move_item(text, selection, list_edit::Direction::Down)
+                })
+            }),
+        ),
+    ];
     let toggle_live_preview_action = editor.register_action(cx.listener(toggle_live_preview));
     let run_extension_command_action =
         editor.register_action(cx.listener(commands::run_extension_command));
@@ -332,6 +406,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         _newline_action: newline_action,
         _toggle_bold_action: toggle_bold_action,
         _toggle_italic_action: toggle_italic_action,
+        _format_actions: format_actions,
+        _list_actions: list_actions,
         _toggle_live_preview_action: toggle_live_preview_action,
         _run_extension_command_action: run_extension_command_action,
         enabled_override: None,
@@ -419,6 +495,13 @@ fn intercept_newline(
         .iter()
         .map(|selection| selection.head().0)
         .collect();
+    if let [cursor] = cursors.as_slice() {
+        match list_edit::newline(&text, *cursor) {
+            Some(edit) => replace_with_list_edit(editor, edit, window, cx),
+            None => cx.propagate(),
+        }
+        return;
+    }
     // Selections are reported in document order, as `newline_batch` needs.
     let Some(batch) = list_continuation::newline_batch(&text, &cursors) else {
         cx.propagate();
@@ -442,6 +525,59 @@ fn intercept_newline(
         );
         editor.change_selections(SelectionEffects::default(), window, cx, |s| {
             s.select_ranges(new_cursors);
+        });
+    });
+}
+
+/// Applies a list-editing key: the edit `compute` gives for the one selection
+/// and the text, or nothing, which lets the key do what it does anywhere else
+/// (indent a line, delete a character, move a line).
+fn apply_list_edit(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+    compute: impl FnOnce(&str, &Range<usize>) -> Option<list_edit::ListEdit>,
+) {
+    if !live_preview_enabled(editor, cx) || editor.read_only(cx) {
+        cx.propagate();
+        return;
+    }
+
+    let display_snapshot = editor.display_snapshot(cx);
+    let selections = editor
+        .selections
+        .all::<MultiBufferOffset>(&display_snapshot);
+    let [selection] = selections.as_slice() else {
+        cx.propagate();
+        return;
+    };
+    let range = selection.start.0..selection.end.0;
+
+    let text = editor.buffer().read(cx).snapshot(cx).text();
+    match compute(&text, &range) {
+        Some(edit) => replace_with_list_edit(editor, edit, window, cx),
+        None => cx.propagate(),
+    }
+}
+
+fn replace_with_list_edit(
+    editor: &mut Editor,
+    edit: list_edit::ListEdit,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    editor.transact(window, cx, |editor, window, cx| {
+        editor.edit(
+            [(
+                MultiBufferOffset(edit.replace.start)..MultiBufferOffset(edit.replace.end),
+                edit.insert,
+            )],
+            cx,
+        );
+        editor.change_selections(SelectionEffects::default(), window, cx, |s| {
+            s.select_ranges([
+                MultiBufferOffset(edit.selection.start)..MultiBufferOffset(edit.selection.end)
+            ]);
         });
     });
 }
@@ -477,6 +613,20 @@ fn intercept_toggle(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
+    apply_format(editor, window, cx, |text, selections| {
+        format_toggle::toggle(text, selections, kind)
+    });
+}
+
+/// Applies a formatting shortcut: the edits `compute` gives for the selections
+/// and the text, in one transaction, or nothing, which lets the keystroke carry
+/// on to whatever else is bound to it.
+fn apply_format(
+    editor: &mut Editor,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+    compute: impl FnOnce(&str, &[Range<usize>]) -> format_toggle::FormatEdit,
+) {
     if !live_preview_enabled(editor, cx) {
         cx.propagate();
         return;
@@ -498,7 +648,7 @@ fn intercept_toggle(
     }
 
     let text = editor.buffer().read(cx).snapshot(cx).text();
-    let result = format_toggle::toggle(&text, &selections, kind);
+    let result = compute(&text, &selections);
     if result.edits.is_empty() {
         cx.propagate();
         return;
@@ -605,6 +755,11 @@ struct VisualMdAddon {
     /// `_newline_action` does.
     _toggle_bold_action: Subscription,
     _toggle_italic_action: Subscription,
+    /// The strikethrough, highlight, code and link shortcuts.
+    _format_actions: Vec<Subscription>,
+    /// Keeps the list-editing interceptors (`Tab`, `Backtab`, `Backspace`,
+    /// `MoveLineUp`, `MoveLineDown`) alive.
+    _list_actions: Vec<Subscription>,
     _toggle_live_preview_action: Subscription,
     /// Keeps the handler for extension commands (see `commands`) alive.
     _run_extension_command_action: Subscription,
@@ -4419,6 +4574,251 @@ mod integration_tests {
 
         cx.dispatch_action(ToggleBold);
         cx.assert_editor_state("Hello **«worldˇ»** now\n");
+    }
+
+    async fn markdown_editor_with(cx: &mut TestAppContext, state: &str) -> EditorTestContext {
+        editor_with_language(cx, state, markdown_language()).await
+    }
+
+    async fn editor_with_language(
+        cx: &mut TestAppContext,
+        state: &str,
+        language: std::sync::Arc<language::Language>,
+    ) -> EditorTestContext {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+        cx.run_until_parked();
+        // Set after the language so that live preview, which turns the fold
+        // arrows off, is already on when indented text first gets painted.
+        cx.set_state(state);
+        cx.run_until_parked();
+        cx
+    }
+
+    #[gpui::test]
+    async fn the_other_formatting_shortcuts_wrap_a_selection(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "Hello «worldˇ» now\n").await;
+
+        cx.dispatch_action(ToggleStrikethrough);
+        cx.assert_editor_state("Hello ~~«worldˇ»~~ now\n");
+        cx.dispatch_action(ToggleStrikethrough);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+
+        cx.dispatch_action(ToggleHighlight);
+        cx.assert_editor_state("Hello ==«worldˇ»== now\n");
+        cx.dispatch_action(ToggleHighlight);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+
+        cx.dispatch_action(ToggleCode);
+        cx.assert_editor_state("Hello `«worldˇ»` now\n");
+        cx.dispatch_action(ToggleCode);
+        cx.assert_editor_state("Hello «worldˇ» now\n");
+    }
+
+    #[gpui::test]
+    async fn the_link_shortcut_selects_the_url_and_undoes_in_one_step(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "see «docsˇ» now\n").await;
+
+        cx.dispatch_action(ToggleLink);
+        cx.assert_editor_state("see [docs](«urlˇ») now\n");
+
+        cx.update_editor(|editor, window, cx| editor.undo(&Default::default(), window, cx));
+        cx.assert_editor_state("see «docsˇ» now\n");
+
+        cx.set_state("a [teˇxt](https://x.org) b\n");
+        cx.dispatch_action(ToggleLink);
+        cx.assert_editor_state("a teˇxt b\n");
+    }
+
+    #[gpui::test]
+    async fn the_formatting_shortcuts_do_nothing_outside_live_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("Hello «worldˇ» now\n");
+        cx.run_until_parked();
+
+        for action in [
+            Box::new(ToggleStrikethrough) as Box<dyn gpui::Action>,
+            Box::new(ToggleHighlight),
+            Box::new(ToggleCode),
+            Box::new(ToggleLink),
+        ] {
+            cx.update(|window, cx| window.dispatch_action(action, cx));
+            cx.assert_editor_state("Hello «worldˇ» now\n");
+        }
+    }
+
+    #[gpui::test]
+    async fn tab_nests_an_item_by_the_width_of_its_sibling_and_undoes_in_one_step(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = markdown_editor_with(cx, "- one\n- tˇwo\n").await;
+        cx.dispatch_action(Tab);
+        cx.assert_editor_state("- one\n  - tˇwo\n");
+        cx.update_editor(|editor, window, cx| editor.undo(&Default::default(), window, cx));
+        cx.assert_editor_state("- one\n- tˇwo\n");
+
+        cx.set_state("1. one\n2. tˇwo\n3. three\n");
+        cx.dispatch_action(Tab);
+        cx.assert_editor_state("1. one\n   1. tˇwo\n2. three\n");
+    }
+
+    #[gpui::test]
+    async fn shift_tab_takes_an_item_and_its_children_out_a_level(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "- one\n  - tˇwo\n    - deep\n").await;
+        cx.dispatch_action(Backtab);
+        cx.assert_editor_state("- one\n- tˇwo\n  - deep\n");
+    }
+
+    #[gpui::test]
+    async fn backspace_at_the_start_of_an_item_outdents_and_then_removes_the_marker(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = markdown_editor_with(cx, "- one\n  - ˇtwo\n").await;
+        cx.dispatch_action(Backspace);
+        cx.assert_editor_state("- one\n- ˇtwo\n");
+        cx.dispatch_action(Backspace);
+        cx.assert_editor_state("- one\nˇtwo\n");
+    }
+
+    #[gpui::test]
+    async fn alt_up_and_down_move_a_list_item_with_its_children(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "- a\n- ˇb\n  - child\n- c\n").await;
+        cx.dispatch_action(MoveLineUp);
+        cx.assert_editor_state("- ˇb\n  - child\n- a\n- c\n");
+        cx.dispatch_action(MoveLineDown);
+        cx.assert_editor_state("- a\n- ˇb\n  - child\n- c\n");
+
+        cx.set_state("plain\nˇtext\n");
+        cx.dispatch_action(MoveLineUp);
+        cx.assert_editor_state("ˇtext\nplain\n");
+    }
+
+    #[gpui::test]
+    async fn enter_in_the_middle_of_an_ordered_list_numbers_the_items_after_it(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = markdown_editor_with(cx, "1. one\n2. twoˇ\n3. three\n").await;
+        cx.dispatch_action(Newline);
+        cx.assert_editor_state("1. one\n2. two\n3. ˇ\n4. three\n");
+    }
+
+    #[gpui::test]
+    async fn the_list_keys_leave_several_cursors_to_the_editor(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "- one\n- tˇwo\n- thˇree\n").await;
+        cx.dispatch_action(MoveLineUp);
+        cx.assert_editor_state("- tˇwo\n- thˇree\n- one\n");
+    }
+
+    #[gpui::test]
+    async fn tab_moves_between_snippet_tabstops_before_it_nests(cx: &mut TestAppContext) {
+        let mut cx = markdown_editor_with(cx, "- one\n- ˇ\n").await;
+        cx.update_editor(|editor, window, cx| {
+            let cursor = editor
+                .selections
+                .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                .head();
+            let snippet = snippet::Snippet::parse("[$1] and [$2]").expect("a valid snippet");
+            editor
+                .insert_snippet(&[cursor..cursor], snippet, window, cx)
+                .expect("the snippet inserts");
+        });
+        cx.assert_editor_state("- one\n- [ˇ] and []\n");
+
+        cx.dispatch_action(Tab);
+        cx.assert_editor_state("- one\n- [] and [ˇ]\n");
+    }
+
+    /// Markdown as it is shipped, brackets included, rather than the bare
+    /// language the other tests use.
+    fn shipped_markdown_language() -> std::sync::Arc<language::Language> {
+        let config: language::LanguageConfig =
+            toml::from_str(include_str!("../../grammars/src/markdown/config.toml"))
+                .expect("the shipped Markdown config parses");
+        std::sync::Arc::new(language::Language::new(config, None))
+    }
+
+    #[gpui::test]
+    async fn typing_two_open_brackets_leaves_a_closed_wikilink(cx: &mut TestAppContext) {
+        let mut cx = editor_with_language(cx, "ˇ\n", shipped_markdown_language()).await;
+        cx.simulate_input("[[");
+        cx.assert_editor_state("[[ˇ]]\n");
+        cx.simulate_input("Note");
+        cx.assert_editor_state("[[Noteˇ]]\n");
+    }
+
+    #[gpui::test]
+    async fn typing_equals_or_underscore_over_a_selection_wraps_it(cx: &mut TestAppContext) {
+        let mut cx = editor_with_language(cx, "a «wordˇ» b\n", shipped_markdown_language()).await;
+        cx.simulate_input("==");
+        cx.assert_editor_state("a ==«wordˇ»== b\n");
+
+        cx.set_state("a «wordˇ» b\n");
+        cx.simulate_input("_");
+        cx.assert_editor_state("a _«wordˇ»_ b\n");
+    }
+
+    #[gpui::test]
+    async fn the_list_keys_do_nothing_special_outside_live_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("- one\n\n- ˇtwo\n");
+        cx.run_until_parked();
+
+        cx.dispatch_action(MoveLineUp);
+        cx.assert_editor_state("- one\n- ˇtwo\n\n");
+    }
+
+    /// Every formatting action has a key on every platform, and the keymaps
+    /// still load: a binding to an action that does not exist is dropped when
+    /// the keymap is read, so this is also what notices a misspelled one.
+    #[gpui::test]
+    async fn the_default_keymaps_bind_every_formatting_shortcut(cx: &mut TestAppContext) {
+        init_test(cx);
+        let platforms = [
+            ("keymaps/default-linux.json", "ctrl"),
+            ("keymaps/default-windows.json", "ctrl"),
+            ("keymaps/default-macos.json", "cmd"),
+        ];
+        cx.update(|cx| {
+            for (asset, modifier) in platforms {
+                let bindings = settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                    .expect("the keymap loads");
+                let bound = |action: &str| -> Vec<String> {
+                    bindings
+                        .iter()
+                        .filter(|binding| binding.action().name() == action)
+                        .map(|binding| {
+                            binding
+                                .keystrokes()
+                                .iter()
+                                .map(|keystroke| keystroke.inner().unparse())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect()
+                };
+                let key = |chord: &str| {
+                    gpui::Keystroke::parse(chord)
+                        .expect("the chord is valid")
+                        .unparse()
+                };
+                for (action, chord) in [
+                    ("visual_md::ToggleBold", format!("{modifier}-b")),
+                    ("visual_md::ToggleItalic", format!("{modifier}-i")),
+                    (
+                        "visual_md::ToggleStrikethrough",
+                        format!("{modifier}-alt-x"),
+                    ),
+                    ("visual_md::ToggleHighlight", format!("{modifier}-alt-u")),
+                    ("visual_md::ToggleCode", format!("{modifier}-alt-t")),
+                    ("visual_md::ToggleLink", format!("{modifier}-alt-n")),
+                ] {
+                    assert_eq!(bound(action), vec![key(&chord)], "{action} in {asset}");
+                }
+            }
+        });
     }
 
     #[gpui::test]

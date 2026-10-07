@@ -76,14 +76,14 @@ pub fn newline_batch(text: &str, cursors: &[usize]) -> Option<NewlineBatch> {
 /// A list item's own marker, as found among its *direct* children (so a
 /// nested list's markers, being children of a nested `list_item` several
 /// levels down, are never picked up here).
-struct ItemMarker {
+pub(crate) struct ItemMarker {
     /// Byte range of the `list_marker_*` node (bullet or ordinal; already
     /// includes its trailing whitespace per the grammar).
-    marker: Range<usize>,
-    ordered: bool,
+    pub(crate) marker: Range<usize>,
+    pub(crate) ordered: bool,
     /// Byte range of a `task_list_marker_*` sibling, if this item is a task
     /// item (`- [ ] ...`).
-    task: Option<Range<usize>>,
+    pub(crate) task: Option<Range<usize>>,
 }
 
 /// Computes the Enter-key edit for `text` with a single collapsed cursor at
@@ -185,7 +185,7 @@ fn clear_marker(line_start: usize, content_start: usize) -> ListNewline {
 
 /// Walks down to the deepest `list_item` node whose byte range contains
 /// `cursor`.
-fn enclosing_list_item(root: Node, cursor: usize) -> Option<Node> {
+pub(crate) fn enclosing_list_item(root: Node, cursor: usize) -> Option<Node> {
     let mut node = root.descendant_for_byte_range(cursor, cursor)?;
     loop {
         if node.kind() == "list_item" {
@@ -197,7 +197,7 @@ fn enclosing_list_item(root: Node, cursor: usize) -> Option<Node> {
 
 /// The `list_item` one level up from `item`, if any (i.e. `item`'s `list`
 /// parent is itself inside another `list_item`, not a top-level list).
-fn parent_list_item(item: Node) -> Option<Node> {
+pub(crate) fn parent_list_item(item: Node) -> Option<Node> {
     let list = item.parent()?;
     debug_assert_eq!(list.kind(), "list");
     let maybe_item = list.parent()?;
@@ -208,7 +208,7 @@ fn parent_list_item(item: Node) -> Option<Node> {
 /// its direct children only -- deliberately not a descendant search, so a
 /// nested sub-list's markers (children of a nested `list_item`) are never
 /// mistaken for this item's own.
-fn own_marker(item: Node) -> Option<ItemMarker> {
+pub(crate) fn own_marker(item: Node) -> Option<ItemMarker> {
     let mut cursor = item.walk();
     let mut marker = None;
     let mut task = None;
@@ -232,7 +232,7 @@ fn own_marker(item: Node) -> Option<ItemMarker> {
 /// The byte offset where this item's actual content begins: right after the
 /// marker, and after the task checkbox (plus its single separating space)
 /// when present.
-fn content_start_after(item_marker: &ItemMarker, text: &str) -> usize {
+pub(crate) fn content_start_after(item_marker: &ItemMarker, text: &str) -> usize {
     match &item_marker.task {
         Some(task) => {
             let after_task = task.end;
@@ -270,11 +270,11 @@ fn next_marker_text(item_marker: &ItemMarker, text: &str) -> String {
     result
 }
 
-fn line_start(text: &str, offset: usize) -> usize {
+pub(crate) fn line_start(text: &str, offset: usize) -> usize {
     text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)
 }
 
-fn line_end(text: &str, offset: usize) -> usize {
+pub(crate) fn line_end(text: &str, offset: usize) -> usize {
     text[offset..]
         .find('\n')
         .map(|i| offset + i)

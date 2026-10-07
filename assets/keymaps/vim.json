@@ -186,6 +186,19 @@
     },
   },
   {
+    // Zed MD's bold and italic shortcuts on a visual selection. Vim's own
+    // `ctrl-b` (page up) and `ctrl-i` (jump forward) are bound in the same
+    // editor context and this file loads after the default keymaps, so without
+    // this they win. Normal mode keeps Vim's keys, since a bare cursor would
+    // only insert an empty pair. On macOS bold and italic are `cmd-b` and
+    // `cmd-i`, which Vim does not use.
+    "context": "Editor && VimControl && vim_mode == visual && visual_md && !menu && os != macos",
+    "bindings": {
+      "ctrl-b": "visual_md::ToggleBold",
+      "ctrl-i": "visual_md::ToggleItalic",
+    },
+  },
+  {
     "context": "vim_mode == normal || vim_mode == visual || vim_mode == operator",
     "bindings": {
       "] ]": "vim::NextSectionStart",

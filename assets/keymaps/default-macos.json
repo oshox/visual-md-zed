@@ -655,6 +655,10 @@
     "bindings": {
       "cmd-b": "visual_md::ToggleBold",
       "cmd-i": "visual_md::ToggleItalic",
+      "cmd-alt-x": "visual_md::ToggleStrikethrough",
+      "cmd-alt-u": "visual_md::ToggleHighlight",
+      "cmd-alt-t": "visual_md::ToggleCode",
+      "cmd-alt-n": "visual_md::ToggleLink",
     },
   },
   {
