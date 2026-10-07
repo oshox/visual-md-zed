@@ -24,7 +24,7 @@ purpose even though the app is branded Zed MD.
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 | M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
-| M17 | Editing tools and the outliner | In progress: editing tools and folding built, completion planned, see "M17" |
+| M17 | Editing tools and the outliner | Built. Nothing that needs a key or the mouse was run in the app, see "M17" |
 | M18 | Block syntax: properties panel, footnotes, math, embeds, hover previews | Planned, see the feature audit |
 | M19 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
@@ -330,12 +330,12 @@ work, "API" needs new extension API.
 | Footnotes, math, YAML properties panel, embedded HTML | none | Core, M18 |
 | Callouts: whole-row fold click, right-click type menu, per-type accent bar | chevron click only | Core, M18 |
 | Tables: row lines, per-cell raw reveal | cells always raw | Core, M18 |
-| Folding of headings and list items, saved per file | fold gutter off | Core, M17 |
-| Built-in `[[`, `#`, `![[` autocomplete | extension-supplied names only | Core, M17 |
-| Strike, highlight, code, link shortcuts | bold and italic only | Core, M17 |
-| List editing: Tab to nest, Backspace on a marker, renumbering the source | Enter only | Core, M17 |
-| Drag and drop to link or embed, image paste as `![[...]]` | drop opens a tab | Core, M17 |
-| Reference-style links, Vim `ctrl-b` and `ctrl-i` | not handled, Vim wins | Core, M17 |
+| Folding of headings and list items, saved per file | fold gutter off | Core, **M17** (not saved per file) |
+| Built-in `[[`, `#`, `![[` autocomplete | extension-supplied names only | Core, **M17** |
+| Strike, highlight, code, link shortcuts | bold and italic only | Core, **M17** |
+| List editing: Tab to nest, Backspace on a marker, renumbering the source | Enter only | Core, **M17** |
+| Drag and drop to link or embed, image paste as `![[...]]` | drop opens a tab | Core, **M17** (as Markdown links) |
+| Reference-style links, Vim `ctrl-b` and `ctrl-i` | not handled, Vim wins | Core, **M17** |
 | Spellcheck, word count, export | none | Core or Ext, unscheduled |
 
 **Logseq, beyond that.** Outliner editing (Tab and Shift-Tab move a bullet with
@@ -557,3 +557,59 @@ a folded section ends in unfolds it when clicked.
 **Not checked in the running app.** There was no way to send a click or a
 key, so the arrow, the chip and the commands are covered by tests that call the
 same functions the editor does.
+
+### As built: completion, paste, drop and reference links
+
+**Completion.** Typing `[[` offers the notes of the project, the closest to the
+one being edited first, and `![[` the images too. A name is the note's name
+without its extension, and with its folders only when another note has the same
+name; an image keeps its extension. After `[[Note#` the headings of that note
+are offered, after `[[Note#^` its block ids with the start of their line, and
+`[[#` does the same for the note being edited. `#` in the middle of a line, after
+whitespace or an opening bracket, offers the tags in use, the most used first. A
+`#` that starts a line, or follows a letter or another `#`, does not, so headings
+and `https://x/#top` open no menu. Tags are read from the project's Markdown
+files in the background, at most 2,000 of them and none over 256 KB, and kept for
+30 seconds; the note being edited is always current. What extensions suggest for
+`[[` is merged in after ours, and an entry whose label is one of ours is left
+out. A project on a remote server gets names but no tags.
+
+**Image paste.** `visual_md.attachment_folder` names where a pasted image is
+saved: a path starting with `/` is from the root of the worktree, any other from
+the note's folder, and `..` goes up. The folder is created, the file is
+`image.png` or `image_N.png` when that is taken, and the note gets
+`![](path)` with the path from its own folder, spaces written `%20`, and the
+cursor between the brackets. With the setting unset, or naming a folder outside
+the worktree, the editor pastes the image beside the note as before. The setting
+is in the settings UI under Markdown Live Preview.
+
+**Drop.** Files dropped on a note from the system, and entries dragged from the
+project panel, are inserted at the cursor as links, one to a line:
+`![](../pics/x.png)` for an image, `[Name](../docs/Name.md)` for a note (without
+its extension) and `[name.pdf](../docs/name.pdf)` for anything else. This is a new
+hook, `Addon::handle_drop`, called from the editor's `Item::handle_drop`. It
+applies only when every dropped path is a file of the same worktree as the note.
+A file from outside the project, a folder, or a drop while live preview is off is
+left to the pane, which opens a tab. The text goes at the cursor because the pane
+does not say where the drop happened. Files are not copied into the project.
+
+**Reference links.** `[text][label]`, `[text][]` and `[label]` show only their
+text, as a link, when the document defines `[label]: destination` anywhere in it,
+and ctrl-click opens that destination. Labels match without regard to case or
+spacing, the first definition counts, and `[[name]]` stays a wikilink. A label
+nobody defines stays text.
+
+**Limitations.**
+- A drop cannot be placed: it goes at the cursor.
+- Tag suggestions come from file contents read at most every 30 seconds, so a tag
+  added in another file shows up in a menu a little later.
+- Tags are found with the pattern the highlighter uses, without regard to code
+  blocks, so a `#word` in a fence is offered.
+- A dropped file is linked by a path from the note, which is not updated if either
+  moves.
+
+**Not checked in the running app.** There was no way to paste, drag or type into
+it. The menus, the paste and the drop are covered by tests that run the same
+paths: typed characters one at a time through the editor, `Paste` dispatched as
+an action with an image on the clipboard, and `handle_drop` called the way a pane
+calls it on a workspace's active item.
