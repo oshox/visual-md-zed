@@ -953,6 +953,7 @@ const KEY_BOLD: usize = 9;
 const KEY_ITALIC: usize = 10;
 const KEY_STRIKETHROUGH: usize = 11;
 const KEY_LINK: usize = 12;
+const KEY_TAG: usize = 13;
 /// The first of the callout background keys: one per distinct callout type
 /// name in view, each setting a different `background_color`. Keeping them
 /// disjoint means a callout that changes type (edited from `[!note]` to
@@ -2821,11 +2822,22 @@ fn apply_style_highlights(
     // way bold/italic have their own), so by default a real link is colored
     // using `link_text_hover`, the same theme token Zed's own generic cmd+hover
     // link highlight already uses (`crates/editor/src/hover_links.rs`).
+    let link_ranges: Vec<Range<usize>> = spans_of(SpanStyle::Link)
+        .into_iter()
+        .chain(computed.wikilinks.iter().map(|link| link.range.clone()))
+        .collect();
     set_visual_md_highlight(
         editor,
         KEY_LINK,
-        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Link)),
+        to_anchor_ranges(snapshot, &link_ranges),
         style.link_style(),
+        cx,
+    );
+    set_visual_md_highlight(
+        editor,
+        KEY_TAG,
+        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Tag)),
+        style.tag_style(),
         cx,
     );
 
@@ -3294,6 +3306,30 @@ mod integration_tests {
                 .lines()
                 .count(),
             "each block takes the one row of the line it replaces, got {displayed:?}"
+        );
+    }
+
+    /// A wikilink shows only its text, or its alias, until a cursor touches it,
+    /// which brings back the brackets and the target.
+    #[gpui::test]
+    async fn a_wikilink_shows_only_its_text_until_the_cursor_is_on_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+
+        cx.set_state("ˇfirst\n\nsee [[Some Note|the alias]] and #tag\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        // Each hidden marker is folded to a single space, as it is for any link.
+        assert_eq!(cx.display_text(), "first\n\nsee  the alias  and #tag\n");
+
+        cx.set_state("first\n\nsee [[Some Nˇote|the alias]] and #tag\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert_eq!(
+            cx.display_text(),
+            "first\n\nsee [[Some Note|the alias]] and #tag\n",
+            "the whole link is raw while the cursor is in it, and a tag never hides anything"
         );
     }
 

@@ -16,6 +16,7 @@ use std::ops::Range;
 use extension::VisualMdSpanStyle;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::inline_scan;
 use crate::rules::{self, DynamicKey, DynamicResult, RuleHit, RuleSet};
 
 /// A persistent style to apply to a content span (never to its markers).
@@ -37,6 +38,8 @@ pub enum SpanStyle {
     /// brackets around it. See `visual_md.rs`'s `link_style` for why this is
     /// the one span style still allowed a distinct color.
     Link,
+    /// A `#tag`, including the `#`.
+    Tag,
 }
 
 /// The callout types the spec calls out by name; anything else still renders
@@ -160,6 +163,18 @@ pub enum GlyphKind {
     TablePipe,
 }
 
+/// A `[[wikilink]]` as the plan sees it: what it shows, and the note it names.
+/// Whether that note exists is for the applying side to decide, since this
+/// module knows nothing of projects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikilinkSpan {
+    /// The text the link shows, which the brackets around it were hidden for.
+    pub range: Range<usize>,
+    /// The note part of the target, without a `#heading` or `#^block`. Empty for
+    /// a link to a heading of the same note, `[[#Heading]]`.
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Marker byte ranges to fold away because no selection touches their
@@ -170,6 +185,9 @@ pub struct Plan {
     pub dimmed_markers: Vec<Range<usize>>,
     /// Content byte ranges (markers excluded) that get a persistent style.
     pub styled_spans: Vec<(Range<usize>, SpanStyle)>,
+    /// The `[[wikilinks]]` (not embeds) in view, whose brackets are in
+    /// `hidden_markers` or `dimmed_markers` like a link's.
+    pub wikilinks: Vec<WikilinkSpan>,
     /// Marker byte ranges replaced with a specific glyph (list bullets and
     /// renumbered ordinals, blockquote/callout left bars) — unlike
     /// `hidden_markers`, these are always folded regardless of selection,
@@ -1482,16 +1500,26 @@ fn plan_inline(
     };
 
     let mut code_ranges = Vec::new();
+    let mut link_ranges = Vec::new();
     walk_inline(
         tree.root_node(),
         range.start,
         selections,
         plan,
         &mut code_ranges,
+        &mut link_ranges,
         &extensions.rules,
         &inline_text,
     );
     plan_highlight_marks(&inline_text, range.start, &code_ranges, selections, plan);
+    plan_note_syntax(
+        &inline_text,
+        range.start,
+        &code_ranges,
+        &link_ranges,
+        selections,
+        plan,
+    );
 
     for hit in rules::find_pattern_hits(&extensions.rules, &inline_text, range.start, &code_ranges)
     {
@@ -1505,6 +1533,7 @@ fn walk_inline(
     selections: &[Range<usize>],
     plan: &mut Plan,
     code_ranges: &mut Vec<Range<usize>>,
+    link_ranges: &mut Vec<Range<usize>>,
     rule_set: &RuleSet,
     inline_text: &str,
 ) {
@@ -1523,6 +1552,7 @@ fn walk_inline(
 
     match node.kind() {
         "inline_link" => {
+            link_ranges.push(shift(node.byte_range(), offset));
             plan_link(node, offset, selections, plan);
             // A link's children are structural tokens (brackets/parens) plus
             // `link_text`/`link_destination`, none of which are themselves
@@ -1531,6 +1561,7 @@ fn walk_inline(
             return;
         }
         "uri_autolink" | "email_autolink" => {
+            link_ranges.push(shift(node.byte_range(), offset));
             plan_autolink(node, offset, selections, plan);
             return;
         }
@@ -1563,6 +1594,7 @@ fn walk_inline(
                     selections,
                     plan,
                     code_ranges,
+                    link_ranges,
                     rule_set,
                     inline_text,
                 );
@@ -1579,6 +1611,7 @@ fn walk_inline(
             selections,
             plan,
             code_ranges,
+            link_ranges,
             rule_set,
             inline_text,
         );
@@ -1782,6 +1815,53 @@ fn plan_highlight_marks(
             }
         }
         i += 1;
+    }
+}
+
+/// `[[wikilinks]]` and `#tags`, which no node of the Markdown grammar covers, so
+/// they are found by scanning the inline node's text like `==highlight==`.
+/// Code spans and links are left alone, and so is an embed `![[...]]`, which is
+/// an image or a note drawn in place rather than a link.
+///
+/// A wikilink behaves like a Markdown link: its brackets, and the target in front
+/// of an alias, are hidden until a selection touches the link, then shown dimmed.
+fn plan_note_syntax(
+    inline_text: &str,
+    offset: usize,
+    code_ranges: &[Range<usize>],
+    link_ranges: &[Range<usize>],
+    selections: &[Range<usize>],
+    plan: &mut Plan,
+) {
+    let mut excluded: Vec<Range<usize>> = code_ranges.iter().chain(link_ranges).cloned().collect();
+
+    for link in inline_scan::find_wikilinks(inline_text, offset, &excluded) {
+        excluded.push(link.range.clone());
+        if link.is_embed {
+            continue;
+        }
+        if touches_selection(&link.range, selections) {
+            plan.dimmed_markers.push(link.prefix);
+            plan.dimmed_markers.push(link.suffix);
+        } else {
+            plan.hidden_markers.push(link.prefix);
+            plan.hidden_markers.push(link.suffix);
+        }
+        let note = link
+            .target
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        plan.wikilinks.push(WikilinkSpan {
+            range: link.visible,
+            note,
+        });
+    }
+
+    for tag in inline_scan::find_tags(inline_text, offset, &excluded) {
+        plan.styled_spans.push((tag.range, SpanStyle::Tag));
     }
 }
 
@@ -2413,6 +2493,10 @@ mod tests {
             "> continuation of a quote\n",
             "[a link](https://example.com)\n",
             "<https://example.com>\n",
+            "See [[Note]] and [[Other Note|an alias]] near #tag/sub.\n",
+            "- [[Note#Heading]] and [[#Here]] with #tag\n",
+            "**[[bold link]]** and ==[[marked #tag]]== and [x [[inside]]](https://example.com)\n",
+            "Code `[[not a link]]` and `#not-a-tag` and ![[embed.png]] inline\n",
             "---\n",
             "```rust\nfn main() {}\n```\n",
             "| A | B |\n|--|--:|\n| 1 | 2 |\n",
@@ -2776,6 +2860,136 @@ mod tests {
             vec![(0..7, Some("rust".to_string())), (21..24, None)],
             "cursor being in the content shouldn't reveal either fence line"
         );
+    }
+
+    fn wikilink_texts<'a>(result: &'a Plan, text: &'a str) -> Vec<(&'a str, &'a str)> {
+        result
+            .wikilinks
+            .iter()
+            .map(|link| (&text[link.range.clone()], link.note.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_wikilink_hides_its_brackets_and_shows_its_target() {
+        let text = "see [[Note]] now\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(result.hidden_markers, vec![4..6, 10..12]);
+        assert!(result.dimmed_markers.is_empty());
+        assert_eq!(wikilink_texts(&result, text), vec![("Note", "Note")]);
+    }
+
+    #[test]
+    fn an_alias_is_shown_and_the_target_before_it_is_hidden() {
+        let text = "[[Some Note|the alias]]\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(result.hidden_markers, vec![0..12, 21..23]);
+        assert_eq!(
+            wikilink_texts(&result, text),
+            vec![("the alias", "Some Note")]
+        );
+    }
+
+    #[test]
+    fn the_note_of_a_link_leaves_out_its_heading_or_block() {
+        let text = "[[Note#Heading]] [[Note#^abc]] [[#Here]]\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(
+            wikilink_texts(&result, text),
+            vec![
+                ("Note#Heading", "Note"),
+                ("Note#^abc", "Note"),
+                ("#Here", "")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_touched_wikilink_shows_its_brackets_dimmed_and_still_counts() {
+        let text = "see [[Note|alias]] now\n";
+        let result = plan(text, &[12..12]);
+
+        assert!(result.hidden_markers.is_empty());
+        assert_eq!(result.dimmed_markers, vec![4..11, 16..18]);
+        assert_eq!(wikilink_texts(&result, text), vec![("alias", "Note")]);
+
+        let at_its_edge = plan(text, &[4..4]);
+        assert!(at_its_edge.hidden_markers.is_empty(), "the edge touches it");
+        let before_it = plan(text, &[3..3]);
+        assert_eq!(before_it.hidden_markers.len(), 2, "one byte off does not");
+        let away = plan(text, &[20..20]);
+        assert_eq!(away.hidden_markers.len(), 2);
+    }
+
+    #[test]
+    fn a_wikilink_in_code_or_an_autolink_is_not_one() {
+        for text in ["`[[a]]`\n", "<https://example.com/[[c]]>\n"] {
+            let result = plan(text, &[]);
+            assert!(
+                result.wikilinks.is_empty(),
+                "{text:?} gave {:?}",
+                result.wikilinks
+            );
+        }
+    }
+
+    #[test]
+    fn an_embed_inside_a_line_is_left_alone() {
+        let text = "a ![[pic.png]] b\n";
+        let result = plan(text, &[]);
+
+        assert!(result.wikilinks.is_empty());
+        assert!(result.hidden_markers.is_empty());
+    }
+
+    #[test]
+    fn wikilinks_work_in_headings_lists_and_quotes() {
+        let text = "# About [[Heading Link]]\n\n- item [[List Link]]\n\n> quoted [[Quote Link]]\n";
+        let result = plan(text, &[]);
+
+        let notes: Vec<&str> = result
+            .wikilinks
+            .iter()
+            .map(|link| link.note.as_str())
+            .collect();
+        assert_eq!(notes, vec!["Heading Link", "List Link", "Quote Link"]);
+    }
+
+    fn tag_texts<'a>(result: &Plan, text: &'a str) -> Vec<&'a str> {
+        result
+            .styled_spans
+            .iter()
+            .filter(|(_, style)| *style == SpanStyle::Tag)
+            .map(|(range, _)| &text[range.clone()])
+            .collect()
+    }
+
+    #[test]
+    fn tags_are_styled_with_their_hash() {
+        let text = "a #tag and #nested/tag, not #12 or x#no\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(tag_texts(&result, text), vec!["#tag", "#nested/tag"]);
+        assert!(result.hidden_markers.is_empty(), "a tag hides nothing");
+    }
+
+    #[test]
+    fn a_tag_in_code_a_link_or_a_wikilink_is_not_one() {
+        let text = "`#code` [x](#anchor) [[Note #spaced]] #real\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(tag_texts(&result, text), vec!["#real"]);
+    }
+
+    #[test]
+    fn tags_in_headings_count() {
+        let text = "## Plans #later\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(tag_texts(&result, text), vec!["#later"]);
     }
 
     #[test]

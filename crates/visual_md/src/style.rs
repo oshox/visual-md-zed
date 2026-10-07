@@ -36,6 +36,9 @@ const DEFAULT_MARKER_COLOR: u32 = 0x6b7280;
 /// A change this small in a size ratio is not worth restyling for.
 const SCALE_EPSILON: f32 = 1e-3;
 
+/// How strongly a tag's color tints its chip when no background is set.
+const TAG_BACKGROUND_OPACITY: f32 = 0.15;
+
 /// Where a callout's icon is drawn from.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CalloutIcon {
@@ -312,6 +315,8 @@ pub(crate) struct ResolvedStyle {
     pub inline_code_color: Option<Hsla>,
     pub inline_code_background: Option<Hsla>,
     pub link_color: Hsla,
+    pub tag_color: Hsla,
+    pub tag_background: Hsla,
     pub marker_color: Hsla,
     pub blockquote_bar_color: Hsla,
     pub rule_color: Hsla,
@@ -340,6 +345,8 @@ impl ResolvedStyle {
         };
         let foreground = theme_colors.editor_foreground;
         let border = theme_colors.border;
+
+        let tag_color = token_color("tag").unwrap_or(theme_colors.text_accent);
 
         let heading_color = |level_setting: &Option<ThemeColor>, level: &str| {
             parse_color(level_setting.as_ref())
@@ -431,6 +438,10 @@ impl ResolvedStyle {
             inline_code_color: color_of(&colors.inline_code, "inline_code"),
             inline_code_background: background_of(&colors.inline_code_background, "inline_code"),
             link_color: color_of(&colors.link, "link").unwrap_or(theme_colors.link_text_hover),
+            tag_color,
+            tag_background: token("tag")
+                .and_then(|style| style.background_color)
+                .unwrap_or_else(|| tag_color.opacity(TAG_BACKGROUND_OPACITY)),
             marker_color: color_of(&colors.marker, "marker")
                 .unwrap_or_else(|| rgb(DEFAULT_MARKER_COLOR).into()),
             blockquote_bar_color: color_of(&colors.blockquote_bar, "blockquote.bar")
@@ -512,6 +523,15 @@ impl ResolvedStyle {
     pub fn link_style(&self) -> HighlightStyle {
         HighlightStyle {
             color: Some(self.link_color),
+            ..HighlightStyle::default()
+        }
+    }
+
+    /// A `#tag`: a tinted chip in the tag's color.
+    pub fn tag_style(&self) -> HighlightStyle {
+        HighlightStyle {
+            color: Some(self.tag_color),
+            background_color: Some(self.tag_background),
             ..HighlightStyle::default()
         }
     }
