@@ -12,7 +12,7 @@
 //! `apply_images`. Blocks are `IMAGE_BLOCK_ROWS` rows tall because block
 //! heights can't follow an image's real size.
 //!
-//! **M4** (current): M1's inline engine (headings, bold, italic, bold-italic,
+//! **M4**: M1's inline engine (headings, bold, italic, bold-italic,
 //! strikethrough, `==highlight==`, inline code) plus M2's lists (bullets and
 //! renumbered ordinals, nesting inherited for free from source indentation),
 //! interactive task checkboxes (real click-to-toggle, unconditionally
@@ -21,8 +21,8 @@
 //! callouts (`> [!type]`: bracket syntax hidden, body tinted per
 //! recognized type). A full callout box (its own accent-bar element, icon,
 //! foldable title row) needs block-level rendering this pass doesn't add;
-//! see `callout_style`'s doc comment for the precise scope line. Links,
-//! tables, and frontmatter remain out of scope until later milestones.
+//! see `callout_style`'s doc comment for the precise scope line. Links
+//! (M6) and tables (M9) arrive below; frontmatter is still out of scope.
 //!
 //! M3 hardened the above rather than adding new constructs: decoration
 //! generation is scoped to the visible viewport (see [`plan::plan_viewport`]
@@ -70,15 +70,13 @@
 //!   though every other construct in this crate deliberately renders in the
 //!   same color as prose — color is a link's only non-structural cue, so
 //!   this is a narrow, intentional exception (see `apply_style_highlights`).
-//! - Only autolinks are actually clickable to navigate: Zed's generic
-//!   cmd+click URL detection (`find_url` in
-//!   `crates/editor/src/hover_links.rs`) scans the *raw buffer text* around
-//!   the click for a URL-shaped substring, which still works once only the
-//!   `<`/`>` chars are hidden (the visible text remains the literal URL at
-//!   its real offset). A `[text](url)` link's visible glyph is the link
-//!   *text*, not the URL, so that same generic mechanism can't find the URL
-//!   from a click there — making it clickable would need a custom widget
-//!   (like the checkbox's) or extending `hover_links`, deferred here.
+//! - M6 itself made only autolinks clickable: Zed's generic cmd+click URL
+//!   detection (`find_url` in `crates/editor/src/hover_links.rs`) scans the
+//!   *raw buffer text* around the click for a URL-shaped substring, which
+//!   still works once only the `<`/`>` chars are hidden. A `[text](url)`
+//!   link's visible glyph is the link *text*, so that mechanism cannot find
+//!   its URL. M15's `links::link_at`, which the editor asks first through
+//!   `Addon::link_at`, now resolves those links too.
 //!
 //! The horizontal rule uses a genuinely different mechanism from every other
 //! decoration in this file: `insert_blocks`/`BlockProperties` (see
@@ -2523,7 +2521,15 @@ fn render_code_fence_border(
         use theme::ActiveTheme;
         cx.theme().colors()
     };
+    // For tests to find where the block was painted. Only an opening fence
+    // that names a language is told apart from a closing one.
+    let selector = if language.is_some() {
+        "visual_md-fence-opening"
+    } else {
+        "visual_md-fence-closing"
+    };
     div()
+        .debug_selector(|| selector.to_string())
         .w(cx.max_width)
         .h(cx.line_height)
         .flex()
@@ -3256,6 +3262,74 @@ mod integration_tests {
                 "the opening border should carry the language name, got {borders:?}"
             );
         });
+    }
+
+    /// The border blocks stand in for the fence lines and for nothing else: the
+    /// first line of the code and the line after the closing fence stay on
+    /// screen. A block's range used to include its line's newline, which put its
+    /// end on the next row, and the block replaced that row too.
+    #[gpui::test]
+    async fn fence_borders_and_rules_replace_only_their_own_row(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state(
+            "ˇtext above\n\n```rust\nfn main() {}\n```\nfollowing line\n\n---\nlast line\n",
+        );
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        cx.run_until_parked();
+
+        let displayed = cx.display_text();
+        for line in ["fn main() {}", "following line", "last line"] {
+            assert!(
+                displayed.lines().any(|displayed| displayed == line),
+                "{line:?} must stay on screen, got {displayed:?}"
+            );
+        }
+        assert_eq!(
+            displayed.lines().count(),
+            "text above\n\n```rust\nfn main() {}\n```\nfollowing line\n\n---\nlast line\n"
+                .lines()
+                .count(),
+            "each block takes the one row of the line it replaces, got {displayed:?}"
+        );
+    }
+
+    /// A block goes where its row's text goes. A heading row is taller than
+    /// the rest, and the blocks below it used to be placed as if it were not.
+    #[gpui::test]
+    async fn blocks_below_a_tall_heading_row_go_down_with_the_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+
+        let opening_top = |cx: &mut EditorTestContext, text: &str| {
+            cx.set_state(text);
+            cx.run_until_parked();
+            cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+            cx.run_until_parked();
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    window.refresh();
+                    let _ = window.draw(cx);
+                });
+            }
+            cx.debug_bounds("visual_md-fence-opening")
+                .expect("the opening fence is painted")
+                .origin
+                .y
+        };
+
+        let under_a_heading =
+            opening_top(&mut cx, "# Title\n\n```rust\nfn main() {}\n```\nˇafter\n");
+        let under_a_paragraph =
+            opening_top(&mut cx, "Title\n\n```rust\nfn main() {}\n```\nˇafter\n");
+
+        assert!(
+            under_a_heading > under_a_paragraph + px(4.),
+            "the heading row is taller, so the fence under it is lower: {under_a_heading:?} against {under_a_paragraph:?}"
+        );
     }
 
     /// A fence line the cursor is touching should not become a border block

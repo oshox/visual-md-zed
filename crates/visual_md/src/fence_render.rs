@@ -1274,8 +1274,8 @@ mod integration_tests {
         assert_eq!(rendered_blocks(&mut cx), 0, "the source is revealed");
         assert_eq!(
             border_blocks(&mut cx),
-            1,
-            "the cursor at the start of the content touches the opening line, so only the closing fence keeps its border"
+            2,
+            "the cursor is in the code, not on a fence line, so both fences keep their borders"
         );
         cx.assert_editor_state("text above\n\n```flow\nˇa -> b\n```\n\ntext below\n");
     }

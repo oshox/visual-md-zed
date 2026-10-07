@@ -789,6 +789,15 @@ fn hash_text(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// `end`, or the offset of the newline just before it when the range it ends
+/// includes its line's newline.
+fn end_of_line_content(text: &str, end: usize) -> usize {
+    match end.checked_sub(1) {
+        Some(newline) if text.as_bytes().get(newline) == Some(&b'\n') => newline,
+        _ => end,
+    }
+}
+
 fn touches_selection(range: &Range<usize>, selections: &[Range<usize>]) -> bool {
     selections
         .iter()
@@ -853,8 +862,12 @@ fn walk_block(
             return;
         }
         "thematic_break" => {
-            if !touches_selection(&node.byte_range(), selections) {
-                plan.horizontal_rules.push(node.byte_range());
+            // Without the line's newline: the rule is a one-row block, and a
+            // range that ends after the newline ends on the next row, which
+            // the block would then swallow too.
+            let range = node.start_byte()..end_of_line_content(text, node.end_byte());
+            if !touches_selection(&range, selections) {
+                plan.horizontal_rules.push(range);
             }
             return;
         }
@@ -1178,31 +1191,22 @@ fn plan_fenced_code_block(
         }
     }
 
-    // The opening delimiter (plus info string, if any) already spans the
-    // entire first line including its trailing newline -- `info_string`
-    // (when present) or `fenced_code_block_delimiter` otherwise ends exactly
-    // where `code_fence_content` begins, confirmed by inspecting the
-    // grammar's own output directly, so no separate line-boundary scan is
-    // needed.
-    let opening_line = opening_delimiter.start..content.start;
+    // Each fence line becomes a one-row block, so its range must end on that
+    // row: a range that includes the newline ends on the next row, and the
+    // block would replace that row as well, hiding the first line of the code
+    // after the opening fence and whatever follows the closing one. The
+    // opening line is everything up to where `code_fence_content` begins,
+    // minus the newline that content starts after.
+    let opening_line = opening_delimiter.start..end_of_line_content(text, content.start);
     if !touches_selection(&opening_line, selections) {
         plan.code_fence_borders
             .push((opening_line, language.clone()));
     }
 
-    if let Some(closing_delimiter) = closing_delimiter {
-        // Extend by the trailing newline, if any, the same way the opening
-        // line's range includes its own -- the closing delimiter node's own
-        // range stops right at the last `` ` ``/`~`.
-        let closing_line_end = if text.as_bytes().get(closing_delimiter.end) == Some(&b'\n') {
-            closing_delimiter.end + 1
-        } else {
-            closing_delimiter.end
-        };
-        let closing_line = closing_delimiter.start..closing_line_end;
-        if !touches_selection(&closing_line, selections) {
-            plan.code_fence_borders.push((closing_line, None));
-        }
+    if let Some(closing_delimiter) = closing_delimiter
+        && !touches_selection(&closing_delimiter, selections)
+    {
+        plan.code_fence_borders.push((closing_delimiter, None));
     }
 
     plan.code_fence_content.push((content, language));
@@ -2662,7 +2666,11 @@ mod tests {
     fn thematic_break_variants_populate_horizontal_rules() {
         for text in ["---\n", "***\n", "___\n", "- - -\n"] {
             let result = plan(text, &[]);
-            assert_eq!(result.horizontal_rules, vec![0..text.len()], "for {text:?}");
+            assert_eq!(
+                result.horizontal_rules,
+                vec![0..text.len() - 1],
+                "for {text:?}: the rule is one row, so it stops before the newline"
+            );
             assert!(result.hidden_markers.is_empty());
             assert!(
                 result.glyph_markers.is_empty(),
@@ -2686,7 +2694,7 @@ mod tests {
         let result = plan(text, &[]);
         assert_eq!(
             result.code_fence_borders,
-            vec![(0..8, Some("rust".to_string())), (21..25, None)]
+            vec![(0..7, Some("rust".to_string())), (21..24, None)]
         );
         assert_eq!(
             result.code_fence_content,
@@ -2700,7 +2708,7 @@ mod tests {
         let result = plan(text, &[]);
         assert_eq!(
             result.code_fence_borders,
-            vec![(0..10, Some("python".to_string())), (19..23, None)]
+            vec![(0..9, Some("python".to_string())), (19..22, None)]
         );
         assert_eq!(
             result.code_fence_content,
@@ -2714,7 +2722,7 @@ mod tests {
         let result = plan(text, &[]);
         assert_eq!(
             result.code_fence_borders,
-            vec![(0..8, Some("js".to_string())), (19..25, None)]
+            vec![(0..7, Some("js".to_string())), (19..24, None)]
         );
     }
 
@@ -2724,7 +2732,7 @@ mod tests {
         let result = plan(text, &[]);
         assert_eq!(
             result.code_fence_borders,
-            vec![(0..4, None), (16..20, None)]
+            vec![(0..3, None), (16..19, None)]
         );
         assert_eq!(result.code_fence_content, vec![(4..16, None)]);
     }
@@ -2735,7 +2743,7 @@ mod tests {
         let result = plan(text, &[1..1]); // cursor on the opening fence line
         assert_eq!(
             result.code_fence_borders,
-            vec![(21..25, None)],
+            vec![(21..24, None)],
             "closing line still not touched"
         );
         assert_eq!(
@@ -2751,7 +2759,7 @@ mod tests {
         let result = plan(text, &[22..22]); // cursor on the closing fence line
         assert_eq!(
             result.code_fence_borders,
-            vec![(0..8, Some("rust".to_string()))]
+            vec![(0..7, Some("rust".to_string()))]
         );
         assert_eq!(
             result.code_fence_content,
@@ -2765,9 +2773,87 @@ mod tests {
         let result = plan(text, &[10..10]); // cursor inside the code content
         assert_eq!(
             result.code_fence_borders,
-            vec![(0..8, Some("rust".to_string())), (21..25, None)],
+            vec![(0..7, Some("rust".to_string())), (21..24, None)],
             "cursor being in the content shouldn't reveal either fence line"
         );
+    }
+
+    #[test]
+    fn a_cursor_on_the_first_code_line_does_not_reveal_the_opening_fence() {
+        let text = "```rust\nfn main() {}\n```\n";
+
+        // Offset 7 is the end of the fence line, offset 8 the start of the
+        // next one: only the first is on the fence line.
+        let on_the_fence = plan(text, &[7..7]);
+        assert_eq!(on_the_fence.code_fence_borders, vec![(21..24, None)]);
+
+        let on_the_code = plan(text, &[8..8]);
+        assert_eq!(on_the_code.code_fence_borders.len(), 2);
+    }
+
+    #[test]
+    fn a_cursor_after_the_closing_fence_does_not_reveal_it() {
+        let text = "```rust\nfn main() {}\n```\nafter\n";
+
+        let on_the_fence = plan(text, &[24..24]);
+        assert_eq!(on_the_fence.code_fence_borders.len(), 1);
+
+        let on_the_next_line = plan(text, &[25..25]);
+        assert_eq!(on_the_next_line.code_fence_borders.len(), 2);
+    }
+
+    #[test]
+    fn a_cursor_on_the_line_after_a_rule_does_not_reveal_it() {
+        let text = "---\nafter\n";
+
+        assert!(plan(text, &[3..3]).horizontal_rules.is_empty());
+        assert_eq!(plan(text, &[4..4]).horizontal_rules, vec![0..3]);
+    }
+
+    #[test]
+    fn the_end_of_a_line_stops_before_its_newline_when_it_has_one() {
+        assert_eq!(end_of_line_content("a\n", 2), 1);
+        assert_eq!(end_of_line_content("ab\ncd\n", 3), 2);
+        assert_eq!(end_of_line_content("\n", 1), 0);
+        assert_eq!(
+            end_of_line_content("a", 1),
+            1,
+            "no newline, nothing to trim"
+        );
+        assert_eq!(
+            end_of_line_content("ab\ncd", 2),
+            2,
+            "an end before the newline stays"
+        );
+        assert_eq!(end_of_line_content("", 0), 0);
+    }
+
+    #[test]
+    fn property_a_fence_line_or_rule_never_spans_a_newline() {
+        let mut rng = Rng(0x0bad_cafe_f00d_1234);
+        for _ in 0..300 {
+            let lines = 1 + rng.below(40);
+            let text = random_document(&mut rng, lines);
+            let selections = if rng.below(2) == 0 {
+                vec![]
+            } else {
+                let start = rng.below(text.len() + 1);
+                vec![start..start]
+            };
+            let result = plan(&text, &selections);
+
+            let single_row_blocks = result
+                .code_fence_borders
+                .iter()
+                .map(|(range, _)| range)
+                .chain(&result.horizontal_rules);
+            for range in single_row_blocks {
+                assert!(
+                    !text[range.clone()].contains('\n'),
+                    "{range:?} would make a one-row block replace two rows in {text:?}"
+                );
+            }
+        }
     }
 
     fn plan_with_claimed_languages(
