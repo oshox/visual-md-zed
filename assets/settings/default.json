@@ -186,8 +186,9 @@
     },
     // Colors as hex strings, for example `"heading.1": "#ff8800"`. Keys:
     // heading, heading.1 to heading.6, bold, italic, strikethrough,
-    // highlight.background, inline_code, inline_code.background, link, marker,
-    // blockquote.bar, rule, table.border, code_block.border,
+    // highlight.background, inline_code, inline_code.background, link,
+    // link.unresolved, tag, tag.background, marker, blockquote.bar, rule,
+    // table.border, code_block.border,
     // code_block.background, task.checked, and callout.<type> with accent and
     // background. A color left unset falls back to the `visual_md.*` token of
     // the same name in the active theme's `syntax` map, then to a default

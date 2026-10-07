@@ -5,14 +5,14 @@
 //! can run on a background thread.
 
 use std::ops::Range;
-use std::sync::LazyLock;
 
 use extension::{
     VisualMdLinkStyle, VisualMdOutline, VisualMdOutlineHeading, VisualMdOutlineLink,
     VisualMdOutlineTag, VisualMdOutlineTask,
 };
-use regex::Regex;
 use tree_sitter::{Node, Parser, Tree};
+
+use crate::inline_scan;
 
 /// The most entries of each kind an outline holds, so that a huge or odd
 /// document cannot make an event as large as the document itself.
@@ -284,70 +284,28 @@ fn inline_nodes(
     }
 }
 
-/// Finds `[[name]]`, `[[name|text]]` and the embed form `![[name]]` by scanning
-/// the text, since they are not Markdown grammar at all.
+/// Adds `[[name]]`, `[[name|text]]` and the embed form `![[name]]`, which are not
+/// Markdown grammar at all, and leaves their text out of what the tag scan reads.
 fn wikilinks(
     inline_text: &str,
     offset: usize,
     excluded: &mut Vec<Range<usize>>,
     outline: &mut VisualMdOutline,
 ) {
-    let mut search_from = 0;
-    while let Some(found) = inline_text
-        .get(search_from..)
-        .and_then(|rest| rest.find("[["))
-    {
-        let open = search_from + found;
-        search_from = open + 2;
-        if excluded
-            .iter()
-            .any(|range| range.contains(&(open + offset)))
-        {
-            continue;
-        }
-        let Some(inner_end) = inline_text
-            .get(open + 2..)
-            .and_then(|rest| rest.find("]]"))
-            .map(|close| open + 2 + close)
-        else {
-            break;
-        };
-        let Some(inner) = inline_text.get(open + 2..inner_end) else {
-            continue;
-        };
-        if inner.is_empty() || inner.contains(['\n', '[']) {
-            continue;
-        }
-        let is_embed = inline_text
-            .get(..open)
-            .is_some_and(|before| before.ends_with('!'));
-        let start = if is_embed { open - 1 } else { open };
-        let (target, alias) = match inner.split_once('|') {
-            Some((target, alias)) => (target.trim(), Some(alias.trim())),
-            None => (inner.trim(), None),
-        };
-        if target.is_empty() {
-            continue;
-        }
-        let range = start + offset..inner_end + 2 + offset;
-        excluded.push(range.clone());
+    for link in inline_scan::find_wikilinks(inline_text, offset, excluded) {
+        excluded.push(link.range.clone());
         outline.links.push(VisualMdOutlineLink {
-            style: if is_embed {
+            style: if link.is_embed {
                 VisualMdLinkStyle::Embed
             } else {
                 VisualMdLinkStyle::Wikilink
             },
-            target: target.to_string(),
-            text: alias.filter(|alias| !alias.is_empty()).map(str::to_string),
-            range,
+            target: link.target,
+            text: link.alias,
+            range: link.range,
         });
-        search_from = inner_end + 2;
     }
 }
-
-/// A `#` at the start of a word, then the name.
-static TAG_PATTERN: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"(?:^|[\s(\[{,;])#([\p{L}\p{N}_][\p{L}\p{N}_/-]*)").ok());
 
 fn tags(
     inline_text: &str,
@@ -355,29 +313,10 @@ fn tags(
     excluded: &[Range<usize>],
     outline: &mut VisualMdOutline,
 ) {
-    let Some(pattern) = TAG_PATTERN.as_ref() else {
-        return;
-    };
-    for captures in pattern.captures_iter(inline_text) {
-        let Some(name_match) = captures.get(1) else {
-            continue;
-        };
-        let name = name_match.as_str().trim_end_matches(['-', '/']);
-        // A tag needs something other than digits: `#12` is a number.
-        if name.is_empty() || name.chars().all(char::is_numeric) {
-            continue;
-        }
-        let hash = name_match.start() - 1 + offset;
-        let range = hash..name_match.start() + name.len() + offset;
-        if excluded
-            .iter()
-            .any(|excluded| excluded.start < range.end && range.start < excluded.end)
-        {
-            continue;
-        }
+    for tag in inline_scan::find_tags(inline_text, offset, excluded) {
         outline.tags.push(VisualMdOutlineTag {
-            name: name.to_string(),
-            range,
+            name: tag.name,
+            range: tag.range,
         });
     }
 }

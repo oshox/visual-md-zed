@@ -2372,6 +2372,30 @@ fn editor_page() -> SettingsPage {
                 allow_unset()
             ),
             visual_md_nested_item!(
+                "Unresolved Link Color",
+                "Text color of a `[[wikilink]]` to a note the project does not have. Falls back to the theme's muted text color.",
+                "visual_md.colors.link.unresolved",
+                colors,
+                link_unresolved,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Tag Color",
+                "Text color of `#tags`. Falls back to the theme's accent text color.",
+                "visual_md.colors.tag",
+                colors,
+                tag,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
+                "Tag Background",
+                "Background color of `#tags`. Falls back to a tint of the tag's color.",
+                "visual_md.colors.tag.background",
+                colors,
+                tag_background,
+                allow_unset()
+            ),
+            visual_md_nested_item!(
                 "Marker Color",
                 "Color of the dimmed Markdown syntax shown on the line the cursor is on.",
                 "visual_md.colors.marker",

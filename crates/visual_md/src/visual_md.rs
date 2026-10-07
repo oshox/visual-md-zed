@@ -238,8 +238,10 @@ pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
+mod inline_scan;
 mod links;
 mod list_continuation;
+mod notes;
 pub mod outline;
 mod plan;
 pub mod rules;
@@ -270,7 +272,9 @@ use gpui::{
     TextStyleRefinement, WeakEntity, Window, actions, black, div, img, px, svg,
 };
 use language::{Language, Rope};
-use plan::{CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment};
+use plan::{
+    CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment, WikilinkSpan,
+};
 use settings::Settings;
 use style::{CalloutIcon, ResolvedStyle};
 use util::ResultExt;
@@ -354,6 +358,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         callout_key_count: 0,
         extension_key_count: 0,
         opened_events_sent: HashMap::new(),
+        note_index: None,
         changed_events: HashMap::new(),
         completion_provider: None,
     });
@@ -690,6 +695,9 @@ struct VisualMdAddon {
     /// its document. An extension is told once per build, as soon as live
     /// preview shows and the extension is registered, whichever comes last.
     opened_events_sent: HashMap<Arc<str>, u64>,
+    /// The project's notes, which say whether a `[[wikilink]]` leads anywhere,
+    /// and what the editor does when they change.
+    note_index: Option<(Entity<notes::NoteIndex>, Subscription)>,
     /// The wait before each extension is told the document changed, by
     /// extension. Starting one again, on the next edit, drops the one before.
     changed_events: HashMap<Arc<str>, Task<()>>,
@@ -718,7 +726,8 @@ impl Addon for VisualMdAddon {
         project: Option<&Entity<project::Project>>,
         cx: &mut App,
     ) -> Option<Task<Option<(Range<language::Anchor>, editor::hover_links::HoverLink)>>> {
-        links::link_at(self.active, buffer, position, project, cx)
+        let note_index = self.note_index.as_ref().map(|(index, _)| index.clone());
+        links::link_at(self.active, buffer, position, project, note_index, cx)
     }
 
     fn to_any(&self) -> &dyn Any {
@@ -952,6 +961,8 @@ const KEY_BOLD: usize = 9;
 const KEY_ITALIC: usize = 10;
 const KEY_STRIKETHROUGH: usize = 11;
 const KEY_LINK: usize = 12;
+const KEY_TAG: usize = 13;
+const KEY_UNRESOLVED_LINK: usize = 14;
 /// The first of the callout background keys: one per distinct callout type
 /// name in view, each setting a different `background_color`. Keeping them
 /// disjoint means a callout that changes type (edited from `[!note]` to
@@ -1073,6 +1084,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 
     if enabled {
         document_events::send_opened(editor, cx);
+        ensure_note_index(editor, window, cx);
     }
     if enabled && !was_active {
         completions::install(editor);
@@ -1397,6 +1409,27 @@ fn apply_text_style_refinement(
     if editor.text_style_refinement() != Some(&refinement) {
         editor.set_text_style_refinement(refinement);
         cx.notify();
+    }
+}
+
+/// Gives the editor the index of its project's notes, if it has a project and
+/// has not got it yet, and has it refresh when notes come and go.
+fn ensure_note_index(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    if editor
+        .addon::<VisualMdAddon>()
+        .is_none_or(|addon| addon.note_index.is_some())
+    {
+        return;
+    }
+    let Some(project) = editor.project().cloned() else {
+        return;
+    };
+    let index = notes::NoteIndex::for_project(&project, cx);
+    let subscription = cx.observe_in(&index, window, |editor, _, window, cx| {
+        force_refresh(editor, window, cx)
+    });
+    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
+        addon.note_index = Some((index, subscription));
     }
 }
 
@@ -2820,11 +2853,30 @@ fn apply_style_highlights(
     // way bold/italic have their own), so by default a real link is colored
     // using `link_text_hover`, the same theme token Zed's own generic cmd+hover
     // link highlight already uses (`crates/editor/src/hover_links.rs`).
+    let (found_wikilinks, missing_wikilinks) = classify_wikilinks(editor, &computed.wikilinks, cx);
+    let link_ranges: Vec<Range<usize>> = spans_of(SpanStyle::Link)
+        .into_iter()
+        .chain(found_wikilinks)
+        .collect();
     set_visual_md_highlight(
         editor,
         KEY_LINK,
-        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Link)),
+        to_anchor_ranges(snapshot, &link_ranges),
         style.link_style(),
+        cx,
+    );
+    set_visual_md_highlight(
+        editor,
+        KEY_UNRESOLVED_LINK,
+        to_anchor_ranges(snapshot, &missing_wikilinks),
+        style.unresolved_link_style(),
+        cx,
+    );
+    set_visual_md_highlight(
+        editor,
+        KEY_TAG,
+        to_anchor_ranges(snapshot, &spans_of(SpanStyle::Tag)),
+        style.tag_style(),
         cx,
     );
 
@@ -2863,6 +2915,41 @@ fn apply_style_highlights(
         style.code_block_style(),
         cx,
     );
+}
+
+/// Splits wikilinks into those that lead to a note of the project and those that
+/// do not. A link is counted as leading somewhere unless the project is known to
+/// lack the note, so nothing is flagged while the project is still being read,
+/// when there is no project, or for a link to a heading of the same note.
+fn classify_wikilinks(
+    editor: &Editor,
+    wikilinks: &[WikilinkSpan],
+    cx: &App,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let index = editor
+        .addon::<VisualMdAddon>()
+        .and_then(|addon| addon.note_index.as_ref())
+        .map(|(index, _)| index.read(cx));
+    let from = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| notes::location_of(buffer.read(cx), cx));
+
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for link in wikilinks {
+        let is_missing = !link.note.is_empty()
+            && index.is_some_and(|index| {
+                index.resolve(&link.note, from.as_ref()) == notes::Resolution::Missing
+            });
+        if is_missing {
+            missing.push(link.range.clone());
+        } else {
+            found.push(link.range.clone());
+        }
+    }
+    (found, missing)
 }
 
 /// Callout boxes (M11) are a second deliberate color exception alongside
@@ -3293,6 +3380,162 @@ mod integration_tests {
                 .lines()
                 .count(),
             "each block takes the one row of the line it replaces, got {displayed:?}"
+        );
+    }
+
+    /// A wikilink shows only its text, or its alias, until a cursor touches it,
+    /// which brings back the brackets and the target.
+    #[gpui::test]
+    async fn a_wikilink_shows_only_its_text_until_the_cursor_is_on_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+
+        cx.set_state("ˇfirst\n\nsee [[Some Note|the alias]] and #tag\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        // Each hidden marker is folded to a single space, as it is for any link.
+        assert_eq!(cx.display_text(), "first\n\nsee  the alias  and #tag\n");
+
+        cx.set_state("first\n\nsee [[Some Nˇote|the alias]] and #tag\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert_eq!(
+            cx.display_text(),
+            "first\n\nsee [[Some Note|the alias]] and #tag\n",
+            "the whole link is raw while the cursor is in it, and a tag never hides anything"
+        );
+    }
+
+    /// Creates `name` in the editor's project, so that links can lead to it.
+    async fn add_note(cx: &mut EditorTestContext, name: &str) {
+        let project = cx
+            .update_editor(|editor, _, _| editor.project().cloned())
+            .expect("the test editor has a project");
+        let worktree_id = project.read_with(&cx.cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("the project has a worktree")
+                .read(cx)
+                .id()
+        });
+        let name = util::rel_path::rel_path(name);
+        project
+            .update(&mut cx.cx, |project, cx| {
+                project.create_entry((worktree_id, name), false, cx)
+            })
+            .await
+            .expect("the note is created");
+        cx.run_until_parked();
+    }
+
+    fn highlighted_text(cx: &mut EditorTestContext, key: usize) -> Vec<String> {
+        cx.update_editor(|editor, _, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            editor
+                .text_highlights(HighlightKey::VisualMd(key), cx)
+                .map(|(_, ranges)| {
+                    ranges
+                        .iter()
+                        .map(|range| snapshot.text_for_range(range.clone()).collect())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    async fn editor_with_notes(cx: &mut TestAppContext, text: &str) -> EditorTestContext {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        add_note(&mut cx, "Plan.md").await;
+        cx.set_state(text);
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// A wikilink to a note the project has looks like a link; one to a note it
+    /// does not have is muted and underlined, until the note is created.
+    #[gpui::test]
+    async fn wikilinks_to_missing_notes_look_unresolved_until_the_note_exists(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx =
+            editor_with_notes(cx, "ˇfirst\n\n[[Plan]] and [[Missing]] and [[#Here]]\n").await;
+
+        assert_eq!(highlighted_text(&mut cx, KEY_LINK), vec!["Plan", "#Here"]);
+        assert_eq!(
+            highlighted_text(&mut cx, KEY_UNRESOLVED_LINK),
+            vec!["Missing"]
+        );
+
+        add_note(&mut cx, "Missing.md").await;
+        assert_eq!(
+            highlighted_text(&mut cx, KEY_LINK),
+            vec!["Plan", "Missing", "#Here"]
+        );
+        assert!(highlighted_text(&mut cx, KEY_UNRESOLVED_LINK).is_empty());
+    }
+
+    #[gpui::test]
+    async fn tags_are_highlighted_as_chips(cx: &mut TestAppContext) {
+        let mut cx = editor_with_notes(cx, "ˇfirst #one and `#code` and #two/three\n").await;
+
+        assert_eq!(
+            highlighted_text(&mut cx, KEY_TAG),
+            vec!["#one", "#two/three"]
+        );
+        let style = cx
+            .update_editor(|editor, _, cx| {
+                editor
+                    .text_highlights(HighlightKey::VisualMd(KEY_TAG), cx)
+                    .map(|(style, _)| style)
+            })
+            .expect("tags are highlighted");
+        assert!(style.color.is_some() && style.background_color.is_some());
+    }
+
+    /// Ctrl-click on a wikilink opens the note it names, and on one that names
+    /// nothing, does nothing.
+    #[gpui::test]
+    async fn clicking_a_wikilink_opens_the_note_it_names(cx: &mut TestAppContext) {
+        let text = "ˇfirst\n\n[[Plan]] and [[Missing]]\n";
+        let mut cx = editor_with_notes(cx, text).await;
+
+        let link_at = |cx: &mut EditorTestContext, word: &'static str| {
+            cx.update_editor(|editor, _, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find(word).expect("the word is there") + 1;
+                let position = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
+                let buffer = editor.buffer().read(cx).as_singleton().expect("one buffer");
+                let position = snapshot
+                    .anchor_to_buffer_anchor(position)
+                    .map(|(position, _)| position)
+                    .expect("the position is in the buffer");
+                let project = editor.project().cloned();
+                editor
+                    .addon::<VisualMdAddon>()
+                    .expect("the addon is there")
+                    .link_at(&buffer, position, project.as_ref(), cx)
+            })
+        };
+
+        let task = link_at(&mut cx, "Plan").expect("a note that exists is a link");
+        let (_, link) = task.await.expect("the link resolves");
+        let editor::hover_links::HoverLink::File(target) = link else {
+            panic!("expected a file, got {link:?}");
+        };
+        let project::ResolvedPath::ProjectPath { project_path, .. } = target.resolved_path else {
+            panic!("expected a project path");
+        };
+        assert_eq!(project_path.path.as_unix_str(), "Plan.md");
+
+        assert!(
+            link_at(&mut cx, "Missing").is_none(),
+            "there is nothing to open for a note the project lacks"
         );
     }
 
@@ -4653,6 +4896,65 @@ mod integration_tests {
         let plain = style_at(&mut cx, "plain");
         assert_eq!(plain.font_weight, None);
         assert_eq!(style_at(&mut cx, "One").font_size_scale, Some(1.8));
+    }
+
+    #[gpui::test]
+    async fn tags_and_unresolved_links_take_their_colors_from_settings_then_the_theme(
+        cx: &mut TestAppContext,
+    ) {
+        use theme::ActiveTheme as _;
+        let mut cx = editor_with_notes(cx, "ˇfirst #idea and [[Nothing]]\n").await;
+        let accent = cx.update(|_window, cx| cx.theme().colors().text_accent);
+        let muted = cx.update(|_window, cx| cx.theme().colors().text_muted);
+
+        let tag = style_at(&mut cx, "#idea");
+        assert_eq!(tag.color, Some(accent));
+        assert_eq!(tag.background_color, Some(accent.opacity(0.15)));
+        let unresolved = style_at(&mut cx, "Nothing");
+        assert_eq!(unresolved.color, Some(muted));
+        assert_eq!(
+            unresolved.underline.map(|underline| underline.wavy),
+            Some(true)
+        );
+
+        set_theme_tokens(
+            &mut cx,
+            vec![
+                (
+                    "visual_md.tag",
+                    HighlightStyle {
+                        color: Some(hex("#111111")),
+                        background_color: Some(hex("#222222")),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "visual_md.link.unresolved",
+                    HighlightStyle {
+                        color: Some(hex("#333333")),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let from_theme = style_at(&mut cx, "#idea");
+        assert_eq!(from_theme.color, Some(hex("#111111")));
+        assert_eq!(from_theme.background_color, Some(hex("#222222")));
+        assert_eq!(style_at(&mut cx, "Nothing").color, Some(hex("#333333")));
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                tag: Some("#444444".into()),
+                tag_background: Some("#555555".into()),
+                link_unresolved: Some("#666666".into()),
+                ..Default::default()
+            }),
+        );
+        let from_settings = style_at(&mut cx, "#idea");
+        assert_eq!(from_settings.color, Some(hex("#444444")));
+        assert_eq!(from_settings.background_color, Some(hex("#555555")));
+        assert_eq!(style_at(&mut cx, "Nothing").color, Some(hex("#666666")));
     }
 
     #[gpui::test]

@@ -427,8 +427,9 @@ add to that:
 - `schemes` lists URL schemes, lowercase, that the extension resolves, such as
   `sample` for `[text](sample://x)`. When two extensions list one scheme, the one
   whose id sorts first has it. A scheme an extension lists is its, even `https`.
-- `wikilinks = true` makes `[[name]]` and `![[name]]` links, which nothing else
-  resolves. Extensions that list it are asked in turn until one answers.
+- `wikilinks = true` has the extension decide where `[[name]]` links go, ahead of
+  Zed MD's own lookup (below). Extensions that list it are asked in turn until
+  one answers.
 
 The `link-request` has the `target` as written, the `scheme` (`none` for a
 wikilink and for a destination without one), whether it is a `wikilink`, and the
@@ -438,6 +439,24 @@ for a link the extension does not know.
 
 The call is made while the pointer is over the link, and gives up after 2
 seconds, which shows the link as not clickable.
+
+### What Zed MD does itself
+
+Without an extension, a wikilink names a note of the project by file name, as in
+other note-taking apps. `[[Note]]` is `Note.md` wherever it is, in any case and
+with or without the extension, `[[folder/Note]]` is the one in a folder of that
+name, and `[[Note#Heading]]` and `[[Note|alias]]` name `Note`. When several
+files match, the one in the folder of the current note wins, then the shortest
+path. Ctrl or Cmd and a click opens it. A link to a note the project does not
+have is drawn muted with a wavy underline. Nothing is marked while the project
+is still being read, when there is no project, or for a link to a heading of the
+same note, and a link to a heading is not scrolled to it.
+
+When no extension that resolves wikilinks knows a link, this is what happens, so
+an extension can add to the notes Zed MD finds and never has to repeat them.
+Headings, block ids and aliases in front matter are not looked at: they are for
+extensions to answer. `#tags` are chips that open a project search for the tag.
+These are drawn by Zed MD, and a syntax rule can still restyle them.
 
 ## Completions
 

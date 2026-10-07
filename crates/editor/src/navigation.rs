@@ -1712,6 +1712,7 @@ impl Editor {
     ) -> Task<Result<Navigated>> {
         // Separate out url and file links, we can only handle one of them at most or an arbitrary number of locations
         let mut first_url_or_file = None;
+        let mut first_action = None;
         let definitions: Vec<_> = definitions
             .into_iter()
             .filter_map(|def| match def {
@@ -1727,6 +1728,10 @@ impl Editor {
                 }
                 HoverLink::File(file_target) => {
                     first_url_or_file = Some(Either::Right(file_target));
+                    None
+                }
+                HoverLink::Action(action) => {
+                    first_action = Some(action);
                     None
                 }
             })
@@ -1847,6 +1852,10 @@ impl Editor {
 
                 anyhow::Ok(Navigated::from_bool(opened))
             } else if num_locations == 0 {
+                if let Some(action) = first_action {
+                    cx.update(|window, cx| action.run(window, cx))?;
+                    return Ok(Navigated::Yes);
+                }
                 // If there is one url or file, open it directly
                 match first_url_or_file {
                     Some(Either::Left(url)) => {

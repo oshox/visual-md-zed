@@ -9,13 +9,15 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use editor::hover_links::{HoverLink, ResolvedFileTarget};
-use extension::{VisualMdLinkRequest, VisualMdLinkStyle, VisualMdLinkTarget};
+use editor::hover_links::{HoverAction, HoverLink, ResolvedFileTarget};
+use extension::{VisualMdLinkRequest, VisualMdLinkStyle, VisualMdLinkTarget, VisualMdOutline};
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{Anchor, Buffer, Point, ToOffset as _};
-use project::Project;
+use project::{Project, ProjectPath, ResolvedPath};
+use workspace::DeploySearch;
 
 use crate::extensions::{HookError, LinkResolvers, VisualMdExtensions, when_not_busy};
+use crate::notes::{self, NoteIndex};
 use crate::outline;
 use crate::plan::parse_blocks;
 
@@ -33,12 +35,38 @@ pub struct LinkInLine {
     pub is_wikilink: bool,
 }
 
+/// What is on a single line of text, as extensions are told about a document.
+fn outline_of_line(line: &str) -> Option<VisualMdOutline> {
+    let tree = parse_blocks(line)?;
+    Some(outline::outline(line, &tree))
+}
+
+/// A `#tag` on one line of text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagInLine {
+    /// Where it is on the line, in bytes, `#` included.
+    pub range: Range<usize>,
+    /// Its name, without the `#`.
+    pub name: String,
+}
+
+/// The tag on `line` that covers byte `offset`, if there is one. Tags in inline
+/// code and in links are not tags.
+pub fn tag_in_line(line: &str, offset: usize) -> Option<TagInLine> {
+    outline_of_line(line)?
+        .tags
+        .into_iter()
+        .find(|tag| tag.range.contains(&offset))
+        .map(|tag| TagInLine {
+            range: tag.range,
+            name: tag.name,
+        })
+}
+
 /// The link on `line` that covers byte `offset`, if there is one. Links in
 /// inline code are not links.
 pub fn link_in_line(line: &str, offset: usize) -> Option<LinkInLine> {
-    let tree = parse_blocks(line)?;
-    let outline = outline::outline(line, &tree);
-    outline
+    outline_of_line(line)?
         .links
         .into_iter()
         .find(|link| link.range.contains(&offset))
@@ -79,6 +107,16 @@ pub fn local_path(destination: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// The note a wikilink target names: what is before a `#heading` or `#^block`.
+pub fn note_of(target: &str) -> String {
+    target
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// What to do about a link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
@@ -91,6 +129,8 @@ pub enum Resolution {
     Url(String),
     /// Open a file, relative to the document unless the path is absolute.
     File(String),
+    /// Open the note a wikilink names, if the project has it.
+    Note(String),
     /// Nothing, because nothing resolves it.
     Nothing,
 }
@@ -108,8 +148,13 @@ pub fn resolve(
         path: document_path.map(str::to_string),
     };
     if link.is_wikilink {
+        let note = note_of(&link.target);
         return if resolvers.wikilinks.is_empty() {
-            Resolution::Nothing
+            if note.is_empty() {
+                Resolution::Nothing
+            } else {
+                Resolution::Note(note)
+            }
         } else {
             Resolution::Extensions {
                 extensions: resolvers.wikilinks.clone(),
@@ -143,6 +188,7 @@ pub(crate) fn link_at(
     buffer: &Entity<Buffer>,
     position: Anchor,
     project: Option<&Entity<Project>>,
+    note_index: Option<Entity<NoteIndex>>,
     cx: &mut App,
 ) -> Option<Task<Option<(Range<Anchor>, HoverLink)>>> {
     if !active {
@@ -154,7 +200,10 @@ pub(crate) fn link_at(
     let line_start = snapshot.point_to_offset(Point::new(row, 0));
     let line_end = snapshot.point_to_offset(Point::new(row, snapshot.line_len(row)));
     let line: String = snapshot.text_for_range(line_start..line_end).collect();
-    let link = link_in_line(&line, offset.checked_sub(line_start)?)?;
+    let relative_offset = offset.checked_sub(line_start)?;
+    let Some(link) = link_in_line(&line, relative_offset) else {
+        return tag_search_link(&line, relative_offset, line_start, &snapshot);
+    };
     let range = snapshot.anchor_before(line_start + link.range.start)
         ..snapshot.anchor_after(line_start + link.range.end);
 
@@ -164,11 +213,16 @@ pub(crate) fn link_at(
         .unwrap_or_default();
     let document_path = crate::fence_render::buffer_path(buffer, cx);
     let resolution = resolve(&link, &resolvers, document_path.as_deref());
+    let from = notes::location_of(buffer.read(cx), cx);
     let buffer = buffer.clone();
     let project = project.cloned();
 
     match resolution {
         Resolution::Nothing => None,
+        Resolution::Note(note) => {
+            let link = note_link(&note, note_index.as_ref(), from.as_ref(), cx)?;
+            Some(Task::ready(Some((range, link))))
+        }
         Resolution::Url(url) => Some(Task::ready(Some((range, HoverLink::Url(url))))),
         Resolution::File(path) => Some(cx.spawn(async move |cx| {
             let link = file_link(&path, &buffer, project.as_ref(), cx).await?;
@@ -199,8 +253,58 @@ pub(crate) fn link_at(
                     }
                 }
             }
+            // No extension knew where a wikilink goes, so it names a note of the project.
+            if request.wikilink {
+                let note = note_of(&request.target);
+                let link =
+                    cx.update(|cx| note_link(&note, note_index.as_ref(), from.as_ref(), cx))?;
+                return Some((range, link));
+            }
             None
         })),
+    }
+}
+
+/// A link from the tag under the pointer that searches the project for it.
+fn tag_search_link(
+    line: &str,
+    relative_offset: usize,
+    line_start: usize,
+    snapshot: &language::BufferSnapshot,
+) -> Option<Task<Option<(Range<Anchor>, HoverLink)>>> {
+    let tag = tag_in_line(line, relative_offset)?;
+    let range = snapshot.anchor_before(line_start + tag.range.start)
+        ..snapshot.anchor_after(line_start + tag.range.end);
+    let query = format!("#{}", tag.name);
+    let search = HoverAction::new(move |window, cx| {
+        window.dispatch_action(
+            Box::new(DeploySearch {
+                query: Some(query.clone()),
+                ..Default::default()
+            }),
+            cx,
+        );
+    });
+    Some(Task::ready(Some((range, HoverLink::Action(search)))))
+}
+
+/// A link to the note `note` names in the project, if it has one.
+fn note_link(
+    note: &str,
+    note_index: Option<&Entity<NoteIndex>>,
+    from: Option<&ProjectPath>,
+    cx: &App,
+) -> Option<HoverLink> {
+    match note_index?.read(cx).resolve(note, from) {
+        notes::Resolution::Found(file) => Some(HoverLink::File(ResolvedFileTarget {
+            resolved_path: ResolvedPath::ProjectPath {
+                project_path: file.project_path(),
+                is_dir: false,
+            },
+            row: None,
+            column: None,
+        })),
+        notes::Resolution::Missing | notes::Resolution::Unknown => None,
     }
 }
 
@@ -257,6 +361,20 @@ mod tests {
         assert_eq!(&line[wiki.range.clone()], "[[Note|alias]]");
         assert_eq!(wiki.target, "Note");
         assert!(wiki.is_wikilink);
+    }
+
+    #[test]
+    fn test_the_tag_under_an_offset_is_found() {
+        let line = "a #idea, `#code` and [x](#anchor) #a/b";
+
+        let idea = tag_in_line(line, 4).expect("offset 4 is in #idea");
+        assert_eq!(&line[idea.range.clone()], "#idea");
+        assert_eq!(idea.name, "idea");
+        assert!(tag_in_line(line, 2).is_some(), "the hash is part of it");
+        assert!(tag_in_line(line, 7).is_none(), "the comma is not");
+        assert!(tag_in_line(line, 11).is_none(), "code is not a tag");
+        assert!(tag_in_line(line, 25).is_none(), "an anchor is not a tag");
+        assert_eq!(tag_in_line(line, 36).expect("a nested tag").name, "a/b");
     }
 
     #[test]
@@ -405,9 +523,20 @@ mod tests {
                 },
             }
         );
+        let nobody = LinkResolvers::default();
         assert_eq!(
-            resolve(&link("Note", true), &LinkResolvers::default(), None),
-            Resolution::Nothing
+            resolve(&link("Note", true), &nobody, None),
+            Resolution::Note("Note".to_string()),
+            "without an extension a wikilink names a note of the project"
+        );
+        assert_eq!(
+            resolve(&link("Note#Heading", true), &nobody, None),
+            Resolution::Note("Note".to_string())
+        );
+        assert_eq!(
+            resolve(&link("#Heading", true), &nobody, None),
+            Resolution::Nothing,
+            "a heading of the same note has no file to open"
         );
     }
 }
@@ -488,6 +617,15 @@ mod integration_tests {
         document: &Document,
         offset: usize,
     ) -> Option<(Range<usize>, String)> {
+        let (range, link) = raw_link_for(cx, document, offset).await?;
+        Some((range, summarize(link)))
+    }
+
+    async fn raw_link_for(
+        cx: &mut TestAppContext,
+        document: &Document,
+        offset: usize,
+    ) -> Option<(Range<usize>, HoverLink)> {
         let buffer = document.buffer.clone();
         let project = document.project.clone();
         let task = document
@@ -504,7 +642,7 @@ mod integration_tests {
         let snapshot = document.buffer.read_with(cx, |buffer, _| buffer.snapshot());
         Some((
             range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot),
-            summarize(link),
+            link,
         ))
     }
 
@@ -778,17 +916,96 @@ mod integration_tests {
     }
 
     #[gpui::test]
-    async fn test_a_wikilink_without_an_extension_is_no_link(cx: &mut TestAppContext) {
+    async fn test_clicking_a_tag_searches_the_project_for_it(cx: &mut TestAppContext) {
         init_test(cx);
+        let text = "a #idea and `#code` and [x](#anchor) and #nested/tag\n";
+        let document = open(cx, json!({ "a.md": text }), "/dir/a.md", true).await;
+        let searches = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let searches = searches.clone();
+            cx.on_action(move |search: &DeploySearch, _| {
+                searches.borrow_mut().push(search.query.clone());
+            });
+        });
+
+        let offset = text.find("idea").expect("the text has it");
+        let (range, link) = raw_link_for(cx, &document, offset)
+            .await
+            .expect("a tag is a link");
+        assert_eq!(text_of(text, range), "#idea");
+        let HoverLink::Action(search) = link else {
+            panic!("expected an action, got {link:?}");
+        };
+        document
+            .window
+            .update(cx, |_, window, cx| search.run(window, cx))
+            .expect("the window is there");
+        assert_eq!(*searches.borrow(), vec![Some("#idea".to_string())]);
+
+        let nested = text.find("nested").expect("the text has it");
+        let (range, _) = raw_link_for(cx, &document, nested)
+            .await
+            .expect("a nested tag is a link");
+        assert_eq!(text_of(text, range), "#nested/tag");
+
+        let in_code = text.find("code").expect("the text has it");
+        assert!(raw_link_for(cx, &document, in_code).await.is_none());
+        let in_link = text.find("anchor").expect("the text has it");
+        assert!(
+            raw_link_for(cx, &document, in_link).await.is_none(),
+            "the anchor of a link is not a tag"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_no_extension_knows_still_opens_the_note(cx: &mut TestAppContext) {
+        init_test(cx);
+        let extension =
+            extension_with_links(cx, "a-first", "wikilinks = true\n", Behavior::Succeed);
+        extension.set_link_responder(|_| None);
+        let text = "go [[Other]]\n";
         let document = open(
             cx,
-            json!({ "a.md": "go [[Other]]\n", "other.md": "o" }),
+            json!({ "a.md": text, "other.md": "o" }),
             "/dir/a.md",
             true,
         )
         .await;
 
-        assert_eq!(link_for(cx, &document, 6).await, None);
+        let found = link_for(cx, &document, 6).await.expect("a link");
+
+        assert_eq!(found.1, "file other.md");
+        assert_eq!(
+            extension.link_requests().len(),
+            1,
+            "the extension was asked first"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_without_an_extension_opens_the_note_of_that_name(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let text = "go [[Other]] or [[Nobody]]\n";
+        let document = open(
+            cx,
+            json!({ "a.md": text, "other.md": "o" }),
+            "/dir/a.md",
+            true,
+        )
+        .await;
+
+        let found = link_for(cx, &document, 6).await.expect("a link");
+        assert_eq!(found.1, "file other.md");
+        assert_eq!(text_of(text, found.0), "[[Other]]");
+
+        let nobody = text.find("Nobody").expect("the text has it");
+        assert_eq!(
+            link_for(cx, &document, nobody).await,
+            None,
+            "there is no note to open"
+        );
     }
 
     #[gpui::test]
