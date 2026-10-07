@@ -24,7 +24,7 @@ purpose even though the app is branded Zed MD.
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 | M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
-| M17 | Editing tools and the outliner | In progress: editing tools built, folding and completion planned, see "M17" |
+| M17 | Editing tools and the outliner | In progress: editing tools and folding built, completion planned, see "M17" |
 | M18 | Block syntax: properties panel, footnotes, math, embeds, hover previews | Planned, see the feature audit |
 | M19 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
@@ -504,3 +504,56 @@ because a toggle there would insert `****`.
 **Limitations.**
 - A selection across lines is wrapped as one span, as bold has always been.
 - List keys do not apply inside a quote; a list in a quote keeps the editor's keys.
+
+### As built: folding and the outliner
+
+**What folds.** A heading folds its section, up to the next heading of the same
+or a higher level, and a list item folds what is nested under it: a list, a
+second paragraph, a code block, a quote or a table. A wrapped line of the first
+paragraph is not nesting. `fold_ranges.rs` finds these from the block parse,
+once per edit. A range starts where the first line ends, trailing spaces
+included, so that typing them does not move it, and stops after the last
+character of the section, so the newline and the blank lines before the next
+heading stay. Setext headings do not fold.
+
+**Creases and state.** Every foldable range gets a crease, so the editor's
+gutter arrow, `Fold`, `UnfoldLines`, `ToggleFold`, `FoldAll` and `UnfoldAll` find
+it. A document with more than 2,000 foldable ranges only gets creases for what
+is on screen and what is folded, so "fold all" folds only what has one. What is
+folded is kept in the editor's fold map and lasts for the session: it is not
+saved with the file and not restored when the file is opened again. Folds
+follow edits; a section whose range changes is made again and folded again if
+the section that started in the same place was folded. A folded section that
+scrolls out of view stays folded. Moving a folded list item with Alt-Up or
+Alt-Down unfolds it, because the move rewrites the lines the fold was anchored
+in.
+
+**Gutter.** The fold arrow appears on the cursor's row and while the gutter is
+hovered, as for code, and follows the setting `gutter.folds`. The editor's guess
+that any line followed by a more indented one can fold is off while live preview
+is on; in prose it would put an arrow on every wrapped or nested line. The "⋯"
+a folded section ends in unfolds it when clicked.
+
+**Changes to the editor.** Four, all inert for any editor that does not opt in:
+- A fold can be tagged `DecorativeFold` (a hidden marker, which is what every
+  fold live preview makes from the plan is) or `TransientFold` (a folded
+  section). Decorative folds do not count when asking whether a line is folded,
+  are not removed by the unfold commands, and neither kind is saved with the
+  file. Hidden markers used to be written to the fold table, which is probably
+  why the application log showed unique constraint failures there; they no
+  longer are.
+- Looking up the crease on a row prefers one that can be folded over a decorative
+  one, so a heading's section is found behind its hidden `#`.
+- A block that replaces rows is dropped while those rows are folded away. It used
+  to replace the row the fold is on, so folding a section with a code fence, a rule
+  or a table in it blanked the heading.
+- Unfolding no longer removes the blocks that replace rows in an editor that
+  turns that off, which live preview does: its rules, fences, tables and images
+  are such blocks, and `UnfoldAll` took them away until the text changed.
+
+**Not in M17.** Zoom into a block and multi-block selection, saved fold state, and
+`FoldAtLevel`, which only reaches ranges that have a crease.
+
+**Not checked in the running app.** There was no way to send a click or a
+key, so the arrow, the chip and the commands are covered by tests that call the
+same functions the editor does.
