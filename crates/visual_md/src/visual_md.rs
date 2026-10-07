@@ -2939,10 +2939,11 @@ fn apply_style_highlights(
 
     apply_callout_backgrounds(editor, snapshot, computed, style, cx);
 
-    // Highlights, inline code and code blocks carry no color or background
-    // unless a setting or theme token supplies one: the live-preview reference
-    // (Obsidian) leaves them untinted, so only the structural styling
-    // (the code font and size) applies by default.
+    // A highlight and inline code are chips by default, with a background taken
+    // from the theme (a transparent color in the settings turns one off), and a
+    // setting or theme token replaces it. Code blocks have no background unless
+    // one is set. Neither adds a text color, so only the code font and size
+    // apply to the text itself.
     let highlight_ranges = if style.highlight_background.is_some() {
         spans_of(SpanStyle::Highlight)
     } else {
@@ -4893,12 +4894,20 @@ mod integration_tests {
         let inline_code = style_at(&mut cx, "code");
         assert_eq!(family_name(&inline_code), Some(buffer_family.clone()));
         assert_eq!(inline_code.color, None);
-        assert_eq!(inline_code.background_color, None);
+        assert_eq!(
+            inline_code.background_color,
+            Some(cx.update(|_window, cx| cx.theme().colors().element_background)),
+            "inline code is a chip by default"
+        );
         assert_eq!(inline_code.font_size_scale, None);
 
         let marked = style_at(&mut cx, "marked");
         assert_eq!(marked.color, None);
-        assert_eq!(marked.background_color, None);
+        assert_eq!(
+            marked.background_color,
+            Some(cx.update(|_window, cx| cx.theme().status().warning_background)),
+            "a highlight is marked by default"
+        );
 
         let fenced = style_at(&mut cx, "fenced");
         assert_eq!(family_name(&fenced), Some(buffer_family));
@@ -5189,7 +5198,28 @@ mod integration_tests {
             Some(cx.update(|_window, cx| cx.theme().colors().link_text_hover))
         });
         assert_eq!(style_at(&mut cx, "code").color, None);
-        assert_eq!(style_at(&mut cx, "marked").background_color, None);
+        assert_eq!(style_at(&mut cx, "marked").background_color, {
+            use theme::ActiveTheme as _;
+            Some(cx.update(|_window, cx| cx.theme().status().warning_background))
+        });
+    }
+
+    #[gpui::test]
+    async fn a_transparent_color_turns_a_default_chip_off(cx: &mut TestAppContext) {
+        let mut cx = styling_context(cx).await;
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                highlight_background: Some("#00000000".into()),
+                inline_code_background: Some("#00000000".into()),
+                ..Default::default()
+            }),
+        );
+
+        let transparent = Some(hex("#00000000"));
+        assert_eq!(style_at(&mut cx, "marked").background_color, transparent);
+        assert_eq!(style_at(&mut cx, "code").background_color, transparent);
     }
 
     #[gpui::test]

@@ -503,9 +503,11 @@ impl ResolvedStyle {
             italic_color: color_of(&colors.italic, "italic").unwrap_or(foreground),
             strikethrough_color: color_of(&colors.strikethrough, "strikethrough")
                 .unwrap_or(foreground),
-            highlight_background: background_of(&colors.highlight_background, "highlight"),
+            highlight_background: background_of(&colors.highlight_background, "highlight")
+                .or(Some(cx.theme().status().warning_background)),
             inline_code_color: color_of(&colors.inline_code, "inline_code"),
-            inline_code_background: background_of(&colors.inline_code_background, "inline_code"),
+            inline_code_background: background_of(&colors.inline_code_background, "inline_code")
+                .or(Some(theme_colors.element_background)),
             link_color: color_of(&colors.link, "link").unwrap_or(theme_colors.link_text_hover),
             unresolved_link_color: color_of(&colors.link_unresolved, "link.unresolved")
                 .unwrap_or(theme_colors.text_muted),
