@@ -3407,6 +3407,25 @@ mod integration_tests {
         );
     }
 
+    /// A comment disappears until the cursor is in it, and a block id stays.
+    #[gpui::test]
+    async fn a_comment_is_hidden_until_the_cursor_is_in_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+
+        cx.set_state("ˇfirst\n\nA %%secret%% and ^id\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        // The comment is one folded space, between the two around it.
+        assert_eq!(cx.display_text(), "first\n\nA   and ^id\n");
+
+        cx.set_state("first\n\nA %%secˇret%% and ^id\n");
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        assert_eq!(cx.display_text(), "first\n\nA %%secret%% and ^id\n");
+    }
+
     /// Creates `name` in the editor's project, so that links can lead to it.
     async fn add_note(cx: &mut EditorTestContext, name: &str) {
         let project = cx

@@ -1818,10 +1818,16 @@ fn plan_highlight_marks(
     }
 }
 
-/// `[[wikilinks]]` and `#tags`, which no node of the Markdown grammar covers, so
-/// they are found by scanning the inline node's text like `==highlight==`.
-/// Code spans and links are left alone, and so is an embed `![[...]]`, which is
-/// an image or a note drawn in place rather than a link.
+/// `%%comments%%`, `^block-ids`, `[[wikilinks]]` and `#tags`, which no node of
+/// the Markdown grammar covers, so they are found by scanning the inline node's
+/// text like `==highlight==`. Code spans and links are left alone, and so is an
+/// embed `![[...]]`, which is an image or a note drawn in place rather than a
+/// link.
+///
+/// A comment is hidden until a selection touches it, then shown dimmed. One that
+/// runs over several lines of a paragraph is only ever dimmed, since a fold
+/// cannot span lines. Nothing inside a comment is anything else. A block id is
+/// always dimmed.
 ///
 /// A wikilink behaves like a Markdown link: its brackets, and the target in front
 /// of an alias, are hidden until a selection touches the link, then shown dimmed.
@@ -1834,6 +1840,19 @@ fn plan_note_syntax(
     plan: &mut Plan,
 ) {
     let mut excluded: Vec<Range<usize>> = code_ranges.iter().chain(link_ranges).cloned().collect();
+
+    for comment in inline_scan::find_comments(inline_text, offset, &excluded) {
+        excluded.push(comment.range.clone());
+        if comment.is_multiline || touches_selection(&comment.range, selections) {
+            plan.dimmed_markers.push(comment.range);
+        } else {
+            plan.hidden_markers.push(comment.range);
+        }
+    }
+
+    for id in inline_scan::find_block_ids(inline_text, offset, &excluded) {
+        plan.dimmed_markers.push(id);
+    }
 
     for link in inline_scan::find_wikilinks(inline_text, offset, &excluded) {
         excluded.push(link.range.clone());
@@ -2497,6 +2516,8 @@ mod tests {
             "- [[Note#Heading]] and [[#Here]] with #tag\n",
             "**[[bold link]]** and ==[[marked #tag]]== and [x [[inside]]](https://example.com)\n",
             "Code `[[not a link]]` and `#not-a-tag` and ![[embed.png]] inline\n",
+            "Aside %%a comment with [[a link]] and #tag%% and a block id ^blk-1\n",
+            "%% a comment that\nruns over lines %% and `%%code%%` text\n",
             "---\n",
             "```rust\nfn main() {}\n```\n",
             "| A | B |\n|--|--:|\n| 1 | 2 |\n",
@@ -2956,6 +2977,70 @@ mod tests {
             .map(|link| link.note.as_str())
             .collect();
         assert_eq!(notes, vec!["Heading Link", "List Link", "Quote Link"]);
+    }
+
+    #[test]
+    fn a_comment_is_hidden_until_the_cursor_is_in_it() {
+        let text = "a %%hidden%% b\n";
+
+        let away = plan(text, &[0..0]);
+        assert_eq!(away.hidden_markers, vec![2..12]);
+        assert!(away.dimmed_markers.is_empty());
+
+        let inside = plan(text, &[6..6]);
+        assert!(inside.hidden_markers.is_empty());
+        assert_eq!(inside.dimmed_markers, vec![2..12]);
+    }
+
+    #[test]
+    fn a_comment_over_several_lines_is_dimmed_and_never_hidden() {
+        let text = "a %%one\ntwo%% b\n";
+        let result = plan(text, &[]);
+
+        assert!(result.hidden_markers.is_empty(), "a fold cannot span lines");
+        assert_eq!(result.dimmed_markers, vec![2..13]);
+    }
+
+    #[test]
+    fn nothing_inside_a_comment_is_anything_else() {
+        let text = "%% [[Note]] #tag ^id %% after\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(result.hidden_markers, vec![0..23]);
+        assert!(result.wikilinks.is_empty());
+        assert!(result.styled_spans.is_empty());
+        assert!(result.dimmed_markers.is_empty());
+    }
+
+    #[test]
+    fn a_comment_in_code_is_not_one() {
+        let result = plan("`%%x%%` and 100% and 5% more\n", &[]);
+
+        assert!(result.hidden_markers.is_empty());
+    }
+
+    #[test]
+    fn a_block_id_is_dimmed_with_or_without_the_cursor() {
+        let text = "a paragraph ^abc\n";
+
+        assert_eq!(plan(text, &[]).dimmed_markers, vec![12..16]);
+        assert_eq!(plan(text, &[3..3]).dimmed_markers, vec![12..16]);
+        assert_eq!(plan("- item ^id\n", &[]).dimmed_markers, vec![7..10]);
+    }
+
+    #[test]
+    fn something_that_only_looks_like_a_block_id_is_not_one() {
+        assert!(plan("x^2 and 2 ^n more\n", &[]).dimmed_markers.is_empty());
+
+        // The backticks of inline code are dimmed, but the id inside is not.
+        let text = "`code ^id`\n";
+        let result = plan(text, &[]);
+        assert!(
+            result
+                .dimmed_markers
+                .iter()
+                .all(|range| !text[range.clone()].contains("^id"))
+        );
     }
 
     fn tag_texts<'a>(result: &Plan, text: &'a str) -> Vec<&'a str> {
