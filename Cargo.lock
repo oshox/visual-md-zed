@@ -20070,6 +20070,7 @@ dependencies = [
  "util",
  "util_macros",
  "vim_mode_setting",
+ "visual_md",
  "workspace",
  "zed_actions",
 ]
@@ -20111,6 +20112,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "snippet",
  "syntax_theme",
  "theme",
  "theme_settings",

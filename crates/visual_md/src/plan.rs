@@ -1927,11 +1927,11 @@ fn plan_note_syntax(
     }
 }
 
-fn in_code(byte_offset: usize, code_ranges: &[Range<usize>]) -> bool {
+pub(crate) fn in_code(byte_offset: usize, code_ranges: &[Range<usize>]) -> bool {
     code_ranges.iter().any(|range| range.contains(&byte_offset))
 }
 
-fn find_closing(
+pub(crate) fn find_closing(
     bytes: &[u8],
     start: usize,
     code_ranges: &[Range<usize>],
