@@ -98,12 +98,35 @@ impl RangeInEditor {
 #[derive(Debug, Clone)]
 pub enum HoverLink {
     Url(String),
+    /// Something to do when the link is clicked, for a link that is neither an
+    /// address, a file nor a place in code, such as a tag that opens a search.
+    Action(HoverAction),
     File(ResolvedFileTarget),
     Text(LocationLink),
     /// Navigate to an LSP-given location whose buffer may not be loaded yet.
     /// Used by inlay-hint hover, code-lens references, and document-link
     /// targets that point inside a workspace file (e.g. `file:///foo#9,16`).
     LspLocation(lsp::Location, LanguageServerId),
+}
+
+/// What clicking a [`HoverLink::Action`] does.
+#[derive(Clone)]
+pub struct HoverAction(std::sync::Arc<dyn Fn(&mut Window, &mut App)>);
+
+impl HoverAction {
+    pub fn new(run: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        Self(std::sync::Arc::new(run))
+    }
+
+    pub fn run(&self, window: &mut Window, cx: &mut App) {
+        (self.0)(window, cx)
+    }
+}
+
+impl std::fmt::Debug for HoverAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HoverAction")
+    }
 }
 
 /// Convert a `documentLink` target URI into a [`HoverLink`], reusing the
@@ -251,8 +274,10 @@ impl Editor {
         let mut links = cached.map(|state| state.links).unwrap_or_default();
         if refresh || !self.lsp_data_enabled() {
             links.retain(|link| {
-                matches!(link, HoverLink::Url(_) | HoverLink::File(_))
-                    || (self.lsp_data_enabled() && matches!(link, HoverLink::LspLocation(..)))
+                matches!(
+                    link,
+                    HoverLink::Url(_) | HoverLink::File(_) | HoverLink::Action(_)
+                ) || (self.lsp_data_enabled() && matches!(link, HoverLink::LspLocation(..)))
             });
         }
         if refresh && point.as_valid().is_some() {
@@ -304,7 +329,10 @@ impl Editor {
                             );
                         } else {
                             links.retain(|link| {
-                                matches!(link, HoverLink::Url(_) | HoverLink::File(_))
+                                matches!(
+                                    link,
+                                    HoverLink::Url(_) | HoverLink::File(_) | HoverLink::Action(_)
+                                )
                             });
                         }
                         editor
@@ -500,10 +528,12 @@ pub fn show_link_definition(
         return;
     };
     let same_kind = hovered_link_state.preferred_kind == preferred_kind
-        || hovered_link_state
-            .links
-            .first()
-            .is_some_and(|d| matches!(d, HoverLink::Url(_) | HoverLink::LspLocation(_, _)));
+        || hovered_link_state.links.first().is_some_and(|d| {
+            matches!(
+                d,
+                HoverLink::Url(_) | HoverLink::Action(_) | HoverLink::LspLocation(_, _)
+            )
+        });
 
     if same_kind {
         if is_cached && (hovered_link_state.last_trigger_point == trigger_point)
@@ -2397,6 +2427,65 @@ mod tests {
         );
         cx.simulate_click(on_magic, Modifiers::secondary_key());
         assert_eq!(cx.opened_url(), Some("https://example.com/magic".into()));
+    }
+
+    /// An addon that makes the word "act" a link that runs something when clicked.
+    struct ActionWordAddon {
+        clicked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::Addon for ActionWordAddon {
+        fn to_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn link_at(
+            &self,
+            buffer: &gpui::Entity<language::Buffer>,
+            position: text::Anchor,
+            _project: Option<&gpui::Entity<project::Project>>,
+            cx: &mut gpui::App,
+        ) -> Option<gpui::Task<Option<(std::ops::Range<text::Anchor>, HoverLink)>>> {
+            use text::ToOffset as _;
+
+            let snapshot = buffer.read(cx).snapshot();
+            let offset = position.to_offset(&snapshot);
+            let start = snapshot.text().find("act")?;
+            let range = start..start + "act".len();
+            if !range.contains(&offset) {
+                return None;
+            }
+            let anchors = snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end);
+            let clicked = self.clicked.clone();
+            Some(gpui::Task::ready(Some((
+                anchors,
+                HoverLink::Action(HoverAction::new(move |_, _| {
+                    clicked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+            ))))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_clicking_an_action_link_runs_the_action(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+        let clicked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cx.update_editor(|editor, _, _| {
+            editor.register_addon(ActionWordAddon {
+                clicked: clicked.clone(),
+            })
+        });
+        cx.set_state("one act wordˇ\n");
+
+        let on_act = cx.pixel_position("one aˇct word\n");
+        cx.simulate_mouse_move(on_act, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(HighlightKey::HoveredLinkState, "one «actˇ» word\n");
+        assert_eq!(clicked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        cx.simulate_click(on_act, Modifiers::secondary_key());
+        assert_eq!(clicked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(cx.opened_url(), None, "nothing was opened");
     }
 
     #[gpui::test]
