@@ -238,6 +238,7 @@ pub mod dynamic_rules;
 pub mod extensions;
 mod fence_render;
 mod format_toggle;
+mod inline_scan;
 mod links;
 mod list_continuation;
 pub mod outline;
