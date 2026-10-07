@@ -231,6 +231,7 @@
 //! `highlight_text` calls, diffing against what was previously applied so a
 //! single keystroke or cursor move touches only what changed.
 
+mod attachments;
 mod commands;
 mod completions;
 mod document_events;
@@ -243,6 +244,7 @@ mod inline_scan;
 mod links;
 mod list_continuation;
 mod list_edit;
+mod note_contents;
 mod notes;
 pub mod outline;
 mod plan;
@@ -399,16 +401,19 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
             }),
         ),
     ];
+    let paste_action = editor.register_action(cx.listener(attachments::intercept_paste));
     let toggle_live_preview_action = editor.register_action(cx.listener(toggle_live_preview));
     let run_extension_command_action =
         editor.register_action(cx.listener(commands::run_extension_command));
     editor.register_addon(VisualMdAddon {
+        editor: cx.weak_entity(),
         _state: state,
         _newline_action: newline_action,
         _toggle_bold_action: toggle_bold_action,
         _toggle_italic_action: toggle_italic_action,
         _format_actions: format_actions,
         _list_actions: list_actions,
+        _paste_action: paste_action,
         _toggle_live_preview_action: toggle_live_preview_action,
         _run_extension_command_action: run_extension_command_action,
         enabled_override: None,
@@ -748,6 +753,9 @@ fn toggle_live_preview(
 /// is where the currently-folded marker creases are tracked so `refresh` can
 /// diff against them instead of re-folding everything from scratch.
 struct VisualMdAddon {
+    /// The editor this belongs to, for what has to happen to it after the editor
+    /// has finished handling something (see `Addon::handle_drop`).
+    editor: WeakEntity<Editor>,
     _state: Entity<VisualMdState>,
     /// Keeps the `Newline` interceptor (see [`intercept_newline`]) alive for
     /// as long as this editor is visual_md-managed; dropping it would let
@@ -763,6 +771,8 @@ struct VisualMdAddon {
     /// Keeps the list-editing interceptors (`Tab`, `Backtab`, `Backspace`,
     /// `MoveLineUp`, `MoveLineDown`) alive.
     _list_actions: Vec<Subscription>,
+    /// Keeps the `Paste` interceptor alive (see [`attachments`]).
+    _paste_action: Subscription,
     _toggle_live_preview_action: Subscription,
     /// Keeps the handler for extension commands (see `commands`) alive.
     _run_extension_command_action: Subscription,
@@ -875,6 +885,8 @@ struct ParsedDocument {
     block_tree: tree_sitter::Tree,
     /// What can be folded, in document order (see [`fold_ranges`]).
     foldable: Arc<[Range<usize>]>,
+    /// The `[label]: destination` definitions, for reference-style links.
+    link_definitions: Arc<HashMap<String, String>>,
 }
 
 impl Addon for VisualMdAddon {
@@ -892,7 +904,44 @@ impl Addon for VisualMdAddon {
         cx: &mut App,
     ) -> Option<Task<Option<(Range<language::Anchor>, editor::hover_links::HoverLink)>>> {
         let note_index = self.note_index.as_ref().map(|(index, _)| index.clone());
-        links::link_at(self.active, buffer, position, project, note_index, cx)
+        let definitions = self
+            .parsed
+            .as_ref()
+            .map(|parsed| parsed.link_definitions.clone());
+        links::link_at(
+            self.active,
+            buffer,
+            position,
+            project,
+            note_index,
+            definitions,
+            cx,
+        )
+    }
+
+    fn handle_drop(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        project: Option<&Entity<project::Project>>,
+        dropped: &dyn Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Some(text) =
+            project.and_then(|project| attachments::dropped_links(buffer, project, dropped, cx))
+        else {
+            return false;
+        };
+        let editor = self.editor.clone();
+        window.defer(cx, move |window, cx| {
+            editor
+                .update(cx, |editor, cx| editor.insert(&text, window, cx))
+                .log_err();
+        });
+        true
     }
 
     fn to_any(&self) -> &dyn Any {
@@ -1286,12 +1335,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 VIEWPORT_OVERSCAN_ROWS,
                 cx,
             );
+            let link_definitions = editor
+                .addon::<VisualMdAddon>()
+                .and_then(|addon| addon.parsed.as_ref())
+                .map(|parsed| parsed.link_definitions.clone());
             let plan = plan::plan_viewport_with_extensions(
                 text,
                 block_tree,
                 &selections,
                 visible_range.clone(),
-                &plan_extensions(&style, cx),
+                &plan_extensions(&style, link_definitions, cx),
             );
             if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
                 addon.planned = Some((snapshot.edit_count(), visible_range));
@@ -1458,16 +1511,22 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 }
 
 /// What extensions currently claim, as far as the planner needs to know.
-fn plan_extensions(style: &ResolvedStyle, cx: &App) -> plan::PlanExtensions {
+fn plan_extensions(
+    style: &ResolvedStyle,
+    link_definitions: Option<Arc<HashMap<String, String>>>,
+    cx: &App,
+) -> plan::PlanExtensions {
     let task_marks = style.task_marks.keys().copied().collect();
     let Some(registry) = cx.try_global::<extensions::VisualMdExtensions>() else {
         return plan::PlanExtensions {
             task_marks,
+            link_definitions,
             ..Default::default()
         };
     };
     plan::PlanExtensions {
         task_marks,
+        link_definitions,
         rendered_fence_languages: registry.fence_languages().into_iter().collect(),
         rules: rules::RuleSet {
             rules: registry.syntax_rules().into(),
@@ -1674,6 +1733,7 @@ fn parsed_document(
             edit_count,
             text: text.clone(),
             foldable: fold_ranges::foldable_ranges(&text, &block_tree).into(),
+            link_definitions: Arc::new(plan::link_definitions(&text, &block_tree)),
             block_tree,
         });
     }
@@ -4984,6 +5044,50 @@ mod integration_tests {
         cx.assert_editor_state("a _«wordˇ»_ b\n");
     }
 
+    /// An editor on `path` of a project holding `files` under `/dir`, showing
+    /// live preview, focused, with the cursor at the end of the text.
+    pub(crate) async fn editor_in_project(
+        cx: &mut TestAppContext,
+        files: serde_json::Value,
+        path: &str,
+    ) -> gpui::WindowHandle<Editor> {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/dir", files).await;
+        let project = project::Project::test(fs, ["/dir".as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| project.open_local_buffer(path, cx))
+            .await
+            .expect("the file opens");
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(markdown_language()), cx)
+        });
+        let multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let window = cx.add_window({
+            let project = project.clone();
+            |window, cx| {
+                Editor::new(
+                    editor::EditorMode::full(),
+                    multi_buffer,
+                    Some(project),
+                    window,
+                    cx,
+                )
+            }
+        });
+        window
+            .update(cx, |editor, window, cx| {
+                refresh(editor, window, cx);
+                window.focus(&gpui::Focusable::focus_handle(editor, cx), cx);
+                let end = editor.buffer().read(cx).len(cx);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([end..end]);
+                });
+            })
+            .expect("the window is open");
+        cx.run_until_parked();
+        window
+    }
+
     fn section_crease_count(cx: &mut EditorTestContext) -> usize {
         cx.update_editor(|editor, _, _| {
             editor
@@ -5226,6 +5330,25 @@ mod integration_tests {
                 .is_some()
         });
         assert!(last_has_a_crease);
+    }
+
+    #[gpui::test]
+    async fn a_reference_link_shows_its_text_only_while_the_cursor_is_elsewhere(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "a [text][ref] and [nope][none] b\n\n[ref]: https://example.com\n";
+        let mut cx = markdown_editor_with(cx, &format!("{text}ˇ")).await;
+        assert_eq!(
+            cx.display_text(),
+            "a  text  and [nope][none] b\n\n[ref]: https://example.com\n"
+        );
+
+        cx.set_state("a [teˇxt][ref] and [nope][none] b\n\n[ref]: https://example.com\n");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.display_text(),
+            "a [text][ref] and [nope][none] b\n\n[ref]: https://example.com\n"
+        );
     }
 
     #[gpui::test]

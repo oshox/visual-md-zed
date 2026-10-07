@@ -18,6 +18,31 @@ use util::rel_path::RelPath;
 
 const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
 
+/// The files `![[name]]` can embed besides notes.
+const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"];
+
+/// Whether `extension` is one of an image.
+pub(crate) fn is_image_extension(extension: &str) -> bool {
+    IMAGE_EXTENSIONS
+        .iter()
+        .any(|image| extension.eq_ignore_ascii_case(image))
+}
+
+/// The extension of the file name `name`, if it has one.
+pub(crate) fn extension_of(name: &str) -> Option<&str> {
+    split_name(name).1
+}
+
+/// A file a `[[` can name, and what goes between the brackets to name it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteSuggestion {
+    /// A note's name without its extension, or an image's with it, and with
+    /// its folders when another file would have the same name.
+    pub name: String,
+    /// The path of the file in its worktree.
+    pub path: String,
+}
+
 /// A file of the project that a link can name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteFile {
@@ -123,6 +148,55 @@ impl Entries {
             }
         }
         entries
+    }
+
+    /// The notes, and with `embed` the images too, that a `[[` can name, the
+    /// closest to `from` first.
+    fn suggestions(&self, from: Option<&ProjectPath>, embed: bool) -> Vec<NoteSuggestion> {
+        let mut files: Vec<(&NoteFile, String)> = Vec::new();
+        for (stem, notes) in &self.by_stem {
+            let ambiguous = notes.len() > 1;
+            for note in notes {
+                let unix = note.path.as_unix_str();
+                let without_extension = split_name(unix).0;
+                let name = if ambiguous {
+                    without_extension
+                } else {
+                    without_extension.rsplit('/').next().unwrap_or(stem)
+                };
+                files.push((note, name.to_string()));
+            }
+        }
+        if embed {
+            for (name, images) in &self.by_name {
+                let is_image = split_name(name).1.is_some_and(is_image_extension);
+                if !is_image {
+                    continue;
+                }
+                let ambiguous = images.len() > 1;
+                for image in images {
+                    let unix = image.path.as_unix_str();
+                    let shown = if ambiguous {
+                        unix
+                    } else {
+                        unix.rsplit('/').next().unwrap_or(unix)
+                    };
+                    files.push((image, shown.to_string()));
+                }
+            }
+        }
+        files.sort_by(|(left, left_name), (right, right_name)| {
+            closeness(left, from)
+                .cmp(&closeness(right, from))
+                .then_with(|| left_name.cmp(right_name))
+        });
+        files
+            .into_iter()
+            .map(|(file, name)| NoteSuggestion {
+                name,
+                path: file.path.as_unix_str().to_string(),
+            })
+            .collect()
     }
 
     fn resolve(&self, note: &str, from: Option<&ProjectPath>) -> Resolution {
@@ -311,6 +385,12 @@ impl NoteIndex {
     pub fn resolve(&self, note: &str, from: Option<&ProjectPath>) -> Resolution {
         self.entries.resolve(note, from)
     }
+
+    /// What a `[[` (or with `embed`, a `![[`) can name, the closest to `from`
+    /// first. Empty until the project has been read.
+    pub fn suggestions(&self, from: Option<&ProjectPath>, embed: bool) -> Vec<NoteSuggestion> {
+        self.entries.suggestions(from, embed)
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +426,76 @@ mod tests {
             Resolution::Found(file) => Some(file.path.as_unix_str().to_string()),
             _ => None,
         }
+    }
+
+    fn names(suggestions: Vec<NoteSuggestion>) -> Vec<String> {
+        suggestions
+            .into_iter()
+            .map(|suggestion| suggestion.name)
+            .collect()
+    }
+
+    #[test]
+    fn test_a_note_is_suggested_by_its_name_and_by_its_folders_only_when_it_must_be() {
+        let index = entries(&[
+            "Inbox.md",
+            "projects/Plan.md",
+            "archive/Plan.md",
+            "projects/deep/Idea.markdown",
+            "Version 1.2 notes.md",
+            "notes.txt",
+        ]);
+
+        assert_eq!(
+            names(index.suggestions(None, false)),
+            [
+                "Inbox",
+                "Version 1.2 notes",
+                "archive/Plan",
+                "projects/Plan",
+                "Idea",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_images_are_suggested_only_for_an_embed_and_with_their_extension() {
+        let index = entries(&[
+            "Note.md",
+            "pic.png",
+            "photos/pic.PNG",
+            "doc.pdf",
+            "photos/sun.jpg",
+        ]);
+
+        assert_eq!(names(index.suggestions(None, false)), ["Note"]);
+        assert_eq!(
+            names(index.suggestions(None, true)),
+            ["Note", "pic.png", "photos/pic.PNG", "sun.jpg"]
+        );
+    }
+
+    #[test]
+    fn test_suggestions_start_with_the_notes_closest_to_the_one_being_edited() {
+        let index = entries(&["a/Far.md", "b/Near.md", "b/Also.md", "Top.md"]);
+
+        assert_eq!(
+            names(index.suggestions(Some(&from("b/Current.md")), false)),
+            ["Also", "Near", "Top", "Far"]
+        );
+    }
+
+    #[test]
+    fn test_a_suggestion_says_which_file_it_names() {
+        let index = entries(&["projects/Plan.md"]);
+
+        assert_eq!(
+            index.suggestions(None, false),
+            [NoteSuggestion {
+                name: "Plan".to_string(),
+                path: "projects/Plan.md".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -10,8 +10,9 @@
 //! and so the same logic can later be scoped to a viewport without touching
 //! the rendering side at all.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use extension::VisualMdSpanStyle;
 use tree_sitter::{Node, Parser, Tree};
@@ -453,6 +454,10 @@ pub struct PlanExtensions {
     /// The characters of the task marks, besides `[ ]` and `[x]`, that get a
     /// checkbox of their own.
     pub task_marks: HashSet<char>,
+    /// The `[label]: destination` definitions of the document, as
+    /// [`link_definitions`] finds them, when the caller already has them. They
+    /// are looked for in the block parse when it does not.
+    pub link_definitions: Option<Arc<HashMap<String, String>>>,
 }
 
 /// [`plan_viewport_with_tree`], also planning what `extensions` claim.
@@ -473,6 +478,17 @@ pub fn plan_viewport_with_extensions(
         visible_range.start = visible_range.start.min(selection.start);
         visible_range.end = visible_range.end.max(selection.end);
     }
+
+    let with_definitions;
+    let extensions = if extensions.link_definitions.is_some() {
+        extensions
+    } else {
+        with_definitions = PlanExtensions {
+            link_definitions: Some(Arc::new(link_definitions(text, block_tree))),
+            ..extensions.clone()
+        };
+        &with_definitions
+    };
 
     let mut plan = Plan::default();
     walk_block(
@@ -1544,6 +1560,7 @@ fn plan_inline(
 
     let mut code_ranges = Vec::new();
     let mut link_ranges = Vec::new();
+    let no_definitions = HashMap::new();
     walk_inline(
         tree.root_node(),
         range.start,
@@ -1552,6 +1569,10 @@ fn plan_inline(
         &mut code_ranges,
         &mut link_ranges,
         &extensions.rules,
+        extensions
+            .link_definitions
+            .as_deref()
+            .unwrap_or(&no_definitions),
         &inline_text,
     );
     plan_highlight_marks(&inline_text, range.start, &code_ranges, selections, plan);
@@ -1578,6 +1599,7 @@ fn walk_inline(
     code_ranges: &mut Vec<Range<usize>>,
     link_ranges: &mut Vec<Range<usize>>,
     rule_set: &RuleSet,
+    definitions: &HashMap<String, String>,
     inline_text: &str,
 ) {
     for rule in rule_set.node_rules(node.kind()) {
@@ -1606,6 +1628,14 @@ fn walk_inline(
         "uri_autolink" | "email_autolink" => {
             link_ranges.push(shift(node.byte_range(), offset));
             plan_autolink(node, offset, selections, plan);
+            return;
+        }
+        "full_reference_link" | "collapsed_reference_link" | "shortcut_link"
+            if reference_label(node, inline_text)
+                .is_some_and(|label| definitions.contains_key(&normalize_label(label))) =>
+        {
+            link_ranges.push(shift(node.byte_range(), offset));
+            plan_reference_link(node, offset, selections, plan);
             return;
         }
         _ => {}
@@ -1639,6 +1669,7 @@ fn walk_inline(
                     code_ranges,
                     link_ranges,
                     rule_set,
+                    definitions,
                     inline_text,
                 );
             }
@@ -1656,6 +1687,7 @@ fn walk_inline(
             code_ranges,
             link_ranges,
             rule_set,
+            definitions,
             inline_text,
         );
     }
@@ -1678,15 +1710,9 @@ fn find_child<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
 /// entirely unhandled, i.e. fully raw) if any expected child is missing --
 /// malformed/unusual grammar output isn't worth guessing at.
 ///
-/// Only the direct `[text](url)` shape is handled. Reference-style links
-/// (`[text][1]`, `[text][]`, `[shortcut]`) are deliberately left alone: this
-/// function is only ever reached for the `inline_link` node kind, which the
-/// grammar produces exclusively for the immediate, self-contained
-/// `[..](..)`  shape -- `full_reference_link`/`collapsed_reference_link`/
-/// `shortcut_link` are different node kinds `walk_inline` never dispatches
-/// here, since resolving those needs a `link_reference_definition` that may
-/// live in a completely different part of the document (out of scope for
-/// this crate's per-paragraph, no-cross-block-lookup inline planner).
+/// Only the direct `[text](url)` shape is handled here. Reference-style links
+/// (`[text][1]`, `[text][]`, `[shortcut]`) are other node kinds, planned by
+/// `plan_reference_link` when the document defines the label they name.
 fn plan_link(node: Node, offset: usize, selections: &[Range<usize>], plan: &mut Plan) {
     let Some(open_bracket) = find_child(node, "[") else {
         return;
@@ -1710,6 +1736,110 @@ fn plan_link(node: Node, offset: usize, selections: &[Range<usize>], plan: &mut 
     // delimiter of one kind.
     let suffix = shift(
         close_bracket.byte_range().start..close_paren.byte_range().end,
+        offset,
+    );
+    let link_text = shift(link_text.byte_range(), offset);
+
+    if touches_selection(&node_range, selections) {
+        plan.dimmed_markers.push(prefix);
+        plan.dimmed_markers.push(suffix);
+    } else {
+        plan.hidden_markers.push(prefix);
+        plan.hidden_markers.push(suffix);
+    }
+    plan.styled_spans.push((link_text, SpanStyle::Link));
+}
+
+/// The label a reference link (`[text][label]`, `[text][]` or `[label]`) names,
+/// as written.
+pub(crate) fn reference_label<'a>(node: Node, text: &'a str) -> Option<&'a str> {
+    let label_node = match node.kind() {
+        "full_reference_link" => find_child(node, "link_label")?,
+        "collapsed_reference_link" | "shortcut_link" => find_child(node, "link_text")?,
+        _ => return None,
+    };
+    let written = text.get(label_node.byte_range())?;
+    if node.kind() == "full_reference_link" {
+        return written.strip_prefix('[')?.strip_suffix(']');
+    }
+    // `[[name]]` is a wikilink, not a link to the label `name` inside brackets.
+    let inside_double_brackets = text
+        .get(..node.start_byte())
+        .is_some_and(|before| before.ends_with('['))
+        && text
+            .get(node.end_byte()..)
+            .is_some_and(|after| after.starts_with(']'));
+    (!inside_double_brackets).then_some(written)
+}
+
+/// A label as CommonMark matches it: case folded, with every run of whitespace
+/// a single space.
+pub(crate) fn normalize_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The `[label]: destination` definitions of a document, by normalized label.
+/// When a label is defined twice the first definition counts, as in CommonMark.
+pub(crate) fn link_definitions(text: &str, block_tree: &Tree) -> HashMap<String, String> {
+    let mut definitions = HashMap::new();
+    // Nearly every document has none, and finding that out should not take a
+    // walk of its block tree.
+    if !text.contains("]:") {
+        return definitions;
+    }
+
+    let mut pending = vec![block_tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "link_reference_definition" {
+            let label = find_child(node, "link_label")
+                .and_then(|label| text.get(label.byte_range()))
+                .and_then(|written| written.strip_prefix('[')?.strip_suffix(']'));
+            let destination = find_child(node, "link_destination")
+                .and_then(|destination| text.get(destination.byte_range()));
+            if let (Some(label), Some(destination)) = (label, destination) {
+                let destination = destination
+                    .strip_prefix('<')
+                    .and_then(|inner| inner.strip_suffix('>'))
+                    .unwrap_or(destination);
+                definitions
+                    .entry(normalize_label(label))
+                    .or_insert_with(|| destination.to_string());
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        // Taken in document order, which decides which of two definitions of a
+        // label counts.
+        pending.extend(children.into_iter().rev());
+    }
+    definitions
+}
+
+/// Hides a reference link's brackets and label, leaving its text, styled as a
+/// link, and reveals them (dimmed) while the cursor is on the link. Only called
+/// for a link whose label the document defines: any other `[text]` is text.
+fn plan_reference_link(node: Node, offset: usize, selections: &[Range<usize>], plan: &mut Plan) {
+    let Some(open_bracket) = find_child(node, "[") else {
+        return;
+    };
+    let Some(link_text) = find_child(node, "link_text") else {
+        return;
+    };
+    let Some(close_bracket) = find_child(node, "]") else {
+        return;
+    };
+
+    let node_range = shift(node.byte_range(), offset);
+    let prefix = shift(open_bracket.byte_range(), offset);
+    // From the `]` that ends the text to the end of the link: nothing, a `[]`,
+    // or the `[label]`, which sit back to back.
+    let suffix = shift(
+        close_bracket.byte_range().start..node.byte_range().end,
         offset,
     );
     let link_text = shift(link_text.byte_range(), offset);
@@ -2759,12 +2889,109 @@ mod tests {
     }
 
     #[test]
+    fn reference_links_to_a_defined_label_show_only_their_text() {
+        let definition = "\n[ref]: https://example.com\n[text]: /t\n";
+        for (written, hidden_before, hidden_after) in [
+            ("a [text][ref] b", 2..3, 7..13),
+            ("a [text][] b", 2..3, 7..10),
+            ("a [ref] b", 2..3, 6..7),
+        ] {
+            let text = format!("{written}\n{definition}");
+            let result = plan(&text, &[]);
+            assert_eq!(
+                result.hidden_markers,
+                vec![hidden_before, hidden_after],
+                "for {written:?}"
+            );
+            let link = spans(&text, SpanStyle::Link);
+            assert_eq!(link.len(), 1, "for {written:?}");
+            assert_eq!(
+                text.get(link[0].clone()),
+                Some(if written.contains("text") {
+                    "text"
+                } else {
+                    "ref"
+                }),
+                "for {written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_links_match_their_label_without_regard_to_case_or_spacing() {
+        let text = "see [A  Thing][a thing] and [Other Thing]\n\n[A THING]: <https://a.example>\n[other thing]: /b\n";
+        assert_eq!(spans(text, SpanStyle::Link).len(), 2);
+    }
+
+    #[test]
+    fn a_wikilink_is_not_a_reference_link_to_a_label_of_the_same_name() {
+        let text = "see [[ref]] and ![[ref]]\n\n[ref]: https://example.com\n";
+        assert!(spans(text, SpanStyle::Link).is_empty());
+    }
+
+    #[test]
+    fn a_reference_link_whose_label_is_not_defined_stays_text() {
+        let text = "[text][nope] and [nope]\n\n[other]: https://example.com\n";
+        assert!(spans(text, SpanStyle::Link).is_empty());
+        assert!(plan(text, &[]).hidden_markers.is_empty());
+    }
+
+    #[test]
+    fn a_reference_link_is_dimmed_while_the_cursor_is_on_it() {
+        let text = "a [text][ref] b\n\n[ref]: https://example.com\n";
+        let result = plan(text, &[5..5]);
+        assert!(result.hidden_markers.is_empty());
+        assert_eq!(result.dimmed_markers, vec![2..3, 7..13]);
+        assert_eq!(spans(text, SpanStyle::Link).len(), 1);
+    }
+
+    #[test]
+    fn a_definition_anywhere_in_the_document_counts_even_out_of_view() {
+        let mut text = String::from("a [text][ref] b\n\n");
+        for line in 0..200 {
+            text.push_str(&format!("filler {line}\n\n"));
+        }
+        text.push_str("[ref]: https://example.com\n");
+        let tree = parse_blocks(&text).expect("parses");
+
+        let result = plan_viewport_with_tree(&text, &tree, &[], 0..20);
+
+        assert_eq!(result.hidden_markers, vec![2..3, 7..13]);
+    }
+
+    #[test]
+    fn the_first_definition_of_a_label_is_the_one_that_counts() {
+        let text = "[ref]: https://first.example\n[REF]: https://second.example\n";
+        let tree = parse_blocks(text).expect("parses");
+        let definitions = link_definitions(text, &tree);
+        assert_eq!(
+            definitions.get("ref").map(String::as_str),
+            Some("https://first.example")
+        );
+        assert_eq!(definitions.len(), 1);
+    }
+
+    #[test]
+    fn definitions_are_found_inside_lists_and_quotes_and_without_brackets_in_text() {
+        let text = "> [quoted]: /q\n\n- item\n\n  [nested]: </n>\n\nno definitions]: here\n";
+        let tree = parse_blocks(text).expect("parses");
+        let definitions = link_definitions(text, &tree);
+        assert_eq!(definitions.get("quoted").map(String::as_str), Some("/q"));
+        assert!(definitions.contains_key("nested"));
+        assert!(!definitions.contains_key("no definitions"));
+    }
+
+    #[test]
+    fn a_document_without_definitions_is_not_walked_for_them() {
+        let text = "# Title\n\n[text][ref]\n";
+        let tree = parse_blocks(text).expect("parses");
+        assert!(link_definitions(text, &tree).is_empty());
+    }
+
+    #[test]
     fn reference_style_links_are_left_completely_raw() {
-        // No `[1]: url` definition backs either of these, and tree-sitter-md
-        // can't tell the difference from the per-paragraph inline text alone
-        // (see `plan_link`'s doc comment) -- so `shortcut_link`/
-        // `full_reference_link` are never dispatched to `plan_link` at all,
-        // and nothing about the line should be touched.
+        // No definition backs any of these, so they are text in brackets and
+        // nothing about the line should be touched.
         for text in ["[shortcut]\n", "[ref link][1]\n", "[collapsed][]\n"] {
             let result = plan(text, &[]);
             assert!(

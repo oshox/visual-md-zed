@@ -823,6 +823,23 @@ pub trait Addon: 'static {
         None
     }
 
+    /// Takes what the pane's user dropped on this editor, such as
+    /// `gpui::ExternalPaths` or `workspace::DraggedSelection`, for an addon that
+    /// knows what to do with it in this text. Returns whether it did, in which
+    /// case the pane does not do what it does with a drop. The editor is being
+    /// updated, so anything that changes it has to wait, for example in
+    /// `Window::defer`.
+    fn handle_drop(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _project: Option<&Entity<Project>>,
+        _dropped: &dyn std::any::Any,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
+        false
+    }
+
     fn to_any(&self) -> &dyn std::any::Any;
 
     fn to_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {

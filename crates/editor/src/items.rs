@@ -1211,6 +1211,21 @@ impl Item for Editor {
         }
     }
 
+    fn handle_drop(
+        &self,
+        _active_pane: &Pane,
+        dropped: &dyn std::any::Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(buffer) = self.buffer.read(cx).as_singleton() else {
+            return false;
+        };
+        self.addons.values().any(|addon| {
+            addon.handle_drop(&buffer, self.project.as_ref(), dropped, window, cx)
+        })
+    }
+
     fn tab_extra_context_menu_actions(
         &self,
         _window: &mut Window,
