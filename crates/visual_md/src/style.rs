@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use gpui::{
     AbsoluteLength, App, FontFamilyName, FontStyle, FontWeight, HighlightStyle, Hsla, Pixels,
-    SharedString, StrikethroughStyle, TextStyleRefinement, px, relative, rgb,
+    SharedString, StrikethroughStyle, TextStyleRefinement, UnderlineStyle, px, relative, rgb,
 };
 use icons::IconName;
 use settings::{
@@ -315,6 +315,8 @@ pub(crate) struct ResolvedStyle {
     pub inline_code_color: Option<Hsla>,
     pub inline_code_background: Option<Hsla>,
     pub link_color: Hsla,
+    /// A wikilink to a note the project does not have.
+    pub unresolved_link_color: Hsla,
     pub tag_color: Hsla,
     pub tag_background: Hsla,
     pub marker_color: Hsla,
@@ -438,6 +440,8 @@ impl ResolvedStyle {
             inline_code_color: color_of(&colors.inline_code, "inline_code"),
             inline_code_background: background_of(&colors.inline_code_background, "inline_code"),
             link_color: color_of(&colors.link, "link").unwrap_or(theme_colors.link_text_hover),
+            unresolved_link_color: color_of(&None, "link.unresolved")
+                .unwrap_or(theme_colors.text_muted),
             tag_color,
             tag_background: token("tag")
                 .and_then(|style| style.background_color)
@@ -523,6 +527,19 @@ impl ResolvedStyle {
     pub fn link_style(&self) -> HighlightStyle {
         HighlightStyle {
             color: Some(self.link_color),
+            ..HighlightStyle::default()
+        }
+    }
+
+    /// A wikilink to a note that does not exist: muted, with a wavy underline.
+    pub fn unresolved_link_style(&self) -> HighlightStyle {
+        HighlightStyle {
+            color: Some(self.unresolved_link_color),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(self.unresolved_link_color),
+                wavy: true,
+            }),
             ..HighlightStyle::default()
         }
     }

@@ -13,9 +13,10 @@ use editor::hover_links::{HoverLink, ResolvedFileTarget};
 use extension::{VisualMdLinkRequest, VisualMdLinkStyle, VisualMdLinkTarget};
 use gpui::{App, AsyncApp, Entity, Task};
 use language::{Anchor, Buffer, Point, ToOffset as _};
-use project::Project;
+use project::{Project, ProjectPath, ResolvedPath};
 
 use crate::extensions::{HookError, LinkResolvers, VisualMdExtensions, when_not_busy};
+use crate::notes::{self, NoteIndex};
 use crate::outline;
 use crate::plan::parse_blocks;
 
@@ -79,6 +80,16 @@ pub fn local_path(destination: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// The note a wikilink target names: what is before a `#heading` or `#^block`.
+pub fn note_of(target: &str) -> String {
+    target
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// What to do about a link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
@@ -91,6 +102,8 @@ pub enum Resolution {
     Url(String),
     /// Open a file, relative to the document unless the path is absolute.
     File(String),
+    /// Open the note a wikilink names, if the project has it.
+    Note(String),
     /// Nothing, because nothing resolves it.
     Nothing,
 }
@@ -108,8 +121,13 @@ pub fn resolve(
         path: document_path.map(str::to_string),
     };
     if link.is_wikilink {
+        let note = note_of(&link.target);
         return if resolvers.wikilinks.is_empty() {
-            Resolution::Nothing
+            if note.is_empty() {
+                Resolution::Nothing
+            } else {
+                Resolution::Note(note)
+            }
         } else {
             Resolution::Extensions {
                 extensions: resolvers.wikilinks.clone(),
@@ -143,6 +161,7 @@ pub(crate) fn link_at(
     buffer: &Entity<Buffer>,
     position: Anchor,
     project: Option<&Entity<Project>>,
+    note_index: Option<Entity<NoteIndex>>,
     cx: &mut App,
 ) -> Option<Task<Option<(Range<Anchor>, HoverLink)>>> {
     if !active {
@@ -164,11 +183,16 @@ pub(crate) fn link_at(
         .unwrap_or_default();
     let document_path = crate::fence_render::buffer_path(buffer, cx);
     let resolution = resolve(&link, &resolvers, document_path.as_deref());
+    let from = notes::location_of(buffer.read(cx), cx);
     let buffer = buffer.clone();
     let project = project.cloned();
 
     match resolution {
         Resolution::Nothing => None,
+        Resolution::Note(note) => {
+            let link = note_link(&note, note_index.as_ref(), from.as_ref(), cx)?;
+            Some(Task::ready(Some((range, link))))
+        }
         Resolution::Url(url) => Some(Task::ready(Some((range, HoverLink::Url(url))))),
         Resolution::File(path) => Some(cx.spawn(async move |cx| {
             let link = file_link(&path, &buffer, project.as_ref(), cx).await?;
@@ -199,8 +223,35 @@ pub(crate) fn link_at(
                     }
                 }
             }
+            // No extension knew where a wikilink goes, so it names a note of the project.
+            if request.wikilink {
+                let note = note_of(&request.target);
+                let link =
+                    cx.update(|cx| note_link(&note, note_index.as_ref(), from.as_ref(), cx))?;
+                return Some((range, link));
+            }
             None
         })),
+    }
+}
+
+/// A link to the note `note` names in the project, if it has one.
+fn note_link(
+    note: &str,
+    note_index: Option<&Entity<NoteIndex>>,
+    from: Option<&ProjectPath>,
+    cx: &App,
+) -> Option<HoverLink> {
+    match note_index?.read(cx).resolve(note, from) {
+        notes::Resolution::Found(file) => Some(HoverLink::File(ResolvedFileTarget {
+            resolved_path: ResolvedPath::ProjectPath {
+                project_path: file.project_path(),
+                is_dir: false,
+            },
+            row: None,
+            column: None,
+        })),
+        notes::Resolution::Missing | notes::Resolution::Unknown => None,
     }
 }
 
@@ -405,9 +456,20 @@ mod tests {
                 },
             }
         );
+        let nobody = LinkResolvers::default();
         assert_eq!(
-            resolve(&link("Note", true), &LinkResolvers::default(), None),
-            Resolution::Nothing
+            resolve(&link("Note", true), &nobody, None),
+            Resolution::Note("Note".to_string()),
+            "without an extension a wikilink names a note of the project"
+        );
+        assert_eq!(
+            resolve(&link("Note#Heading", true), &nobody, None),
+            Resolution::Note("Note".to_string())
+        );
+        assert_eq!(
+            resolve(&link("#Heading", true), &nobody, None),
+            Resolution::Nothing,
+            "a heading of the same note has no file to open"
         );
     }
 }
@@ -778,17 +840,54 @@ mod integration_tests {
     }
 
     #[gpui::test]
-    async fn test_a_wikilink_without_an_extension_is_no_link(cx: &mut TestAppContext) {
+    async fn test_a_wikilink_no_extension_knows_still_opens_the_note(cx: &mut TestAppContext) {
         init_test(cx);
+        let extension =
+            extension_with_links(cx, "a-first", "wikilinks = true\n", Behavior::Succeed);
+        extension.set_link_responder(|_| None);
+        let text = "go [[Other]]\n";
         let document = open(
             cx,
-            json!({ "a.md": "go [[Other]]\n", "other.md": "o" }),
+            json!({ "a.md": text, "other.md": "o" }),
             "/dir/a.md",
             true,
         )
         .await;
 
-        assert_eq!(link_for(cx, &document, 6).await, None);
+        let found = link_for(cx, &document, 6).await.expect("a link");
+
+        assert_eq!(found.1, "file other.md");
+        assert_eq!(
+            extension.link_requests().len(),
+            1,
+            "the extension was asked first"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_without_an_extension_opens_the_note_of_that_name(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let text = "go [[Other]] or [[Nobody]]\n";
+        let document = open(
+            cx,
+            json!({ "a.md": text, "other.md": "o" }),
+            "/dir/a.md",
+            true,
+        )
+        .await;
+
+        let found = link_for(cx, &document, 6).await.expect("a link");
+        assert_eq!(found.1, "file other.md");
+        assert_eq!(text_of(text, found.0), "[[Other]]");
+
+        let nobody = text.find("Nobody").expect("the text has it");
+        assert_eq!(
+            link_for(cx, &document, nobody).await,
+            None,
+            "there is no note to open"
+        );
     }
 
     #[gpui::test]
