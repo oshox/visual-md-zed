@@ -1045,6 +1045,14 @@ pub struct VisualMdColorsContent {
     pub inline_code_background: Option<ThemeColor>,
     /// Text color of links.
     pub link: Option<ThemeColor>,
+    /// Text color of a `[[wikilink]]` to a note the project does not have.
+    #[serde(rename = "link.unresolved")]
+    pub link_unresolved: Option<ThemeColor>,
+    /// Text color of `#tags`.
+    pub tag: Option<ThemeColor>,
+    /// Background color of `#tags`.
+    #[serde(rename = "tag.background")]
+    pub tag_background: Option<ThemeColor>,
     /// Color of the dimmed Markdown syntax shown on the line the cursor is on.
     pub marker: Option<ThemeColor>,
     /// Color of the bar beside a blockquote.

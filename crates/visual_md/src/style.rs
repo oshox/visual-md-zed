@@ -348,7 +348,7 @@ impl ResolvedStyle {
         let foreground = theme_colors.editor_foreground;
         let border = theme_colors.border;
 
-        let tag_color = token_color("tag").unwrap_or(theme_colors.text_accent);
+        let tag_color = color_of(&colors.tag, "tag").unwrap_or(theme_colors.text_accent);
 
         let heading_color = |level_setting: &Option<ThemeColor>, level: &str| {
             parse_color(level_setting.as_ref())
@@ -440,11 +440,10 @@ impl ResolvedStyle {
             inline_code_color: color_of(&colors.inline_code, "inline_code"),
             inline_code_background: background_of(&colors.inline_code_background, "inline_code"),
             link_color: color_of(&colors.link, "link").unwrap_or(theme_colors.link_text_hover),
-            unresolved_link_color: color_of(&None, "link.unresolved")
+            unresolved_link_color: color_of(&colors.link_unresolved, "link.unresolved")
                 .unwrap_or(theme_colors.text_muted),
             tag_color,
-            tag_background: token("tag")
-                .and_then(|style| style.background_color)
+            tag_background: background_of(&colors.tag_background, "tag")
                 .unwrap_or_else(|| tag_color.opacity(TAG_BACKGROUND_OPACITY)),
             marker_color: color_of(&colors.marker, "marker")
                 .unwrap_or_else(|| rgb(DEFAULT_MARKER_COLOR).into()),

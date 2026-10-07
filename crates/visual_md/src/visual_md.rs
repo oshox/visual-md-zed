@@ -4899,6 +4899,65 @@ mod integration_tests {
     }
 
     #[gpui::test]
+    async fn tags_and_unresolved_links_take_their_colors_from_settings_then_the_theme(
+        cx: &mut TestAppContext,
+    ) {
+        use theme::ActiveTheme as _;
+        let mut cx = editor_with_notes(cx, "ˇfirst #idea and [[Nothing]]\n").await;
+        let accent = cx.update(|_window, cx| cx.theme().colors().text_accent);
+        let muted = cx.update(|_window, cx| cx.theme().colors().text_muted);
+
+        let tag = style_at(&mut cx, "#idea");
+        assert_eq!(tag.color, Some(accent));
+        assert_eq!(tag.background_color, Some(accent.opacity(0.15)));
+        let unresolved = style_at(&mut cx, "Nothing");
+        assert_eq!(unresolved.color, Some(muted));
+        assert_eq!(
+            unresolved.underline.map(|underline| underline.wavy),
+            Some(true)
+        );
+
+        set_theme_tokens(
+            &mut cx,
+            vec![
+                (
+                    "visual_md.tag",
+                    HighlightStyle {
+                        color: Some(hex("#111111")),
+                        background_color: Some(hex("#222222")),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "visual_md.link.unresolved",
+                    HighlightStyle {
+                        color: Some(hex("#333333")),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        let from_theme = style_at(&mut cx, "#idea");
+        assert_eq!(from_theme.color, Some(hex("#111111")));
+        assert_eq!(from_theme.background_color, Some(hex("#222222")));
+        assert_eq!(style_at(&mut cx, "Nothing").color, Some(hex("#333333")));
+
+        set_visual_md(
+            &mut cx,
+            colors(settings::VisualMdColorsContent {
+                tag: Some("#444444".into()),
+                tag_background: Some("#555555".into()),
+                link_unresolved: Some("#666666".into()),
+                ..Default::default()
+            }),
+        );
+        let from_settings = style_at(&mut cx, "#idea");
+        assert_eq!(from_settings.color, Some(hex("#444444")));
+        assert_eq!(from_settings.background_color, Some(hex("#555555")));
+        assert_eq!(style_at(&mut cx, "Nothing").color, Some(hex("#666666")));
+    }
+
+    #[gpui::test]
     async fn color_settings_restyle_a_running_editor(cx: &mut TestAppContext) {
         let mut cx = styling_context(cx).await;
 
