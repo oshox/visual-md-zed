@@ -24,7 +24,7 @@ purpose even though the app is branded Zed MD.
 | M14 | Full font and color customization, in settings.json, the settings UI and themes | Done |
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 | M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
-| M17 | Editing tools and the outliner | Planned, see the feature audit |
+| M17 | Editing tools and the outliner | In progress: editing tools built, folding and completion planned, see "M17" |
 | M18 | Block syntax: properties panel, footnotes, math, embeds, hover previews | Planned, see the feature audit |
 | M19 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
@@ -454,3 +454,53 @@ covered by tests that ask the addon for the link and run its action.
   answer for them.
 - A comment cut by a blank line is not recognized.
 - The default chips change how every document already looks.
+
+## M17: Editing tools and the outliner
+
+**Today:** the audit above found that only bold and italic have shortcuts, that
+`Enter` is the only list key, that Tab nests an ordered item by the wrong width,
+that Vim's `ctrl-b` and `ctrl-i` win over the formatting shortcuts, and that
+nothing folds. M17 closes these in three pull requests: editing tools, then
+folding and the outliner, then completion, paste and drop.
+
+### As built: editing tools
+
+**Formatting shortcuts.** `ctrl-alt-x` (strikethrough), `ctrl-alt-u` (highlight),
+`ctrl-alt-t` (inline code) and `ctrl-alt-n` (link), with `cmd` for `ctrl` on
+macOS. They work like bold and italic: wrap a selection, unwrap one that is
+already wrapped or sits inside the markers, and put a bare cursor between an
+empty pair. Code uses a backtick run longer than any inside the selection, and a
+padding space where the text starts or ends with a backtick. A link wraps the
+selection as `[selection](url)` with `url` selected, and unwraps from inside an
+existing link. Each is also an action for the command palette:
+`visual_md::ToggleStrikethrough`, `ToggleHighlight`, `ToggleCode`, `ToggleLink`.
+
+**List keys.** In live preview, on a plain cursor on a list item:
+- `Tab` nests the item, its children included, under the item before it, by the
+  width of that item's marker: 2 for `- `, 3 for `1. `. An item with no item
+  before it, or a cursor in a quote, keeps the editor's own Tab.
+- `Shift-Tab` takes the item and its children out a level. At the top level it
+  keeps the editor's own behavior.
+- `Backspace` at the start of an item's text removes a task checkbox first, else
+  takes a nested item out a level, else removes the marker and leaves the text.
+- `Alt-Up` and `Alt-Down` swap the item with the one before or after it, children
+  included. Blank lines between items stay where they were.
+- Ordered lists are renumbered in the source after `Enter`, `Tab`, `Shift-Tab`,
+  `Backspace` and a move. A number with more or fewer digits moves the item's
+  other lines by the difference so children stay under the text. Typing in the
+  middle of a number is not renumbered; the display always is.
+- With several cursors, a selection across lines, a read-only editor or a snippet
+  tabstop to go to, the keys are left to the editor.
+
+**Auto-pair.** `[[` already closed to `[[]]` because `[` pairs, which is now a
+test. `=` and `_` surround a selection the way `*` and `~` do, so `==` over a
+selection highlights it.
+
+**Vim.** `ctrl-b` and `ctrl-i` in Vim's visual mode bold and italicize the
+selection when live preview is on, outside macOS (where Vim's bindings use other
+keys). In normal mode with a bare cursor Vim's page-up and jump-forward stay,
+because a toggle there would insert `****`.
+
+**Limitations.**
+- A selection across lines is wrapped as one span, as bold has always been.
+- List keys do not apply inside a quote; a list in a quote keeps the editor's keys.
