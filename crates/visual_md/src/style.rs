@@ -8,7 +8,7 @@
 //! `visual_md.x`, and a key `x.background` as the `background_color` of that
 //! same token. Fonts and sizes are not theme-able.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr as _;
 use std::sync::Arc;
 
@@ -327,6 +327,73 @@ pub(crate) struct ResolvedStyle {
     pub code_block_background: Option<Hsla>,
     pub task_checked_color: Hsla,
     pub callouts: CalloutStyles,
+    /// How each task mark besides `[ ]` and `[x]` is drawn.
+    pub task_marks: BTreeMap<char, TaskMarkLook>,
+}
+
+/// How one task mark besides `[ ]` and `[x]` is drawn: a checkbox with this
+/// symbol inside, in this color.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TaskMarkLook {
+    pub symbol: SharedString,
+    pub color: Hsla,
+}
+
+/// The marks drawn without any setting, which are the common ones of the task
+/// statuses note-taking apps give themes: in progress, cancelled, forwarded,
+/// scheduled, a question, important, a star, a quote and information.
+const DEFAULT_TASK_MARKS: [(char, &str, u32); 9] = [
+    ('/', "◐", 0xd97706),
+    ('-', "–", 0x6b7280),
+    ('>', "→", 0x3b82f6),
+    ('<', "←", 0x8b5cf6),
+    ('?', "?", 0xf59e0b),
+    ('!', "!", 0xef4444),
+    ('*', "★", 0xeab308),
+    ('"', "“", 0x6b7280),
+    ('i', "i", 0x06b6d4),
+];
+
+fn resolve_task_marks(
+    settings: &VisualMdSettingsContent,
+    fallback_color: Hsla,
+) -> BTreeMap<char, TaskMarkLook> {
+    let mut marks: BTreeMap<char, TaskMarkLook> = DEFAULT_TASK_MARKS
+        .iter()
+        .map(|(mark, symbol, color)| {
+            (
+                *mark,
+                TaskMarkLook {
+                    symbol: SharedString::new_static(symbol),
+                    color: rgb(*color).into(),
+                },
+            )
+        })
+        .collect();
+
+    for (key, content) in settings.task_marks.iter().flatten() {
+        let mut characters = key.chars();
+        let (Some(mark), None) = (characters.next(), characters.next()) else {
+            continue;
+        };
+        // `[ ]` and `[x]` are the checkbox itself.
+        if matches!(mark, ' ' | 'x' | 'X') {
+            continue;
+        }
+        let default = marks.get(&mark).cloned();
+        let symbol = content
+            .symbol
+            .as_deref()
+            .filter(|symbol| !symbol.is_empty())
+            .map(|symbol| SharedString::from(symbol.to_string()))
+            .or_else(|| default.as_ref().map(|default| default.symbol.clone()))
+            .unwrap_or_else(|| SharedString::from(mark.to_string()));
+        let color = parse_color(content.color.as_ref())
+            .or(default.map(|default| default.color))
+            .unwrap_or(fallback_color);
+        marks.insert(mark, TaskMarkLook { symbol, color });
+    }
+    marks
 }
 
 impl ResolvedStyle {
@@ -457,6 +524,7 @@ impl ResolvedStyle {
             task_checked_color: color_of(&colors.task_checked, "task.checked")
                 .unwrap_or(theme_colors.icon_accent),
             callouts: CalloutStyles::resolve(settings, &colors, cx),
+            task_marks: resolve_task_marks(settings, theme_colors.icon_accent),
         }
     }
 

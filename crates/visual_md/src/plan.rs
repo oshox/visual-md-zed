@@ -209,6 +209,11 @@ pub struct Plan {
     /// hypothetical one — confirmed the hard way (see `checkbox_placeholder`
     /// in visual_md.rs for the fix this drives on the applying side).
     pub checkboxes: Vec<(Range<usize>, bool)>,
+    /// Byte ranges of task marks other than `[ ]` and `[x]`, such as `[/]`, with
+    /// the character between the brackets. Only marks in
+    /// `PlanExtensions::task_marks` are here, since the item's own bullet is
+    /// hidden for a checkbox that is going to be drawn in its place.
+    pub task_marks: Vec<(Range<usize>, char)>,
     /// Byte ranges of `thematic_break` nodes (`---`, `***`, `___`) that
     /// aren't touched by a selection. Unlike every other category above,
     /// these don't become a fold at all — a full-width `<hr>` needs the
@@ -445,6 +450,9 @@ pub struct PlanExtensions {
     pub rendered_fence_languages: HashSet<String>,
     /// The syntax rules in force, and what extensions have answered for them.
     pub rules: RuleSet,
+    /// The characters of the task marks, besides `[ ]` and `[x]`, that get a
+    /// checkbox of their own.
+    pub task_marks: HashSet<char>,
 }
 
 /// [`plan_viewport_with_tree`], also planning what `extensions` claim.
@@ -746,6 +754,7 @@ fn resolve_extension_candidates(plan: &mut Plan) {
         .cloned()
         .chain(plan.glyph_markers.iter().map(|(range, _)| range.clone()))
         .chain(plan.checkboxes.iter().map(|(range, _)| range.clone()))
+        .chain(plan.task_marks.iter().map(|(range, _)| range.clone()))
         .chain(
             plan.code_fence_borders
                 .iter()
@@ -1006,12 +1015,19 @@ fn plan_list(
         }
         let mut item_cursor = item.walk();
         let children: Vec<Node> = item.children(&mut item_cursor).collect();
-        let has_task_marker = children.iter().any(|child| {
+        let has_standard_task_marker = children.iter().any(|child| {
             matches!(
                 child.kind(),
                 "task_list_marker_checked" | "task_list_marker_unchecked"
             )
         });
+        let custom_task_mark = (!has_standard_task_marker)
+            .then(|| custom_task_mark(&children, text, &extensions.task_marks))
+            .flatten();
+        let has_task_marker = has_standard_task_marker || custom_task_mark.is_some();
+        if let Some(mark) = custom_task_mark {
+            plan.task_marks.push(mark);
+        }
 
         for child in &children {
             match child.kind() {
@@ -1061,6 +1077,33 @@ fn plan_list(
             }
         }
     }
+}
+
+/// The `[c]` that starts a list item whose text begins with one, when `c` is one
+/// of `known`. The grammar only knows `[ ]` and `[x]` as task markers, so any
+/// other mark is plain text at the start of the item's paragraph.
+fn custom_task_mark(
+    children: &[Node],
+    text: &str,
+    known: &HashSet<char>,
+) -> Option<(Range<usize>, char)> {
+    if known.is_empty() {
+        return None;
+    }
+    let paragraph = children.iter().find(|child| child.kind() == "paragraph")?;
+    let start = paragraph.start_byte();
+    let rest = text.get(start..)?;
+    let mut characters = rest.chars();
+    let (Some('['), Some(mark), Some(']')) =
+        (characters.next(), characters.next(), characters.next())
+    else {
+        return None;
+    };
+    let after = characters.next();
+    if !known.contains(&mark) || !after.is_none_or(|after| after == ' ' || after == '\n') {
+        return None;
+    }
+    Some((start..start + mark.len_utf8() + 2, mark))
 }
 
 /// The display number an ordered list should start counting from, taken from
@@ -2401,6 +2444,7 @@ mod tests {
             .iter()
             .cloned()
             .chain(result.checkboxes.iter().map(|(range, _)| range.clone()))
+            .chain(result.task_marks.iter().map(|(range, _)| range.clone()))
             .chain(result.glyph_markers.iter().map(|(range, _)| range.clone()))
             .chain(
                 result
@@ -2517,6 +2561,9 @@ mod tests {
             "**[[bold link]]** and ==[[marked #tag]]== and [x [[inside]]](https://example.com)\n",
             "Code `[[not a link]]` and `#not-a-tag` and ![[embed.png]] inline\n",
             "Aside %%a comment with [[a link]] and #tag%% and a block id ^blk-1\n",
+            "- [/] in progress with [[Note]]\n",
+            "1. [-] cancelled #tag ^id\n",
+            "- [?] a question %%aside%%\n",
             "%% a comment that\nruns over lines %% and `%%code%%` text\n",
             "---\n",
             "```rust\nfn main() {}\n```\n",
@@ -2881,6 +2928,103 @@ mod tests {
             vec![(0..7, Some("rust".to_string())), (21..24, None)],
             "cursor being in the content shouldn't reveal either fence line"
         );
+    }
+
+    fn plan_with_task_marks(text: &str, selections: &[Range<usize>], marks: &str) -> Plan {
+        let tree = parse_blocks(text).expect("the document should parse");
+        let extensions = PlanExtensions {
+            task_marks: marks.chars().collect(),
+            ..Default::default()
+        };
+        plan_viewport_with_extensions(text, &tree, selections, 0..text.len(), &extensions)
+    }
+
+    #[test]
+    fn a_known_task_mark_gets_a_checkbox_and_its_bullet_goes() {
+        let text = "- [/] in progress\n";
+        let result = plan_with_task_marks(text, &[], "/-");
+
+        assert_eq!(result.task_marks, vec![(2..5, '/')]);
+        assert_eq!(
+            result.hidden_markers,
+            vec![0..2],
+            "the bullet and its space"
+        );
+        assert!(result.glyph_markers.is_empty());
+        assert!(result.checkboxes.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_task_mark_is_left_as_text() {
+        let text = "- [~] unknown\n";
+        let result = plan_with_task_marks(text, &[], "/-");
+
+        assert!(result.task_marks.is_empty());
+        assert_eq!(
+            result.glyph_markers,
+            vec![(0..2, GlyphKind::Bullet)],
+            "an ordinary item"
+        );
+        assert!(
+            plan(text, &[]).task_marks.is_empty(),
+            "nothing is known by default"
+        );
+    }
+
+    #[test]
+    fn the_standard_marks_are_still_checkboxes() {
+        let text = "- [ ] open\n- [x] done\n";
+        let result = plan_with_task_marks(text, &[], "/ x");
+
+        assert_eq!(result.checkboxes, vec![(2..5, false), (13..16, true)]);
+        assert!(result.task_marks.is_empty());
+    }
+
+    #[test]
+    fn a_task_mark_needs_a_space_or_the_end_of_the_line_after_it() {
+        assert!(
+            plan_with_task_marks("- [/]text\n", &[], "/")
+                .task_marks
+                .is_empty()
+        );
+        assert_eq!(
+            plan_with_task_marks("- [/]\n", &[], "/").task_marks.len(),
+            1
+        );
+        assert!(
+            plan_with_task_marks("- text [/] more\n", &[], "/")
+                .task_marks
+                .is_empty(),
+            "only at the start of the item"
+        );
+    }
+
+    #[test]
+    fn task_marks_work_in_ordered_lists_and_with_wide_characters() {
+        let ordered = plan_with_task_marks("1. [-] cancelled\n", &[], "-");
+        assert_eq!(ordered.task_marks, vec![(3..6, '-')]);
+        assert_eq!(ordered.hidden_markers, vec![0..3], "the number goes too");
+
+        let wide = plan_with_task_marks("- [★] starred\n", &[], "★");
+        assert_eq!(wide.task_marks, vec![(2..7, '★')]);
+    }
+
+    #[test]
+    fn property_task_marks_never_make_overlapping_folds() {
+        let mut rng = Rng(0x7a5c_0dd5_1234_5678);
+        for _ in 0..200 {
+            let lines = 1 + rng.below(40);
+            let text = random_document(&mut rng, lines);
+            let selections = if rng.below(2) == 0 {
+                vec![]
+            } else {
+                let start = rng.below(text.len() + 1);
+                vec![start..start]
+            };
+            let result = plan_with_task_marks(&text, &selections, "/-?");
+
+            assert_no_overlaps(&fold_inducing_ranges(&result), &text);
+        }
     }
 
     fn wikilink_texts<'a>(result: &'a Plan, text: &'a str) -> Vec<(&'a str, &'a str)> {

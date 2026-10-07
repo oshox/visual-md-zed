@@ -2535,6 +2535,31 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
+    fn markdown_live_preview_task_marks_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Markdown Live Preview Task Marks"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Task Marks",
+                description: "Checkboxes for task marks other than `[ ]` and `[x]`, keyed by the character between the brackets, each with its own symbol and color.",
+                field: Box::new(
+                    SettingField {
+                        organization_override: None,
+                        json_path: Some("visual_md.task_marks"),
+                        pick: |settings_content| {
+                            visual_md_settings(settings_content)?.task_marks.as_ref()
+                        },
+                        write: |settings_content, value, _| {
+                            visual_md_settings_mut(settings_content).task_marks = value;
+                        },
+                    }
+                    .unimplemented(),
+                ),
+                metadata: allow_unset(),
+                files: USER | PROJECT,
+            }),
+        ]
+    }
+
     fn markdown_live_preview_extensions_section() -> [SettingsPageItem; 2] {
         [
             SettingsPageItem::SectionHeader("Markdown Live Preview Extensions"),
@@ -4035,6 +4060,7 @@ fn editor_page() -> SettingsPage {
         markdown_live_preview_headings_section(),
         markdown_live_preview_colors_section(),
         markdown_live_preview_callouts_section(),
+        markdown_live_preview_task_marks_section(),
         markdown_live_preview_extensions_section(),
         multibuffer_section(),
         scrolling_section(),

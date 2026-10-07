@@ -951,6 +951,12 @@ pub struct VisualMdSettingsContent {
     /// Custom callout types, keyed by the type name written in `> [!name]`.
     /// This can also restyle the built-in types and their aliases.
     pub callouts: Option<HashMap<String, VisualMdCalloutContent>>,
+    /// Task list marks beyond `[ ]` and `[x]`, keyed by the one character
+    /// between the brackets, for example
+    /// `"/": { "symbol": "◐", "color": "#d97706" }`. The marks `/ - > < ? ! * "`
+    /// and `i` have a look of their own by default, which an entry here
+    /// replaces; any other character listed here gets a checkbox as well.
+    pub task_marks: Option<HashMap<String, VisualMdTaskMarkContent>>,
     /// Settings for Zed MD extensions, keyed by extension id. An extension reads
     /// only its own entry, whose shape it defines.
     ///
@@ -1076,6 +1082,16 @@ pub struct VisualMdColorsContent {
     /// written in `> [!name]`. The built-in names are `note`, `tip`,
     /// `warning` and `danger`; they also apply to their aliases.
     pub callout: Option<HashMap<String, VisualMdCalloutColorsContent>>,
+}
+
+/// How a task list mark other than `[ ]` and `[x]` is drawn.
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug, JsonSchema, MergeFrom)]
+pub struct VisualMdTaskMarkContent {
+    /// The symbol drawn in the checkbox. Defaults to the mark's own character.
+    pub symbol: Option<String>,
+    /// The color of the checkbox and its symbol.
+    pub color: Option<ThemeColor>,
 }
 
 /// The colors of one callout type.
