@@ -25,7 +25,7 @@ purpose even though the app is branded Zed MD.
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 | M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
 | M17 | Editing tools and the outliner | Built. Nothing that needs a key or the mouse was run in the app, see "M17" |
-| M18 | Embeds, hover previews, footnotes and an editable properties panel | In progress: embeds, hover previews and footnotes built, see "M18" |
+| M18 | Embeds, hover previews, footnotes and an editable properties panel | Built. Nothing that needs a pointer or a key was run in the app, see "M18" |
 | M19 | Math (after a renderer spike), an HTML subset, callout and table polish | Planned |
 | M20 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
@@ -329,7 +329,7 @@ work, "API" needs new extension API.
 | Embeds: `![[Note]]`, `#Heading`, sizes, audio, video, PDF | only a line that is one image | Core, **M18** (audio, video and PDF as a chip that opens the file) |
 | Hover page preview, footnote hover | none | Core, **M18** (the popover is the editor's hover box, fed by a new `Addon::hover_at`) |
 | Footnotes | none | Core, **M18** |
-| YAML properties panel | none | Core, M18 |
+| YAML properties panel | none | Core, **M18** (editable; mouse only) |
 | Math, embedded HTML | none | Core, M19 |
 | Callouts: whole-row fold click, right-click type menu, per-type accent bar | chevron click only | Core, M19 |
 | Tables: row lines, per-cell raw reveal | cells always raw | Core, M19 |
@@ -730,3 +730,58 @@ first of two definitions of a label counts.
   mouse path in the tests, with the pointer placed by pixel position. The wikilink
   preview was tested through the addon, and the popover through a stand-in addon
   in the editor's tests. None of it was run in the app.
+
+### As built: the properties panel
+
+**What it shows.** The YAML front matter of a note is read with `tree-sitter-yaml`
+in `properties.rs`, and while no selection touches it, `properties_panel.rs`
+replaces it with a block of rows, one for each property: its name, and a control
+for its value. The value is one of:
+- **Text**: shown as text. Click to type another; Enter or a click elsewhere takes
+  it, Esc drops it.
+- **Number**, **date** (`2026-10-08`) and **date and time** (`2026-10-08T10:30`):
+  the same, but what is typed has to be one, or the input stays open with a red
+  border and a line saying why. A property does not change its type by a typing
+  mistake.
+- **Checkbox** for `true` and `false`: a click flips it.
+- **List**, written `[a, b]` or as lines of `- a`: a chip for each item with an x
+  to remove it, and a `+` that opens an input for another. `tags`, `aliases` and
+  `cssclasses` are lists even while they have no value.
+- **Anything else**: a nested mapping, a block scalar (`|`), an anchor or alias, a
+  tag, a list of lists, a scalar over several lines. It is shown as its first line
+  and not edited here.
+
+Clicking a property's name renames it, the x at the end of its row removes it, and
+**+ Add property** asks for a name, adds a `name:` line at the end and then asks
+for its value. **Edit as YAML** puts the cursor in the front matter, which shows
+the source.
+
+**How it edits.** The YAML is never written out again from a model of it. Each
+change replaces the bytes of the thing that changed, so comments, quoting, order,
+indentation and line endings (CRLF too) of everything else stay as written. A value
+is written plain unless it would read back as something else (`true`, a number,
+`a: b`, a leading `#`, `-` or `[`), when it is double-quoted. After every edit the
+result is parsed again, and an edit that would not read back as exactly what was
+asked for is refused, as are control characters. A change is one edit of the
+buffer, so one undo step.
+
+**When it shows.** Like other blocks, the panel is gone while a selection touches
+the front matter, so the source can be edited, and comes back when the cursor
+leaves. It stays source for TOML (`+++`), for front matter that is not a mapping
+of plain or quoted keys, that does not parse, or that is over 64 KB. Lines in the
+front matter are no longer taken for embeds.
+
+**Limitations.**
+- A note opens with its cursor at the start, which touches the front matter, so a
+  note shows its YAML until the cursor moves into the text below. Putting the
+  cursor below the front matter on open was left out: it changes where the user's
+  cursor is.
+- The panel is operated with the mouse. There is no tab order or keyboard
+  navigation between its controls, and no date picker or type menu.
+- A property cannot be moved, and a list cannot be made from a text. Renaming a
+  property does not change other notes, and a duplicated key is two rows.
+- A `#` comment at the start of a line after an entry is not part of the entry, so
+  removing the entry leaves it.
+- Nothing about the panel was run in the app. The tests click its controls by
+  position through the window and type into the input that opens, but the layout
+  and look were not seen.
