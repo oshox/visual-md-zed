@@ -20102,6 +20102,7 @@ dependencies = [
  "language",
  "log",
  "markdown",
+ "menu",
  "multi_buffer",
  "parking_lot",
  "project",
@@ -20120,6 +20121,7 @@ dependencies = [
  "toml 0.8.23",
  "tree-sitter",
  "tree-sitter-md",
+ "tree-sitter-yaml",
  "util",
  "workspace",
 ]
