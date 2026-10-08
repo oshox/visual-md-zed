@@ -251,12 +251,13 @@ pub struct Plan {
     /// collapsed callout's `body_range` even while its title happens to be
     /// showing raw (touched) text.
     pub callouts: Vec<CalloutInfo>,
-    /// Lines that hold nothing but one image (`![alt](path)` or the
-    /// Obsidian-style `![[path]]` embed) and aren't touched by a selection.
-    /// Rendered as a block that replaces the whole line, for the same reason
-    /// `horizontal_rules` are: an image needs the editor's real width, which
-    /// a fold can't stretch to. See `apply_images` in visual_md.rs.
-    pub images: Vec<ImageInfo>,
+    /// Lines that hold nothing but one embed (an image `![alt](path)`, or the
+    /// Obsidian-style `![[name]]` of a note, image, audio, video or PDF file)
+    /// and aren't touched by a selection. Rendered as a block that replaces the
+    /// whole line, for the same reason `horizontal_rules` are: an image or a
+    /// note needs the editor's real width, which a fold can't stretch to. See
+    /// `embeds.rs`.
+    pub embeds: Vec<EmbedInfo>,
     /// Fenced code blocks an extension renders in place of the block, which a
     /// selection does not touch. Such a block gets neither borders nor
     /// `code_fence_content`: the extension's output stands in for all of it.
@@ -303,18 +304,70 @@ pub struct RenderedFence {
     pub content_hash: u64,
 }
 
-/// A standalone image line, see `Plan::images`.
+/// What a standalone embed line points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmbedKind {
+    Image,
+    /// A note, to be shown in place. A `![[name]]` whose name has an extension
+    /// that is not one of the kinds below is also planned as a note, since a
+    /// dot is as likely to be part of a note's name (`Notes 1.2`); what the
+    /// name resolves to decides.
+    Note,
+    Audio,
+    Video,
+    Pdf,
+    /// A file of another kind, named by a Markdown link.
+    Other,
+}
+
+impl EmbedKind {
+    /// The kind of file with this extension, for the extensions that have one.
+    pub fn for_extension(extension: &str) -> Option<Self> {
+        let extension = extension.to_ascii_lowercase();
+        let kind = match extension.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "avif" => Self::Image,
+            "md" | "markdown" => Self::Note,
+            "mp3" | "wav" | "m4a" | "ogg" | "oga" | "flac" | "opus" | "3gp" => Self::Audio,
+            "mp4" | "webm" | "ogv" | "mov" | "mkv" => Self::Video,
+            "pdf" => Self::Pdf,
+            _ => return None,
+        };
+        Some(kind)
+    }
+}
+
+/// The part of a note that an embed or a link names after its `#`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Subpath {
+    /// A heading, as written. With several `#` it is everything after the first.
+    Heading(String),
+    /// A block id, without the `^`.
+    Block(String),
+}
+
+/// The size an embed asks for with `|300` or `|300x200`, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EmbedSize {
+    pub width: u32,
+    pub height: Option<u32>,
+}
+
+/// A standalone embed line, see `Plan::embeds`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageInfo {
+pub struct EmbedInfo {
     /// The line's byte range with leading indentation and the newline
     /// excluded.
     pub range: Range<usize>,
-    /// The raw path or URL as written. For an embed this has any `|size` or
-    /// `#heading` suffix already stripped.
+    /// The path, URL or note name as written, without any `|size` and, for a
+    /// `![[name]]`, without any `#heading` or `#^block`. Empty for `![[#Heading]]`,
+    /// which names a part of the note being edited.
     pub target: String,
     /// Whether this came from a `![[name]]` embed, which Obsidian resolves by
     /// name anywhere in the vault rather than strictly relative to the note.
-    pub is_embed: bool,
+    pub is_wikilink: bool,
+    pub kind: EmbedKind,
+    pub subpath: Option<Subpath>,
+    pub size: Option<EmbedSize>,
 }
 
 /// A column's alignment, from its `pipe_table_delimiter_cell`
@@ -503,7 +556,7 @@ pub fn plan_viewport_with_extensions(
 
     // Standalone images are planned before the extension candidates are
     // resolved, since their rows are among the ranges extensions must stay off.
-    plan_images(text, selections, &visible_range, &mut plan);
+    plan_embeds(text, selections, &visible_range, &mut plan);
     resolve_extension_candidates(&mut plan);
 
     // Nested constructs (`***bold italic***`, and the grammar's own
@@ -528,11 +581,11 @@ pub fn plan_viewport_with_extensions(
     plan
 }
 
-/// Finds lines consisting solely of an image. Done as a line scan rather than
+/// Finds lines consisting solely of an embed. Done as a line scan rather than
 /// through the tree: `![[embed]]` isn't markdown grammar at all, and a
-/// standalone image line is the only shape that can sensibly be swapped for a
+/// standalone embed line is the only shape that can sensibly be swapped for a
 /// block. Fenced code is skipped by tracking the fence markers directly.
-fn plan_images(
+fn plan_embeds(
     text: &str,
     selections: &[Range<usize>],
     visible_range: &Range<usize>,
@@ -582,33 +635,58 @@ fn plan_images(
         {
             continue;
         }
-        if let Some((target, is_embed)) = parse_image_line(&text[range.clone()]) {
-            plan.images.push(ImageInfo {
+        if let Some(embed) = parse_embed_line(&text[range.clone()]) {
+            plan.embeds.push(EmbedInfo {
                 range,
-                target,
-                is_embed,
+                target: embed.target,
+                is_wikilink: embed.is_wikilink,
+                kind: embed.kind,
+                subpath: embed.subpath,
+                size: embed.size,
             });
         }
     }
 }
 
-/// `line` must already be trimmed. Returns the image target and whether it
-/// was a `![[..]]` embed.
-fn parse_image_line(line: &str) -> Option<(String, bool)> {
-    if let Some(inner) = line
-        .strip_prefix("![[")
-        .and_then(|rest| rest.strip_suffix("]]"))
-    {
-        if inner.contains("[[") || inner.contains("]]") {
+/// What `parse_embed_line` found on a line, before it has a range.
+struct ParsedEmbed {
+    target: String,
+    is_wikilink: bool,
+    kind: EmbedKind,
+    subpath: Option<Subpath>,
+    size: Option<EmbedSize>,
+}
+
+/// `line` must already be trimmed.
+fn parse_embed_line(line: &str) -> Option<ParsedEmbed> {
+    if line.starts_with("![[") {
+        let link = inline_scan::find_wikilinks(line, 0, &[])
+            .into_iter()
+            .next()
+            .filter(|link| link.is_embed && link.range == (0..line.len()))?;
+        let (name, subpath) = split_subpath(&link.target);
+        if name.is_empty() && subpath.is_none() {
             return None;
         }
-        let name = inner.split(['|', '#']).next()?.trim();
-        return (!name.is_empty()).then(|| (name.to_string(), true));
+        // A name with an extension that is no kind of its own is still taken for a
+        // note, since a dot is as likely to be part of its name.
+        let kind = file_extension(name)
+            .and_then(|extension| EmbedKind::for_extension(&extension))
+            .unwrap_or(EmbedKind::Note);
+        let size = link.alias.as_deref().and_then(parse_size);
+        return Some(ParsedEmbed {
+            target: name.to_string(),
+            is_wikilink: true,
+            kind,
+            subpath,
+            size,
+        });
     }
 
     let rest = line.strip_prefix("![")?;
     let alt_end = rest.find("](")?;
-    if rest[..alt_end].contains(['[', ']']) {
+    let alt = &rest[..alt_end];
+    if alt.contains(['[', ']']) {
         return None;
     }
     let destination = rest[alt_end + 2..].strip_suffix(')')?;
@@ -620,7 +698,79 @@ fn parse_image_line(line: &str) -> Option<(String, bool)> {
         Some(bracketed) => bracketed.split('>').next()?,
         None => destination.split_whitespace().next()?,
     };
-    (!destination.is_empty()).then(|| (destination.to_string(), false))
+    if destination.is_empty() {
+        return None;
+    }
+    let is_url = destination.starts_with("http://") || destination.starts_with("https://");
+    let kind = match file_extension(destination)
+        .and_then(|extension| EmbedKind::for_extension(&extension))
+    {
+        Some(kind) => kind,
+        // An address with no known extension may still serve an image.
+        None if is_url => EmbedKind::Image,
+        None if file_extension(destination).is_none() => EmbedKind::Image,
+        None => EmbedKind::Other,
+    };
+    let size = alt.rsplit_once('|').and_then(|(_, size)| parse_size(size));
+    Some(ParsedEmbed {
+        target: destination.to_string(),
+        is_wikilink: false,
+        kind,
+        subpath: None,
+        size,
+    })
+}
+
+/// A wikilink target split into the note's name and the part of it named
+/// after the first `#`.
+pub(crate) fn split_subpath(target: &str) -> (&str, Option<Subpath>) {
+    let Some((name, rest)) = target.split_once('#') else {
+        return (target.trim(), None);
+    };
+    let rest = rest.trim();
+    let subpath = match rest.strip_prefix('^') {
+        Some(id) if !id.is_empty() => Some(Subpath::Block(id.trim().to_string())),
+        _ if rest.is_empty() => None,
+        _ => Some(Subpath::Heading(rest.to_string())),
+    };
+    (name.trim(), subpath)
+}
+
+/// The extension of the file a path or address names, lowercased: letters and
+/// digits after the last dot of its last component, without a query or fragment.
+pub(crate) fn file_extension(target: &str) -> Option<String> {
+    let path = target.split(['?', '#']).next().unwrap_or(target);
+    let name = path.rsplit(['/', '\\']).next()?;
+    let (stem, extension) = name.rsplit_once('.')?;
+    let is_extension = !stem.is_empty()
+        && !extension.is_empty()
+        && extension.len() <= 5
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric());
+    is_extension.then(|| extension.to_ascii_lowercase())
+}
+
+/// `300` or `300x200`, or the last part after a `|` of text that has one.
+fn parse_size(text: &str) -> Option<EmbedSize> {
+    let text = text.rsplit('|').next()?.trim();
+    let (width, height) = match text.split_once(['x', 'X']) {
+        Some((width, height)) => (width, Some(height)),
+        None => (text, None),
+    };
+    let valid = |number: &str| {
+        number
+            .parse::<u32>()
+            .ok()
+            .filter(|number| (1..=10_000).contains(number))
+    };
+    Some(EmbedSize {
+        width: valid(width)?,
+        height: match height {
+            Some(height) => Some(valid(height)?),
+            None => None,
+        },
+    })
 }
 
 /// Sorts and merges overlapping/touching ranges into a minimal disjoint set.
@@ -776,7 +926,7 @@ fn resolve_extension_candidates(plan: &mut Plan) {
                 .iter()
                 .map(|(range, _)| range.clone()),
         )
-        .chain(plan.images.iter().map(|image| image.range.clone()))
+        .chain(plan.embeds.iter().map(|embed| embed.range.clone()))
         .chain(plan.rendered_fences.iter().map(|fence| fence.range.clone()))
         .collect();
     for callout in &plan.callouts {
@@ -3685,10 +3835,10 @@ mod tests {
                 for (border, _) in &result.code_fence_borders {
                     assert!(border.end <= fence.range.start || border.start >= fence.range.end);
                 }
-                for image in &result.images {
+                for embed in &result.embeds {
                     assert!(
-                        image.range.end <= fence.range.start
-                            || image.range.start >= fence.range.end
+                        embed.range.end <= fence.range.start
+                            || embed.range.start >= fence.range.end
                     );
                 }
             }
@@ -3830,11 +3980,14 @@ mod tests {
         let text = "before\n![alt](pics/a.png)\nafter\n";
         let result = plan(text, &[]);
         assert_eq!(
-            result.images,
-            vec![ImageInfo {
+            result.embeds,
+            vec![EmbedInfo {
                 range: 7..25,
                 target: "pics/a.png".to_string(),
-                is_embed: false,
+                is_wikilink: false,
+                kind: EmbedKind::Image,
+                subpath: None,
+                size: None,
             }]
         );
         assert_eq!(&text[7..25], "![alt](pics/a.png)");
@@ -3843,49 +3996,136 @@ mod tests {
     #[test]
     fn image_title_and_angle_brackets_are_stripped_from_the_target() {
         let titled = plan("![a](x.png \"a title\")\n", &[]);
-        assert_eq!(titled.images[0].target, "x.png");
+        assert_eq!(titled.embeds[0].target, "x.png");
         let bracketed = plan("![a](<my pic.png>)\n", &[]);
-        assert_eq!(bracketed.images[0].target, "my pic.png");
+        assert_eq!(bracketed.embeds[0].target, "my pic.png");
     }
 
     #[test]
-    fn embed_strips_size_and_heading_suffixes() {
+    fn an_embed_keeps_its_name_and_reads_its_size_and_subpath() {
         let sized = plan("![[cat.png|300]]\n", &[]);
-        assert_eq!(sized.images[0].target, "cat.png");
-        assert!(sized.images[0].is_embed);
-        let heading = plan("![[cat.png#frag]]\n", &[]);
-        assert_eq!(heading.images[0].target, "cat.png");
+        assert_eq!(sized.embeds[0].target, "cat.png");
+        assert!(sized.embeds[0].is_wikilink);
+        assert_eq!(
+            sized.embeds[0].size,
+            Some(EmbedSize {
+                width: 300,
+                height: None
+            })
+        );
+
+        let both = plan("![[cat.png|alt words|300x200]]\n", &[]);
+        assert_eq!(
+            both.embeds[0].size,
+            Some(EmbedSize {
+                width: 300,
+                height: Some(200)
+            })
+        );
+
+        let heading = plan("![[Note#Some heading]]\n", &[]);
+        assert_eq!(heading.embeds[0].target, "Note");
+        assert_eq!(
+            heading.embeds[0].subpath,
+            Some(Subpath::Heading("Some heading".to_string()))
+        );
+
+        let block = plan("![[Note#^abc-1]]\n", &[]);
+        assert_eq!(
+            block.embeds[0].subpath,
+            Some(Subpath::Block("abc-1".to_string()))
+        );
+
+        let same_note = plan("![[#Part]]\n", &[]);
+        assert_eq!(same_note.embeds[0].target, "");
+        assert_eq!(same_note.embeds[0].kind, EmbedKind::Note);
+    }
+
+    #[test]
+    fn a_size_in_the_alt_text_of_a_markdown_image_is_read() {
+        let sized = plan("![a picture|250](x.png)\n", &[]);
+        assert_eq!(
+            sized.embeds[0].size,
+            Some(EmbedSize {
+                width: 250,
+                height: None
+            })
+        );
+        assert_eq!(plan("![a|wide](x.png)\n", &[]).embeds[0].size, None);
+        assert_eq!(plan("![a|0](x.png)\n", &[]).embeds[0].size, None);
+        assert_eq!(plan("![a|99999](x.png)\n", &[]).embeds[0].size, None);
+    }
+
+    #[test]
+    fn an_embed_is_a_note_an_image_or_a_file_by_its_extension() {
+        let kind = |text: &str| plan(text, &[]).embeds[0].kind;
+        assert_eq!(kind("![[Note]]\n"), EmbedKind::Note);
+        assert_eq!(kind("![[Note.md]]\n"), EmbedKind::Note);
+        assert_eq!(kind("![[Notes 1.2]]\n"), EmbedKind::Note);
+        assert_eq!(kind("![[cat.PNG]]\n"), EmbedKind::Image);
+        assert_eq!(kind("![[song.mp3]]\n"), EmbedKind::Audio);
+        assert_eq!(kind("![[clip.mp4]]\n"), EmbedKind::Video);
+        assert_eq!(kind("![[paper.pdf]]\n"), EmbedKind::Pdf);
+        assert_eq!(kind("![](x.png)\n"), EmbedKind::Image);
+        assert_eq!(kind("![](x.pdf)\n"), EmbedKind::Pdf);
+        assert_eq!(kind("![](other.md)\n"), EmbedKind::Note);
+        assert_eq!(kind("![](data.csv)\n"), EmbedKind::Other);
+        assert_eq!(
+            kind("![](https://example.com/photo?id=7)\n"),
+            EmbedKind::Image
+        );
+        assert_eq!(
+            kind("![](https://example.com/photo.php)\n"),
+            EmbedKind::Image
+        );
+        assert_eq!(kind("![](no-extension)\n"), EmbedKind::Image);
+    }
+
+    #[test]
+    fn file_extensions_ignore_queries_and_odd_names() {
+        assert_eq!(file_extension("a/b/c.PNG").as_deref(), Some("png"));
+        assert_eq!(
+            file_extension("https://x.org/a.jpg?w=3#top").as_deref(),
+            Some("jpg")
+        );
+        assert_eq!(file_extension(".hidden"), None);
+        assert_eq!(file_extension("name."), None);
+        assert_eq!(file_extension("dir.d/file"), None);
+        assert_eq!(file_extension("v1.2 notes"), None);
+        assert_eq!(file_extension("archive.tar.gz").as_deref(), Some("gz"));
     }
 
     #[test]
     fn image_mixed_with_text_is_left_raw() {
-        assert!(plan("see ![a](x.png) here\n", &[]).images.is_empty());
-        assert!(plan("![a](x.png) trailing\n", &[]).images.is_empty());
-        assert!(plan("![a]()\n", &[]).images.is_empty());
-        assert!(plan("![[]]\n", &[]).images.is_empty());
+        assert!(plan("see ![a](x.png) here\n", &[]).embeds.is_empty());
+        assert!(plan("![a](x.png) trailing\n", &[]).embeds.is_empty());
+        assert!(plan("![a]()\n", &[]).embeds.is_empty());
+        assert!(plan("![[]]\n", &[]).embeds.is_empty());
+        assert!(plan("see ![[Note]] here\n", &[]).embeds.is_empty());
+        assert!(plan("![[A]] ![[B]]\n", &[]).embeds.is_empty());
     }
 
     #[test]
     fn touched_image_line_is_excluded() {
         let text = "![a](x.png)\n";
-        assert!(plan(text, &[3..3]).images.is_empty());
+        assert!(plan(text, &[3..3]).embeds.is_empty());
     }
 
     #[test]
     fn images_inside_fenced_or_indented_code_are_ignored() {
         let fenced = "```\n![a](x.png)\n```\n![b](y.png)\n";
         let result = plan(fenced, &[]);
-        assert_eq!(result.images.len(), 1);
-        assert_eq!(result.images[0].target, "y.png");
-        assert!(plan("    ![a](x.png)\n", &[]).images.is_empty());
+        assert_eq!(result.embeds.len(), 1);
+        assert_eq!(result.embeds[0].target, "y.png");
+        assert!(plan("    ![a](x.png)\n", &[]).embeds.is_empty());
     }
 
     #[test]
     fn images_outside_the_viewport_are_pruned() {
         let text = "![a](x.png)\n\n\n![b](y.png)\n";
         let result = plan_viewport(text, &[], 0..12);
-        assert_eq!(result.images.len(), 1);
-        assert_eq!(result.images[0].target, "x.png");
+        assert_eq!(result.embeds.len(), 1);
+        assert_eq!(result.embeds[0].target, "x.png");
     }
 
     mod extension_rules {

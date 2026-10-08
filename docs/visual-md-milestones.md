@@ -25,8 +25,9 @@ purpose even though the app is branded Zed MD.
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 | M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
 | M17 | Editing tools and the outliner | Built. Nothing that needs a key or the mouse was run in the app, see "M17" |
-| M18 | Block syntax: properties panel, footnotes, math, embeds, hover previews | Planned, see the feature audit |
-| M19 | Extension surface for knowledge-base features | Planned, see the feature audit |
+| M18 | Embeds, hover previews, footnotes and an editable properties panel | In progress: embeds built, see "M18" |
+| M19 | Math (after a renderer spike), an HTML subset, callout and table polish | Planned |
+| M20 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
 ## M13: On/off switch at global and project level
 
@@ -325,11 +326,12 @@ work, "API" needs new extension API.
 | `^block-id` dimmed | none | Core, **M16** |
 | Custom task marks `[/]` `[-]` | only `[ ]` and `[x]` | Core, **M16** |
 | Highlight and inline code chips | no background | Core, **M16** |
-| Embeds: `![[Note]]`, `#Heading`, sizes, audio, video, PDF | only a line that is one image | Core, M18 |
+| Embeds: `![[Note]]`, `#Heading`, sizes, audio, video, PDF | only a line that is one image | Core, **M18** (audio, video and PDF as a chip that opens the file) |
 | Hover page preview, footnote hover | none | Core, M18 |
-| Footnotes, math, YAML properties panel, embedded HTML | none | Core, M18 |
-| Callouts: whole-row fold click, right-click type menu, per-type accent bar | chevron click only | Core, M18 |
-| Tables: row lines, per-cell raw reveal | cells always raw | Core, M18 |
+| Footnotes, YAML properties panel | none | Core, M18 |
+| Math, embedded HTML | none | Core, M19 |
+| Callouts: whole-row fold click, right-click type menu, per-type accent bar | chevron click only | Core, M19 |
+| Tables: row lines, per-cell raw reveal | cells always raw | Core, M19 |
 | Folding of headings and list items, saved per file | fold gutter off | Core, **M17** (not saved per file) |
 | Built-in `[[`, `#`, `![[` autocomplete | extension-supplied names only | Core, **M17** |
 | Strike, highlight, code, link shortcuts | bold and italic only | Core, **M17** |
@@ -353,15 +355,15 @@ inside a `[[` completion request, and cannot read other files, open or create a
 file, hear about a rename, show a hover, draw inline or own a panel. Backlinks,
 query results and a graph need all of that, each behind a declared capability:
 listing and reading project files, opening and creating a file, file events,
-hover content, inline widgets and some panel surface. That is M19.
+hover content, inline widgets and some panel surface. That is M20.
 
 **Roadmap.** M16 below. **M17:** editing tools and the outliner (folding with
 saved state, subtree indent, outdent and move, Tab, Backspace and renumbering,
 formatting shortcuts, auto-pair, paste and drop, built-in autocomplete from a
-project note index, the Vim conflict, reference links). **M18:** block syntax
-(frontmatter and `key::` properties panel, footnotes, math after a renderer
-spike, an HTML subset, note and heading embeds with sizes, hover page preview,
-callout and table polish). **M19:** the extension surface for KB features, with
+project note index, the Vim conflict, reference links). **M18:** embeds of notes,
+headings, blocks and files, page and footnote hover previews, footnotes, and an
+editable properties panel. **M19:** math after a renderer spike, an HTML subset,
+and callout and table polish. **M20:** the extension surface for KB features, with
 a sample backlinks extension as the proof.
 
 ## M16: Block layout fixes, native links, tags and cursor-line syntax
@@ -613,3 +615,60 @@ it. The menus, the paste and the drop are covered by tests that run the same
 paths: typed characters one at a time through the editor, `Paste` dispatched as
 an action with an image on the clipboard, and `handle_drop` called the way a pane
 calls it on a workspace's active item.
+
+## M18: Embeds, hover previews, footnotes and properties
+
+**Today:** the audit scheduled "block syntax" as M18. That was too much for one
+milestone, so it is split: M18 is what shows other content in the note (embeds,
+hover previews, footnotes) and the properties panel; math, the HTML subset, and
+callout and table polish are M19. Three pull requests, in the order embeds, hover
+previews with footnotes, properties.
+
+### As built: embeds
+
+**What an embed line is.** A line that holds only `![alt](path)` or `![[name]]`
+and that no selection touches becomes a block, as images did. `plan.rs` now
+classifies it: an image, a note, audio, video, PDF or another file, by extension
+(`EmbedKind::for_extension`). A `![[name]]` whose extension is no kind of its own
+is taken for a note, since a dot is as likely part of a note's name (`Notes 1.2`);
+a Markdown link to a file of another kind is a file. `![[Note#Heading]]` and
+`![[Note#^id]]` carry a subpath, and `|300` or `|300x200` (also in the alt text
+of `![alt|300](img.png)`) a size.
+
+**Images.** The block is no longer ten rows tall. The editor measures every block
+as it draws it (`element.rs`, `resize_blocks`), and the old fixed `h(...)` was
+what stopped that. The row count is now only the first guess. An image uses its
+size when it has one and is otherwise as large as the editor is wide, up to 30
+rows. While it loads there is a two-row placeholder, so the block does not
+collapse.
+
+**Notes.** `![[Note]]` shows the note, without its front matter, as rendered
+Markdown in a bordered block with its name and an Open button. `#Heading` shows
+that heading and everything under it to the next heading of the same or a higher
+level; `#^id` shows the paragraph, list item (with what is nested in it), quote,
+table or code block that the id ends. `![[#Heading]]` names a part of the note
+being edited. The note is read through the project, so an unsaved edit in another
+pane is shown, and an edit to it updates every block showing it.
+`![[x]]` and `[[x]]` inside the embedded text are turned into plain text, and a
+nested embed is shown by name and not opened, so a note that embeds itself, or two
+that embed each other, cannot loop. `%%comments%%` and the `^id` that ends a line
+are dropped from what is shown. The text is cut at 100 KB and the block at 24
+rows, with a line saying so. Notes are cached, 64 at a time, by (file, subpath);
+two embeds of the same part share one load. A note that cannot be found says so
+in a box, as does a heading or block that is not in it.
+
+**Files.** Audio, video, PDF and any other file are a one-row chip with the file's
+name and an Open button, which opens the file with the system's default app. There
+is no player or PDF viewer in Zed. A file that does not exist says
+"File not found: name". Clicking anywhere else on a note embed or a chip puts the
+cursor in the line, which shows the source.
+
+**Limitations.**
+- Only visible blocks are measured, so below the screen a block has its first
+  guess for a height and the text shifts when it scrolls into view.
+- An embedded note does not show its own images unless they are relative to it or
+  on the web, and `![[image.png]]` inside it is a name, not a picture.
+- A heading is found by its text, without regard to case, and the first one with
+  that text wins.
+- The Open button and a click on the block were not run in the app; the tests
+  call the same functions the click does.

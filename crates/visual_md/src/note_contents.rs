@@ -7,6 +7,7 @@
 //! and none larger than [`MAX_FILE_BYTES`], and are kept for [`LIFETIME`].
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use project::Project;
 
 use crate::inline_scan;
 use crate::outline;
-use crate::plan::parse_blocks;
+use crate::plan::{Subpath, parse_blocks};
 
 /// The most Markdown files read to find the tags of a project.
 pub const MAX_FILES: usize = 2_000;
@@ -77,6 +78,187 @@ pub fn block_ids(text: &str) -> Vec<BlockId> {
             })
         })
         .collect()
+}
+
+/// The text of a note after its front matter.
+fn without_front_matter<'a>(text: &'a str, tree: &tree_sitter::Tree) -> &'a str {
+    let mut cursor = tree.root_node().walk();
+    let end = tree
+        .root_node()
+        .children(&mut cursor)
+        .find(|child| matches!(child.kind(), "minus_metadata" | "plus_metadata"))
+        .map_or(0, |front_matter| front_matter.end_byte());
+    text.get(end..).unwrap_or(text)
+}
+
+/// What `![[Note#...]]` and a preview of `[[Note#...]]` show: the whole note
+/// after its front matter, a heading and everything under it up to the next
+/// heading of the same or a higher level, or the block a `^id` ends (a list item
+/// with its children, or a paragraph, quote, table or code block) without the id.
+/// `None` when the heading or block is not there.
+pub fn section(text: &str, subpath: Option<&Subpath>) -> Option<String> {
+    let tree = parse_blocks(text)?;
+    match subpath {
+        None => Some(without_front_matter(text, &tree).trim().to_string()),
+        Some(Subpath::Heading(name)) => {
+            let wanted = name.rsplit('#').next().unwrap_or(name).trim();
+            let headings = outline::outline(text, &tree).headings;
+            let (index, heading) = headings
+                .iter()
+                .enumerate()
+                .find(|(_, heading)| heading.text.trim().eq_ignore_ascii_case(wanted))?;
+            let end = headings[index + 1..]
+                .iter()
+                .find(|next| next.level <= heading.level)
+                .map_or(text.len(), |next| next.range.start);
+            text.get(heading.range.start..end)
+                .map(|section| section.trim_end().to_string())
+        }
+        Some(Subpath::Block(id)) => {
+            let marker = format!("^{id}");
+            let id_range = inline_scan::find_block_ids(text, 0, &[])
+                .into_iter()
+                .find(|range| text.get(range.clone()) == Some(marker.as_str()))?;
+            let mut node = tree
+                .root_node()
+                .descendant_for_byte_range(id_range.start, id_range.start)?;
+            loop {
+                let is_block = matches!(
+                    node.kind(),
+                    "list_item"
+                        | "paragraph"
+                        | "block_quote"
+                        | "pipe_table"
+                        | "fenced_code_block"
+                        | "atx_heading"
+                        | "setext_heading"
+                );
+                if is_block {
+                    // An id on a list item's first line names the item and what is nested in it.
+                    if node.kind() == "paragraph"
+                        && let Some(parent) = node.parent().filter(|p| p.kind() == "list_item")
+                    {
+                        node = parent;
+                    }
+                    break;
+                }
+                node = node.parent()?;
+            }
+            let block = text.get(node.byte_range())?;
+            let relative = id_range.start.checked_sub(node.start_byte())?;
+            let before = block.get(..relative)?.trim_end();
+            let after = block.get(relative + marker.len()..)?;
+            Some(format!("{before}{after}").trim().to_string())
+        }
+    }
+}
+
+/// `text` as the Markdown to show in a preview or an embed: the markup of
+/// note-taking apps that the Markdown renderer knows nothing about is made
+/// readable. A `[[Note|alias]]` becomes its visible text, a nested `![[embed]]`
+/// is shown by name rather than expanded, `%%comments%%` and the `^id` that ends
+/// a line are dropped. Code is left alone. Cut at `max_bytes`, on a line.
+pub fn preview_markdown(text: &str, max_bytes: usize) -> (String, bool) {
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    let code = code_ranges(text);
+
+    for link in inline_scan::find_wikilinks(text, 0, &code) {
+        let visible = text.get(link.visible.clone()).unwrap_or_default();
+        let replacement = if link.is_embed {
+            format!("*↳ {visible}*")
+        } else {
+            visible.to_string()
+        };
+        edits.push((link.range.clone(), replacement));
+    }
+    for comment in inline_scan::find_comments(text, 0, &code) {
+        edits.push((comment.range.clone(), String::new()));
+    }
+    for id in inline_scan::find_block_ids(text, 0, &code) {
+        // The space before the id goes with it.
+        let start = text.get(..id.start).map_or(id.start, |before| {
+            before.trim_end_matches([' ', '\t']).len()
+        });
+        edits.push((start..id.end, String::new()));
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+
+    let mut result = String::with_capacity(text.len());
+    let mut position = 0;
+    for (range, replacement) in edits {
+        if range.start < position {
+            continue;
+        }
+        result.push_str(text.get(position..range.start).unwrap_or_default());
+        result.push_str(&replacement);
+        position = range.end;
+    }
+    result.push_str(text.get(position..).unwrap_or_default());
+
+    if result.len() <= max_bytes {
+        return (result, false);
+    }
+    let mut cut = max_bytes;
+    while !result.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let cut = result[..cut].rfind('\n').unwrap_or(cut);
+    result.truncate(cut);
+    (result.trim_end().to_string(), true)
+}
+
+/// Fenced and indented code blocks, and inline code spans, of `text`.
+fn code_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    if let Some(tree) = parse_blocks(text) {
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if matches!(node.kind(), "fenced_code_block" | "indented_code_block") {
+                ranges.push(node.byte_range());
+                continue;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+    }
+
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let run = bytes[index..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        let mut search = index + run;
+        let mut closing = None;
+        while search < bytes.len() && bytes[search] != b'\n' {
+            if bytes[search] == b'`' {
+                let candidate = bytes[search..]
+                    .iter()
+                    .take_while(|byte| **byte == b'`')
+                    .count();
+                if candidate == run {
+                    closing = Some(search + candidate);
+                    break;
+                }
+                search += candidate;
+            } else {
+                search += 1;
+            }
+        }
+        match closing {
+            Some(end) => {
+                ranges.push(index..end);
+                index = end;
+            }
+            None => index += run,
+        }
+    }
+    ranges
 }
 
 /// The names of the tags in `text`, each once, in order of appearance.
@@ -223,6 +405,85 @@ mod tests {
         let text = format!("{} ^id\n", "é".repeat(100));
         let found = block_ids(&text);
         assert_eq!(found[0].preview, "é".repeat(PREVIEW_CHARACTERS));
+    }
+
+    fn heading(name: &str) -> Subpath {
+        Subpath::Heading(name.to_string())
+    }
+
+    const NOTE: &str = "---\ntitle: x\n---\n# One\nintro\n\n## Sub\nsub text\n\n### Deep\ndeep text\n\n## Next\nnext text ^blk\n\n- item ^li\n  - child\n- other\n\n# Two\ntwo text\n";
+
+    #[test]
+    fn test_the_whole_note_is_shown_without_its_front_matter() {
+        let whole = section(NOTE, None).expect("a note");
+        assert!(whole.starts_with("# One"), "{whole:?}");
+        assert!(whole.ends_with("two text"));
+        assert!(!whole.contains("title: x"));
+    }
+
+    #[test]
+    fn test_a_heading_runs_to_the_next_heading_of_its_level_or_higher() {
+        let sub = section(NOTE, Some(&heading("Sub"))).expect("found");
+        assert_eq!(sub, "## Sub\nsub text\n\n### Deep\ndeep text");
+
+        let one = section(NOTE, Some(&heading("One"))).expect("found");
+        assert!(one.contains("### Deep") && one.contains("next text"));
+        assert!(!one.contains("two text"));
+
+        let last = section(NOTE, Some(&heading("Two"))).expect("found");
+        assert_eq!(last, "# Two\ntwo text");
+    }
+
+    #[test]
+    fn test_a_heading_is_found_without_regard_to_case_and_by_its_last_part() {
+        assert!(section(NOTE, Some(&heading("sub"))).is_some());
+        assert!(section(NOTE, Some(&heading("One#Sub"))).is_some());
+        assert!(section(NOTE, Some(&heading("Nothing"))).is_none());
+    }
+
+    #[test]
+    fn test_a_block_id_names_its_paragraph_or_list_item_without_the_id() {
+        let paragraph = section(NOTE, Some(&Subpath::Block("blk".to_string()))).expect("found");
+        assert_eq!(paragraph, "next text");
+
+        let item = section(NOTE, Some(&Subpath::Block("li".to_string()))).expect("found");
+        assert_eq!(item, "- item\n  - child");
+
+        assert!(section(NOTE, Some(&Subpath::Block("missing".to_string()))).is_none());
+    }
+
+    #[test]
+    fn test_a_note_without_front_matter_and_an_empty_one_are_fine() {
+        assert_eq!(section("plain\n", None).as_deref(), Some("plain"));
+        assert_eq!(section("", None).as_deref(), Some(""));
+        assert_eq!(section("", Some(&heading("x"))), None);
+    }
+
+    #[test]
+    fn test_a_preview_makes_wikilinks_readable_and_nested_embeds_a_name() {
+        let (text, truncated) = preview_markdown(
+            "See [[Note|the note]] and [[Other#Part]], ![[Child]] and `[[code]]`. %%secret%% done ^id\n\n```\n[[fenced]]\n```\n",
+            10_000,
+        );
+        assert!(!truncated);
+        assert_eq!(
+            text,
+            "See the note and Other#Part, *↳ Child* and `[[code]]`.  done\n\n```\n[[fenced]]\n```\n"
+        );
+    }
+
+    #[test]
+    fn test_a_long_preview_is_cut_on_a_line_and_says_so() {
+        let source = "first line\nsecond line\nthird line\n";
+        let (text, truncated) = preview_markdown(source, 15);
+        assert!(truncated);
+        assert_eq!(text, "first line");
+
+        let multibyte = format!("{}\n{}", "é".repeat(10), "ü".repeat(10));
+        let (cut, truncated) = preview_markdown(&multibyte, 25);
+        assert!(truncated);
+        assert_eq!(cut, "é".repeat(10));
+        assert!(!preview_markdown(&multibyte, 1000).1);
     }
 
     #[test]

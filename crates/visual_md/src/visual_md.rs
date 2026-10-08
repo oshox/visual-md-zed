@@ -7,10 +7,10 @@
 //!
 //! ## Status
 //!
-//! **M12**: a line holding only an image (`![alt](path)` or `![[name]]`)
-//! becomes a fixed-height image block while the cursor is off it; see
-//! `apply_images`. Blocks are `IMAGE_BLOCK_ROWS` rows tall because block
-//! heights can't follow an image's real size.
+//! **M12, M18**: a line holding only an embed (`![alt](path)` or `![[name]]`)
+//! becomes a block while the cursor is off it; see `embeds::apply_embeds`. The
+//! editor measures a block once it is drawn, so an image is as tall as the
+//! image, and a note embed as tall as the note.
 //!
 //! **M4**: M1's inline engine (headings, bold, italic, bold-italic,
 //! strikethrough, `==highlight==`, inline code) plus M2's lists (bullets and
@@ -236,6 +236,7 @@ mod commands;
 mod completions;
 mod document_events;
 pub mod dynamic_rules;
+mod embeds;
 pub mod extensions;
 mod fence_render;
 mod fold_ranges;
@@ -270,15 +271,13 @@ use editor::{
 use format_toggle::Emphasis;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FontWeight, HighlightStyle, Hsla, ImageSource,
-    InteractiveElement, IntoElement, KeyContext, ObjectFit, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TextRun,
-    TextStyleRefinement, WeakEntity, Window, actions, black, div, img, px, svg,
+    AnyElement, App, AppContext, Context, Entity, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, KeyContext, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, TextRun, TextStyleRefinement,
+    WeakEntity, Window, actions, black, div, px, svg,
 };
 use language::{Language, Rope};
-use plan::{
-    CalloutFold, CalloutKind, GlyphKind, ImageInfo, Plan, SpanStyle, TableAlignment, WikilinkSpan,
-};
+use plan::{CalloutFold, CalloutKind, GlyphKind, Plan, SpanStyle, TableAlignment, WikilinkSpan};
 use settings::Settings;
 use style::{CalloutIcon, ResolvedStyle, TaskMarkLook};
 use util::ResultExt;
@@ -422,7 +421,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         section_creases: Vec::new(),
         sections_applied: None,
         hr_blocks: Vec::new(),
-        image_blocks: Vec::new(),
+        embed_blocks: Vec::new(),
         rendered_fence_blocks: Vec::new(),
         code_fence_borders: Vec::new(),
         code_languages: HashMap::new(),
@@ -797,11 +796,11 @@ struct VisualMdAddon {
     /// string travels alongside the range: a horizontal rule's rendering
     /// never varies, so range equality alone is enough to diff old vs. new.
     hr_blocks: Vec<(Range<usize>, CustomBlockId)>,
-    /// Standalone-image blocks currently inserted (see `apply_images`),
-    /// diffed on `(range, resolved source)`: retyping the path changes the
-    /// source without moving the range's start, and the block must be rebuilt
-    /// to show the new image.
-    image_blocks: Vec<(Range<usize>, String, CustomBlockId)>,
+    /// Blocks standing in for embed lines currently inserted (see
+    /// `embeds::apply_embeds`), diffed on `(range, what the block draws)`:
+    /// retyping the path changes the source without moving the range's start,
+    /// and the block must be rebuilt to show the new image.
+    embed_blocks: Vec<embeds::EmbedBlock>,
     /// Blocks standing in for fenced code blocks that an extension renders
     /// (see `fence_render::apply_rendered_fences`).
     rendered_fence_blocks: Vec<fence_render::RenderedFenceBlock>,
@@ -1492,7 +1491,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     apply_sections(editor, &snapshot, enabled, window, cx);
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, style_handle.clone(), cx);
-    apply_images(editor, &snapshot, &computed, cx);
+    embeds::apply_embeds(editor, &snapshot, &computed, cx);
     fence_render::apply_rendered_fences(editor, &snapshot, &text, &computed, cx);
     apply_table_dividers(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_code_fence_borders(editor, &snapshot, &computed, style_handle, cx);
@@ -2574,179 +2573,6 @@ fn render_horizontal_rule(cx: &mut BlockContext, color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
-/// How many editor rows an image block occupies. Block heights are whole
-/// rows fixed at insertion time, and the image's real size isn't known until
-/// it has loaded, so every image gets the same box and is fit inside it.
-const IMAGE_BLOCK_ROWS: u32 = 10;
-
-/// How many parent directories an `![[embed]]` name is searched through,
-/// nearest first, approximating Obsidian's vault-wide lookup by name.
-const EMBED_SEARCH_DEPTH: usize = 8;
-
-/// Turns an image line's target into something the image loader can open, or
-/// `None` if it can't be resolved at all. A relative path is joined onto the
-/// note's own directory; an unsaved buffer has no directory to join onto.
-fn resolve_image_source(
-    image: &ImageInfo,
-    note_directory: Option<&std::path::Path>,
-) -> Option<String> {
-    let target = image.target.as_str();
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return Some(target.to_string());
-    }
-    let target_path = std::path::Path::new(target);
-    if target_path.is_absolute() {
-        return Some(target.to_string());
-    }
-    let note_directory = note_directory?;
-    if image.is_embed {
-        let found = note_directory
-            .ancestors()
-            .take(EMBED_SEARCH_DEPTH)
-            .map(|directory| directory.join(target_path))
-            .find(|candidate| candidate.exists());
-        if let Some(found) = found {
-            return Some(found.to_string_lossy().into_owned());
-        }
-    }
-    Some(
-        note_directory
-            .join(target_path)
-            .to_string_lossy()
-            .into_owned(),
-    )
-}
-
-/// Diffs `computed.images` against the blocks inserted by the previous
-/// refresh, same shape as `apply_horizontal_rules` but keyed on the resolved
-/// source as well as the range.
-fn apply_images(
-    editor: &mut Editor,
-    snapshot: &MultiBufferSnapshot,
-    computed: &Plan,
-    cx: &mut Context<Editor>,
-) {
-    let note_directory = editor
-        .buffer()
-        .read(cx)
-        .as_singleton()
-        .and_then(|buffer| {
-            let buffer = buffer.read(cx);
-            let local_file = buffer.file()?.as_local()?;
-            Some(local_file.abs_path(cx))
-        })
-        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
-
-    let wanted: Vec<(Range<usize>, String)> = computed
-        .images
-        .iter()
-        .filter_map(|image| {
-            let source = resolve_image_source(image, note_directory.as_deref())?;
-            Some((image.range.clone(), source))
-        })
-        .collect();
-
-    let previous = editor
-        .addon_mut::<VisualMdAddon>()
-        .map(|addon| std::mem::take(&mut addon.image_blocks))
-        .unwrap_or_default();
-
-    let wanted_keys: HashSet<&(Range<usize>, String)> = wanted.iter().collect();
-    let mut kept = Vec::new();
-    let mut stale_ids: collections::HashSet<CustomBlockId> = collections::HashSet::default();
-    for (range, source, id) in previous {
-        if wanted_keys.contains(&(range.clone(), source.clone())) {
-            kept.push((range, source, id));
-        } else {
-            stale_ids.insert(id);
-        }
-    }
-    if !stale_ids.is_empty() {
-        editor.remove_blocks(stale_ids, None, cx);
-    }
-
-    let already_kept: HashSet<(Range<usize>, String)> = kept
-        .iter()
-        .map(|(range, source, _)| (range.clone(), source.clone()))
-        .collect();
-    let new_images: Vec<(Range<usize>, String)> = wanted
-        .iter()
-        .filter(|key| !already_kept.contains(*key))
-        .cloned()
-        .collect();
-
-    if !new_images.is_empty() {
-        let new_blocks: Vec<BlockProperties<Anchor>> = new_images
-            .iter()
-            .map(|(range, source)| {
-                let anchor_range = to_anchor_range(snapshot, range);
-                let source = source.clone();
-                BlockProperties {
-                    placement: BlockPlacement::Replace(anchor_range.start..=anchor_range.end),
-                    height: Some(IMAGE_BLOCK_ROWS),
-                    style: BlockStyle::Fixed,
-                    render: std::sync::Arc::new(move |cx: &mut BlockContext| {
-                        render_image(&source, cx)
-                    }),
-                    priority: 0,
-                }
-            })
-            .collect();
-        let ids = editor.insert_blocks(new_blocks, None, cx);
-        kept.extend(
-            new_images
-                .into_iter()
-                .zip(ids)
-                .map(|((range, source), id)| (range, source, id)),
-        );
-    }
-
-    if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
-        addon.image_blocks = kept;
-    }
-}
-
-fn render_image(source: &str, cx: &mut BlockContext) -> AnyElement {
-    let (border, muted) = {
-        use theme::ActiveTheme;
-        (cx.theme().colors().border, cx.theme().colors().text_muted)
-    };
-    let line_height = cx.line_height;
-    let unavailable = {
-        let source = source.to_string();
-        move || {
-            div()
-                .px_2()
-                .py_1()
-                .border_1()
-                .border_color(border)
-                .rounded_md()
-                .text_color(muted)
-                .child(SharedString::from(format!("Image not found: {source}")))
-                .into_any_element()
-        }
-    };
-    let image_source: ImageSource =
-        if source.starts_with("http://") || source.starts_with("https://") {
-            ImageSource::from(SharedString::from(source.to_string()))
-        } else {
-            ImageSource::from(std::path::PathBuf::from(source))
-        };
-    div()
-        .w(cx.max_width)
-        .h(line_height * IMAGE_BLOCK_ROWS as f32)
-        .flex()
-        .items_center()
-        .child(
-            img(image_source)
-                .max_w_full()
-                .max_h_full()
-                .object_fit(ObjectFit::Contain)
-                .with_fallback(unavailable),
-        )
-        .into_any_element()
-}
-
 /// Diffs each table's `delimiter_line` against the divider blocks inserted
 /// by the previous refresh -- structurally identical to
 /// `apply_horizontal_rules` (same reasoning: a divider line can't stretch to
@@ -3788,16 +3614,23 @@ mod integration_tests {
         cx.run_until_parked();
         cx.update_editor(|editor, window, cx| {
             refresh(editor, window, cx);
-            let image_blocks = &editor.addon::<VisualMdAddon>().unwrap().image_blocks;
-            assert_eq!(image_blocks.len(), 1, "got {image_blocks:?}");
-            assert_eq!(image_blocks[0].1, "https://example.com/a.png");
+            let blocks = &editor.addon::<VisualMdAddon>().unwrap().embed_blocks;
+            assert_eq!(blocks.len(), 1);
+            assert!(
+                matches!(
+                    &blocks[0].key,
+                    embeds::EmbedKey::Image { source, .. } if source == "https://example.com/a.png"
+                ),
+                "got {:?}",
+                blocks[0].key
+            );
         });
 
         cx.set_state("text above\n\n![alˇt](https://example.com/a.png)\n\ntext below\n");
         cx.update_editor(|editor, window, cx| {
             refresh(editor, window, cx);
-            let image_blocks = &editor.addon::<VisualMdAddon>().unwrap().image_blocks;
-            assert!(image_blocks.is_empty(), "got {image_blocks:?}");
+            let blocks = &editor.addon::<VisualMdAddon>().unwrap().embed_blocks;
+            assert!(blocks.is_empty(), "got {} blocks", blocks.len());
         });
     }
 
