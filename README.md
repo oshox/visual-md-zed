@@ -8,8 +8,9 @@
 > Obsidian-style live-preview Markdown editing (see
 > [docs/visual-md-spec.md](docs/visual-md-spec.md) and the `visual_md` crate).
 > It is not an official Zed release and is not affiliated with Zed Industries.
-> Zed MD keeps its settings and data separately from Zed and does not
-> auto-update. The rest of this README is upstream Zed's.
+> Zed MD keeps its settings and data separately from Zed. Auto-update is off
+> unless you turn it on, and then takes releases from this repository. The rest
+> of this README is upstream Zed's.
 
 # Zed
 

@@ -613,3 +613,62 @@ it. The menus, the paste and the drop are covered by tests that run the same
 paths: typed characters one at a time through the editor, `Paste` dispatched as
 an action with an image on the clipboard, and `handle_drop` called the way a pane
 calls it on a workspace's active item.
+
+## Packages, updates and the remote server
+
+**What the packages are.** The `Zed MD Packages` workflow (`workflow_dispatch`,
+or a `v*` tag that also publishes a GitHub release) runs `script/bundle-linux` and
+`script/bundle-windows.ps1`. The branding is in the build, not in a step of the
+workflow: the editor binary is `zedmd` (`crates/zed/Cargo.toml`), the app id is
+`dev.zedmd.ZedMD`, and the Windows installer is Inno Setup's `ZedMD-x86_64.exe`.
+The files published are:
+
+| File | What it is |
+| --- | --- |
+| `zed-md-<tag>-linux-x86_64.tar.gz` | The app in `zed.app/`: `bin/zed` (the command line tool), `libexec/zed-editor` (`zedmd`), `lib/`, `share/applications/dev.zedmd.ZedMD.desktop` and the icons. |
+| `zed-md-<tag>-x86_64-setup.exe` | The Windows installer. |
+| `zed-remote-server-linux-x86_64.gz` | The remote server for SSH and WSL hosts, built for musl. |
+
+**Checked against the last good run.** Run 36592950009 (commit `de1506ae57`, 29
+September) is the last one that produced the tarball and the installer. A tarball
+built from `main` after M17 has the same layout: the same two executables under
+the same names, the same desktop entry byte for byte, the same icons, and
+`bin/zed --version` reads `Zed 1.23.0 <commit>` in both. The only differences are
+the libraries under `lib/`, which come from the build machine (Ubuntu's CI image
+ships `libbsd`, `libmd` and `libXdmcp`, Fedora's does not). The packaging
+scripts, the Windows installer definition and `crates/zed/Cargo.toml` have not
+changed since that run, so the installer is built as before; it was not rebuilt
+here, since that needs Windows.
+
+**Updates.** `auto_update` is off by default. When it is on, the app asks
+`github.com/oshox/visual-md-zed` for its newest non-prerelease and picks the asset
+by name: `*-linux-<arch>.tar.gz`, `*-<arch>-setup.exe`, or
+`zed-remote-server-<os>-<arch>.gz`. On Linux the update is unpacked and copied
+over the folder the app is running from, if that is `<name>.app/libexec/zed-editor`,
+and otherwise into `~/.local/zed.app`. It used to go into `~/.local/zed.app`
+whatever the running folder was called, so a Zed MD installed beside Zed as
+`zedmd.app` would have overwritten Zed. On Windows the downloaded installer runs
+with `/verysilent /update=true` and the update helper in `tools\` finishes the
+swap.
+
+**The remote server.** When a host has no server for the app's version, the app
+looks up the release tagged `v<crate version>` and gives the host the
+`zed-remote-server-linux-x86_64.gz` asset to download, or uploads it itself if the
+host cannot download. That is why a tag must match `crates/zed/Cargo.toml`, which
+the workflow checks before it builds anything. A build with a pre-release or commit
+suffix looks for the tag without it. Only x86_64 Linux hosts are served; any other
+host gets an error saying the release has no server for its platform.
+
+**Checked.** The updater's tests cover the asset names, the release lookups by tag
+and for the newest release (with a fake GitHub), the remote server asset for a
+version, a platform with none, and a version with no release. A test installs an
+update with the real `tar` and `rsync` over `zedmd.app` and checks that `zed.app`
+beside it is untouched, that files the update no longer has are removed, and that a
+build that is not installed goes to `~/.local/zed.app`. The remote server built here
+runs and reports `1.23.0`.
+
+**Not checked.** A release has never been published, so no running app has fetched
+one; the Windows installer, its silent update and the macOS path have not been
+run for M15 to M17; and no SSH or WSL host has been connected to with this server.
+macOS is not packaged, so an update there finds no asset. The first tag is the test
+for the rest.

@@ -1132,15 +1132,54 @@ async fn install_release_linux(
     running_app_path: PathBuf,
 ) -> Result<Option<PathBuf>> {
     let home_dir = PathBuf::from(env::var("HOME").context("no HOME env var set")?);
+    install_linux_app(
+        temp_dir.path(),
+        downloaded_tar_gz,
+        channel,
+        &running_app_path,
+        &home_dir,
+    )
+    .await
+}
 
-    let extracted = temp_dir.path().join("zed");
+/// The folder an update of the Linux app is installed into.
+///
+/// The tarball holds the app in a folder called `zed.app` (`zed-<channel>.app`
+/// for the other channels), but it is installed over the folder the app is
+/// running from, whatever that is called, so that a copy installed beside
+/// another Zed, for example as `zedmd.app`, updates itself and never the other
+/// one. The running folder is only trusted when the app runs from
+/// `<name>.app/libexec/zed-editor`, which is what keeps `--delete` from
+/// being pointed at a directory such as `/usr` that merely contains a
+/// `libexec/zed-editor`. Anywhere else the update goes to `~/.local`.
+fn linux_app_root(running_app_path: &Path, app_folder_name: &str, home_dir: &Path) -> PathBuf {
+    let running_root = Some(running_app_path)
+        .filter(|path| path.file_name() == Some(OsStr::new("zed-editor")))
+        .and_then(Path::parent)
+        .filter(|libexec| libexec.file_name() == Some(OsStr::new("libexec")))
+        .and_then(Path::parent)
+        .filter(|root| root.extension() == Some(OsStr::new("app")));
+    match running_root {
+        Some(root) => root.to_path_buf(),
+        None => home_dir.join(".local").join(app_folder_name),
+    }
+}
+
+async fn install_linux_app(
+    installer_dir: &Path,
+    downloaded_tar_gz: &Path,
+    channel: &str,
+    running_app_path: &Path,
+    home_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    let extracted = installer_dir.join("zed");
     fs::create_dir_all(&extracted)
         .await
         .context("failed to create directory into which to extract update")?;
 
     let mut cmd = new_command("tar");
     cmd.arg("-xzf")
-        .arg(&downloaded_tar_gz)
+        .arg(downloaded_tar_gz)
         .arg("-C")
         .arg(&extracted);
     let output = cmd
@@ -1164,19 +1203,19 @@ async fn install_release_linux(
     let app_folder_name = format!("zed{}.app", suffix);
 
     let from = extracted.join(&app_folder_name);
-    let mut to = home_dir.join(".local");
+    let app_root = linux_app_root(running_app_path, &app_folder_name, home_dir);
+    fs::create_dir_all(&app_root)
+        .await
+        .with_context(|| format!("failed to create {app_root:?}"))?;
 
-    let expected_suffix = format!("{}/libexec/zed-editor", app_folder_name);
-
-    if let Some(prefix) = running_app_path
-        .to_str()
-        .and_then(|str| str.strip_suffix(&expected_suffix))
-    {
-        to = PathBuf::from(prefix);
-    }
-
+    // The trailing slashes make rsync copy what is in one folder into the other,
+    // whatever the two are called.
+    let mut source = from.clone().into_os_string();
+    source.push("/");
+    let mut destination = app_root.clone().into_os_string();
+    destination.push("/");
     let mut cmd = new_command("rsync");
-    cmd.args(["-av", "--delete"]).arg(&from).arg(&to);
+    cmd.args(["-av", "--delete"]).arg(source).arg(destination);
     let output = cmd
         .output()
         .await
@@ -1186,11 +1225,11 @@ async fn install_release_linux(
         output.status.success(),
         "failed to copy Zed update from {:?} to {:?}: {:?}",
         from,
-        to,
+        app_root,
         String::from_utf8_lossy(&output.stderr)
     );
 
-    Ok(Some(to.join(expected_suffix)))
+    Ok(Some(app_root.join("libexec").join("zed-editor")))
 }
 
 async fn install_release_macos(
@@ -1396,6 +1435,279 @@ mod tests {
             r#"[{{"tag_name":"{tag}","prerelease":false,"tarball_url":"","zipball_url":"","assets":[{}]}}]"#,
             assets.join(",")
         )
+    }
+
+    /// The release `Zed MD Packages` publishes for `tag`, with a different
+    /// download address for each of its assets.
+    fn release_json(tag: &str) -> String {
+        let assets = [
+            (
+                format!("zed-md-{tag}-x86_64-setup.exe"),
+                "https://test.example/installer",
+            ),
+            (
+                format!("zed-md-{tag}-linux-x86_64.tar.gz"),
+                "https://test.example/tarball",
+            ),
+            (
+                "zed-remote-server-linux-x86_64.gz".to_string(),
+                "https://test.example/remote-server",
+            ),
+        ]
+        .map(|(name, url)| {
+            format!(r#"{{"name":"{name}","browser_download_url":"{url}","digest":null}}"#)
+        });
+        format!(
+            r#"{{"tag_name":"{tag}","prerelease":false,"tarball_url":"","zipball_url":"","assets":[{}]}}"#,
+            assets.join(",")
+        )
+    }
+
+    fn init_with_releases(cx: &mut TestAppContext, requests: Arc<parking_lot::Mutex<Vec<String>>>) {
+        cx.update(|cx| {
+            settings::init(cx);
+            release_channel::init_test(semver::Version::new(1, 23, 0), ReleaseChannel::Stable, cx);
+            let clock = Arc::new(FakeSystemClock::new());
+            let http = FakeHttpClient::create(move |req| {
+                let requests = requests.clone();
+                async move {
+                    let path = req.uri().path().to_string();
+                    requests.lock().push(path.clone());
+                    let body = match path.as_str() {
+                        "/repos/oshox/visual-md-zed/releases/tags/v1.23.0" => {
+                            release_json("v1.23.0")
+                        }
+                        "/repos/oshox/visual-md-zed/releases" => {
+                            format!("[{}]", release_json("v1.23.0"))
+                        }
+                        _ => {
+                            return Ok(Response::builder().status(404).body("".into()).unwrap());
+                        }
+                    };
+                    Ok(Response::builder().status(200).body(body.into()).unwrap())
+                }
+            });
+            crate::init(Client::new(clock, http, cx), cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_the_remote_server_is_the_one_released_with_the_apps_version(
+        cx: &mut TestAppContext,
+    ) {
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        init_with_releases(cx, requests.clone());
+        let mut async_cx = cx.to_async();
+
+        // A build carries a pre-release and a commit; the release is tagged without them.
+        let version = semver::Version::parse("1.23.0-dev+ce076e1").unwrap();
+        let url = AutoUpdater::get_remote_server_release_url(
+            ReleaseChannel::Stable,
+            Some(version),
+            "linux",
+            "x86_64",
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(url.as_deref(), Some("https://test.example/remote-server"));
+        assert_eq!(
+            *requests.lock(),
+            ["/repos/oshox/visual-md-zed/releases/tags/v1.23.0"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_the_newest_release_serves_the_remote_server_when_no_version_is_asked_for(
+        cx: &mut TestAppContext,
+    ) {
+        init_with_releases(cx, Arc::default());
+        let mut async_cx = cx.to_async();
+
+        let url = AutoUpdater::get_remote_server_release_url(
+            ReleaseChannel::Stable,
+            None,
+            "linux",
+            "x86_64",
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(url.as_deref(), Some("https://test.example/remote-server"));
+    }
+
+    #[gpui::test]
+    async fn test_a_platform_the_release_has_no_remote_server_for_says_so(cx: &mut TestAppContext) {
+        init_with_releases(cx, Arc::default());
+        let mut async_cx = cx.to_async();
+
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            let error = AutoUpdater::get_remote_server_release_url(
+                ReleaseChannel::Stable,
+                Some(semver::Version::new(1, 23, 0)),
+                os,
+                arch,
+                &mut async_cx,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{error:#}")
+                    .contains(&format!("no zed-remote-server asset for {os}-{arch}")),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_a_version_with_no_release_is_an_error_not_another_versions_server(
+        cx: &mut TestAppContext,
+    ) {
+        init_with_releases(cx, Arc::default());
+        let mut async_cx = cx.to_async();
+
+        let result = AutoUpdater::get_remote_server_release_url(
+            ReleaseChannel::Stable,
+            Some(semver::Version::new(9, 9, 9)),
+            "linux",
+            "x86_64",
+            &mut async_cx,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_a_linux_update_goes_to_the_folder_the_app_runs_from() {
+        let home = Path::new("/home/me");
+        let root = |running: &str, folder: &str| linux_app_root(Path::new(running), folder, home);
+
+        assert_eq!(
+            root("/home/me/.local/zed.app/libexec/zed-editor", "zed.app"),
+            Path::new("/home/me/.local/zed.app")
+        );
+        assert_eq!(
+            root("/home/me/.local/zedmd.app/libexec/zed-editor", "zed.app"),
+            Path::new("/home/me/.local/zedmd.app")
+        );
+        assert_eq!(
+            root(
+                "/opt/apps/zed-preview.app/libexec/zed-editor",
+                "zed-preview.app"
+            ),
+            Path::new("/opt/apps/zed-preview.app")
+        );
+    }
+
+    #[test]
+    fn test_a_linux_update_never_goes_to_a_folder_that_is_not_an_app_folder() {
+        let home = Path::new("/home/me");
+        let default = Path::new("/home/me/.local/zed.app");
+        let root = |running: &str| linux_app_root(Path::new(running), "zed.app", home);
+
+        // A distribution's layout, and a development build.
+        assert_eq!(root("/usr/libexec/zed-editor"), default);
+        assert_eq!(root("/usr/lib/zed/zed-editor"), default);
+        assert_eq!(root("/home/me/zed/target/release/zedmd"), default);
+        assert_eq!(root("/home/me/.local/zed.app/bin/zed"), default);
+        assert_eq!(root("zed-editor"), default);
+    }
+
+    /// Packs the `zed.app` folder of `staging` into `zed.tar.gz` in `into`, as
+    /// the packages do.
+    #[cfg(target_os = "linux")]
+    fn tar_up(staging: &Path, into: &Path) -> PathBuf {
+        let tarball = into.join("zed.tar.gz");
+        let status = smol::block_on(
+            new_command("tar")
+                .arg("-czf")
+                .arg(&tarball)
+                .arg("-C")
+                .arg(staging)
+                .arg("zed.app")
+                .status(),
+        )
+        .unwrap();
+        assert!(status.success());
+        tarball
+    }
+
+    /// An update installed from a real tarball by the real `tar` and `rsync`:
+    /// the copy of Zed MD that is running is replaced, files it no longer has
+    /// are removed, and a Zed installed beside it is left as it was.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_an_update_replaces_the_running_app_and_not_the_one_beside_it() {
+        let write = |path: &Path, contents: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        };
+        let home = tempfile::tempdir().unwrap();
+        let local = home.path().join(".local");
+        write(&local.join("zed.app/libexec/zed-editor"), "stock zed");
+        // rsync skips a file whose size and time are the same, so these differ in size.
+        write(&local.join("zedmd.app/libexec/zed-editor"), "old");
+        write(&local.join("zedmd.app/share/removed-in-update.txt"), "old");
+
+        let staging = tempfile::tempdir().unwrap();
+        write(
+            &staging.path().join("zed.app/libexec/zed-editor"),
+            "the new zed md",
+        );
+        write(&staging.path().join("zed.app/bin/zed"), "new cli");
+        let installer = tempfile::tempdir().unwrap();
+        let tarball = tar_up(staging.path(), installer.path());
+
+        let running = local.join("zedmd.app/libexec/zed-editor");
+        let restart = smol::block_on(install_linux_app(
+            installer.path(),
+            &tarball,
+            "stable",
+            &running,
+            home.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(restart, Some(running.clone()));
+        let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+        assert_eq!(read(running), "the new zed md");
+        assert_eq!(read(local.join("zedmd.app/bin/zed")), "new cli");
+        assert!(!local.join("zedmd.app/share/removed-in-update.txt").exists());
+        assert_eq!(read(local.join("zed.app/libexec/zed-editor")), "stock zed");
+        assert!(!local.join("zed.app/bin").exists());
+    }
+
+    /// An app that does not run from an app folder is updated in `~/.local/zed.app`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_an_update_of_a_build_that_is_not_installed_goes_to_the_default_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let editor = staging.path().join("zed.app/libexec/zed-editor");
+        std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+        std::fs::write(&editor, "new").unwrap();
+        let installer = tempfile::tempdir().unwrap();
+        let tarball = tar_up(staging.path(), installer.path());
+
+        let restart = smol::block_on(install_linux_app(
+            installer.path(),
+            &tarball,
+            "stable",
+            Path::new("/somewhere/target/release/zedmd"),
+            home.path(),
+        ))
+        .unwrap();
+
+        let expected = home.path().join(".local/zed.app/libexec/zed-editor");
+        assert_eq!(restart, Some(expected.clone()));
+        assert_eq!(std::fs::read_to_string(expected).unwrap(), "new");
     }
 
     #[test]
