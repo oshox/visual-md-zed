@@ -553,7 +553,7 @@ fn diff_rendered_fences(
 
 /// Puts the cursor inside the fence, so its source shows instead of the
 /// rendering.
-fn reveal_source(
+pub(crate) fn reveal_source(
     editor: &mut Editor,
     position: Anchor,
     window: &mut Window,
