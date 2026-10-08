@@ -1984,7 +1984,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn markdown_live_preview_section() -> [SettingsPageItem; 3] {
+    fn markdown_live_preview_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Markdown Live Preview"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -2030,6 +2030,23 @@ fn editor_page() -> SettingsPage {
                     },
                 }),
                 metadata: allow_unset(),
+                files: USER | PROJECT,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Page Preview",
+                description: "Show a preview of the note, heading or block a [[wikilink]] names when hovering it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("visual_md.page_preview"),
+                    pick: |settings_content| {
+                        visual_md_settings(settings_content)
+                            .and_then(|visual_md| visual_md.page_preview.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        visual_md_settings_mut(settings_content).page_preview = value;
+                    },
+                }),
+                metadata: None,
                 files: USER | PROJECT,
             }),
         ]

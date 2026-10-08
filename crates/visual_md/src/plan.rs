@@ -17,6 +17,7 @@ use std::sync::Arc;
 use extension::VisualMdSpanStyle;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::footnotes::Footnotes;
 use crate::inline_scan;
 use crate::rules::{self, DynamicKey, DynamicResult, RuleHit, RuleSet};
 
@@ -258,6 +259,10 @@ pub struct Plan {
     /// note needs the editor's real width, which a fold can't stretch to. See
     /// `embeds.rs`.
     pub embeds: Vec<EmbedInfo>,
+    /// Footnote references and the markers of their definitions in view, that no
+    /// selection touches, with the number each shows in their place. One that a
+    /// selection touches is in `dimmed_markers` instead.
+    pub footnote_marks: Vec<FootnoteMark>,
     /// Fenced code blocks an extension renders in place of the block, which a
     /// selection does not touch. Such a block gets neither borders nor
     /// `code_fence_content`: the extension's output stands in for all of it.
@@ -276,6 +281,16 @@ pub struct Plan {
     candidate_hidden: Vec<Range<usize>>,
     candidate_dimmed: Vec<Range<usize>>,
     candidate_replacements: Vec<(Range<usize>, String)>,
+}
+
+/// A footnote reference `[^label]`, or the `[^label]:` that starts its
+/// definition, as the plan sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FootnoteMark {
+    pub range: Range<usize>,
+    pub label: String,
+    pub number: usize,
+    pub is_definition: bool,
 }
 
 /// A match of a dynamic rule waiting for an extension's answer.
@@ -511,6 +526,9 @@ pub struct PlanExtensions {
     /// [`link_definitions`] finds them, when the caller already has them. They
     /// are looked for in the block parse when it does not.
     pub link_definitions: Option<Arc<HashMap<String, String>>>,
+    /// The footnotes of the document, as [`Footnotes::scan`] finds them, when the
+    /// caller already has them. They are looked for in the text when it does not.
+    pub footnotes: Option<Arc<Footnotes>>,
 }
 
 /// [`plan_viewport_with_tree`], also planning what `extensions` claim.
@@ -532,15 +550,26 @@ pub fn plan_viewport_with_extensions(
         visible_range.end = visible_range.end.max(selection.end);
     }
 
-    let with_definitions;
-    let extensions = if extensions.link_definitions.is_some() {
+    let with_defaults;
+    let extensions = if extensions.link_definitions.is_some() && extensions.footnotes.is_some() {
         extensions
     } else {
-        with_definitions = PlanExtensions {
-            link_definitions: Some(Arc::new(link_definitions(text, block_tree))),
+        with_defaults = PlanExtensions {
+            link_definitions: Some(
+                extensions
+                    .link_definitions
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(link_definitions(text, block_tree))),
+            ),
+            footnotes: Some(
+                extensions
+                    .footnotes
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(Footnotes::scan(text, Some(block_tree)))),
+            ),
             ..extensions.clone()
         };
-        &with_definitions
+        &with_defaults
     };
 
     let mut plan = Plan::default();
@@ -557,6 +586,9 @@ pub fn plan_viewport_with_extensions(
     // Standalone images are planned before the extension candidates are
     // resolved, since their rows are among the ranges extensions must stay off.
     plan_embeds(text, selections, &visible_range, &mut plan);
+    if let Some(footnotes) = &extensions.footnotes {
+        plan_footnotes(footnotes, selections, &visible_range, &mut plan);
+    }
     resolve_extension_candidates(&mut plan);
 
     // Nested constructs (`***bold italic***`, and the grammar's own
@@ -904,14 +936,9 @@ fn overlaps_any(sorted_disjoint: &[Range<usize>], range: &Range<usize>) -> bool 
 /// extension that overlaps one of them is dropped, because two folds over the
 /// same text would panic the editor and a hidden marker must not be revealed by
 /// someone else's styling. Among extensions' own ranges, the leftmost wins.
-fn resolve_extension_candidates(plan: &mut Plan) {
-    let hidden = std::mem::take(&mut plan.candidate_hidden);
-    let dimmed = std::mem::take(&mut plan.candidate_dimmed);
-    let replacements = std::mem::take(&mut plan.candidate_replacements);
-    if hidden.is_empty() && dimmed.is_empty() && replacements.is_empty() {
-        return;
-    }
-
+/// What Zed MD's own decorations have claimed, merged: a fold can't be made over
+/// a range that another one covers.
+fn occupied_ranges(plan: &Plan) -> Vec<Range<usize>> {
     let mut occupied: Vec<Range<usize>> = plan
         .hidden_markers
         .iter()
@@ -928,6 +955,7 @@ fn resolve_extension_candidates(plan: &mut Plan) {
         )
         .chain(plan.embeds.iter().map(|embed| embed.range.clone()))
         .chain(plan.rendered_fences.iter().map(|fence| fence.range.clone()))
+        .chain(plan.footnote_marks.iter().map(|mark| mark.range.clone()))
         .collect();
     for callout in &plan.callouts {
         occupied.push(callout.marker_range.clone());
@@ -942,7 +970,69 @@ fn resolve_extension_candidates(plan: &mut Plan) {
             occupied.push(cell.trailing_gap.clone());
         }
     }
-    let occupied = merge_ranges(occupied);
+    merge_ranges(occupied)
+}
+
+/// The footnote references and definition markers in `visible_range`. One that a
+/// selection touches is dimmed, so its source can be edited, and the others are
+/// replaced by their numbers. One that overlaps another decoration is left as
+/// text.
+fn plan_footnotes(
+    footnotes: &Footnotes,
+    selections: &[Range<usize>],
+    visible_range: &Range<usize>,
+    plan: &mut Plan,
+) {
+    if footnotes.references.is_empty() {
+        return;
+    }
+    let occupied = occupied_ranges(plan);
+    let references = footnotes.references.iter().map(|reference| {
+        (
+            reference.range.clone(),
+            reference.label.as_str(),
+            reference.number,
+            false,
+        )
+    });
+    let definitions = footnotes.definitions.iter().filter_map(|definition| {
+        let number = definition.number?;
+        Some((
+            definition.marker.clone(),
+            definition.label.as_str(),
+            number,
+            true,
+        ))
+    });
+    let mut marks: Vec<(Range<usize>, &str, usize, bool)> = references
+        .chain(definitions)
+        .filter(|(range, ..)| overlaps(range, visible_range) && !overlaps_any(&occupied, range))
+        .collect();
+    marks.sort_by_key(|(range, ..)| range.start);
+
+    for (range, label, number, is_definition) in marks {
+        if touches_selection(&range, selections) {
+            plan.dimmed_markers.push(range);
+        } else {
+            plan.footnote_marks.push(FootnoteMark {
+                range,
+                label: label.to_string(),
+                number,
+                is_definition,
+            });
+        }
+    }
+}
+
+fn resolve_extension_candidates(plan: &mut Plan) {
+    let hidden = std::mem::take(&mut plan.candidate_hidden);
+    let dimmed = std::mem::take(&mut plan.candidate_dimmed);
+    let replacements = std::mem::take(&mut plan.candidate_replacements);
+    if hidden.is_empty() && dimmed.is_empty() && replacements.is_empty() {
+        return;
+    }
+
+    let occupied = occupied_ranges(plan);
     let is_clear = |range: &Range<usize>| !overlaps_any(&occupied, range);
 
     let hidden = without_overlaps(
@@ -1950,7 +2040,11 @@ pub(crate) fn link_definitions(text: &str, block_tree: &Tree) -> HashMap<String,
                 .and_then(|written| written.strip_prefix('[')?.strip_suffix(']'));
             let destination = find_child(node, "link_destination")
                 .and_then(|destination| text.get(destination.byte_range()));
-            if let (Some(label), Some(destination)) = (label, destination) {
+            // `[^1]: word` is a footnote, which parses like a definition of the
+            // link `^1`.
+            if let (Some(label), Some(destination)) = (label, destination)
+                && !label.starts_with('^')
+            {
                 let destination = destination
                     .strip_prefix('<')
                     .and_then(|inner| inner.strip_suffix('>'))
@@ -4634,5 +4728,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn footnote_marks(result: &Plan) -> Vec<(Range<usize>, usize, bool)> {
+        result
+            .footnote_marks
+            .iter()
+            .map(|mark| (mark.range.clone(), mark.number, mark.is_definition))
+            .collect()
+    }
+
+    #[test]
+    fn footnote_references_and_definitions_are_planned_with_their_numbers() {
+        let text = "one[^b] two[^a]\n\n[^a]: A.\n[^b]: B.\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(
+            footnote_marks(&result),
+            vec![
+                (3..7, 1, false),
+                (11..15, 2, false),
+                (17..22, 2, true),
+                (26..31, 1, true),
+            ]
+        );
+        assert!(result.hidden_markers.is_empty());
+        assert!(result.dimmed_markers.is_empty());
+    }
+
+    #[test]
+    fn a_footnote_the_selection_touches_is_dimmed_and_not_replaced() {
+        let text = "one[^b] two[^a]\n\n[^a]: A.\n[^b]: B.\n";
+        for selection in [5..5, 3..3, 7..7, 2..8] {
+            let result = plan(text, std::slice::from_ref(&selection));
+
+            assert!(
+                result.dimmed_markers.contains(&(3..7)),
+                "{selection:?} touches the first reference"
+            );
+            assert!(
+                !footnote_marks(&result)
+                    .iter()
+                    .any(|(range, ..)| *range == (3..7)),
+                "{selection:?}"
+            );
+            assert!(
+                footnote_marks(&result)
+                    .iter()
+                    .any(|(range, ..)| *range == (11..15)),
+                "the other reference stays replaced"
+            );
+        }
+    }
+
+    #[test]
+    fn brackets_that_are_not_footnotes_are_left_alone() {
+        for text in [
+            "no definition[^9]\n",
+            "in `code[^1]` here\n\n[^1]: n\n",
+            "```\n[^1]\n```\n\n[^1]: n\n",
+            "[^1]: only a definition\n",
+        ] {
+            let result = plan(text, &[]);
+
+            assert!(result.footnote_marks.is_empty(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_footnote_marker_is_not_a_link_reference() {
+        let text = "a[^1]\n\n[^1]: word\n";
+        let tree = parse_blocks(text).expect("parses");
+
+        assert!(
+            link_definitions(text, &tree).is_empty(),
+            "a footnote whose text is one word parses like a link definition"
+        );
+        let result = plan(text, &[]);
+        assert!(
+            result
+                .styled_spans
+                .iter()
+                .all(|(_, style)| *style != SpanStyle::Link),
+            "the reference is not a link"
+        );
+        assert_eq!(footnote_marks(&result).len(), 2);
+    }
+
+    #[test]
+    fn only_footnotes_in_view_are_planned() {
+        let text = "one[^1]\n\nfiller\n\ntwo[^2]\n\n[^1]: A.\n[^2]: B.\n";
+        let tree = parse_blocks(text).expect("parses");
+        let result =
+            plan_viewport_with_extensions(text, &tree, &[], 0..8, &PlanExtensions::default());
+
+        assert_eq!(
+            footnote_marks(&result),
+            vec![(3..7, 1, false)],
+            "numbers still come from the whole document"
+        );
+    }
+
+    #[test]
+    fn a_footnote_over_another_decoration_stays_text() {
+        let cases = [
+            "[x](http://a[^1])\n\n[^1]: n\n",
+            "> [!note]- Title\n> body[^1]\n\n[^1]: n\n",
+            "- [ ] task[^1]\n\n[^1]: n\n",
+        ];
+        for text in cases {
+            let result = plan(text, &[]);
+            let hidden_or_collapsed: Vec<Range<usize>> = result
+                .hidden_markers
+                .iter()
+                .cloned()
+                .chain(
+                    result
+                        .callouts
+                        .iter()
+                        .filter(|callout| callout.fold.is_collapsed())
+                        .map(|callout| callout.body_range.clone()),
+                )
+                .collect();
+            for mark in &result.footnote_marks {
+                assert!(
+                    !hidden_or_collapsed
+                        .iter()
+                        .any(|range| range.start < mark.range.end && mark.range.start < range.end),
+                    "{text:?}: {mark:?} overlaps {hidden_or_collapsed:?}"
+                );
+            }
+        }
+        let collapsed = plan(cases[1], &[]);
+        assert!(
+            collapsed
+                .footnote_marks
+                .iter()
+                .all(|mark| mark.is_definition),
+            "the reference in a collapsed callout is not replaced"
+        );
     }
 }

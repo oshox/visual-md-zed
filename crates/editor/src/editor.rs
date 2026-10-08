@@ -823,6 +823,20 @@ pub trait Addon: 'static {
         None
     }
 
+    /// The text a hover popover shows for `position`, as Markdown, for an addon
+    /// that knows more about the text than a language server does. The range is
+    /// the text the popover is about: it stays open while the pointer is inside
+    /// it and a hover over the same range does not open it again.
+    fn hover_at(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: text::Anchor,
+        _project: Option<&Entity<Project>>,
+        _cx: &mut App,
+    ) -> Option<Task<Option<(Range<text::Anchor>, String)>>> {
+        None
+    }
+
     /// Takes what the pane's user dropped on this editor, such as
     /// `gpui::ExternalPaths` or `workspace::DraggedSelection`, for an addon that
     /// knows what to do with it in this text. Returns whether it did, in which
@@ -11209,6 +11223,18 @@ impl Editor {
         self.addons
             .values()
             .find_map(|addon| addon.link_at(buffer, position, self.project.as_ref(), cx))
+    }
+
+    /// The hover text at `position` that one of the addons supplies, if any does.
+    pub(crate) fn addon_hover_at(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<(Range<text::Anchor>, String)>>> {
+        self.addons
+            .values()
+            .find_map(|addon| addon.hover_at(buffer, position, self.project.as_ref(), cx))
     }
 
     pub fn addon_mut<T: Addon>(&mut self) -> Option<&mut T> {

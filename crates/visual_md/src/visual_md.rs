@@ -240,6 +240,7 @@ mod embeds;
 pub mod extensions;
 mod fence_render;
 mod fold_ranges;
+mod footnotes;
 mod format_toggle;
 mod inline_scan;
 mod links;
@@ -886,6 +887,30 @@ struct ParsedDocument {
     foldable: Arc<[Range<usize>]>,
     /// The `[label]: destination` definitions, for reference-style links.
     link_definitions: Arc<HashMap<String, String>>,
+    footnotes: Arc<footnotes::Footnotes>,
+}
+
+impl VisualMdAddon {
+    /// The footnote reference at `position` and the definition it refers to.
+    fn footnote_at(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        position: language::Anchor,
+        cx: &App,
+    ) -> Option<(Range<language::Anchor>, &footnotes::Definition)> {
+        use language::ToOffset as _;
+
+        if !self.active {
+            return None;
+        }
+        let footnotes = &self.parsed.as_ref()?.footnotes;
+        let snapshot = buffer.read(cx).snapshot();
+        let reference = footnotes.reference_at(position.to_offset(&snapshot))?;
+        let definition = footnotes.definition_of(&reference.label)?;
+        let range = snapshot.anchor_before(reference.range.start)
+            ..snapshot.anchor_after(reference.range.end);
+        Some((range, definition))
+    }
 }
 
 impl Addon for VisualMdAddon {
@@ -902,6 +927,26 @@ impl Addon for VisualMdAddon {
         project: Option<&Entity<project::Project>>,
         cx: &mut App,
     ) -> Option<Task<Option<(Range<language::Anchor>, editor::hover_links::HoverLink)>>> {
+        if let Some((range, definition)) = self.footnote_at(buffer, position, cx) {
+            let target = MultiBufferOffset(definition.text_start);
+            let editor = self.editor.clone();
+            let go_to_definition = editor::hover_links::HoverAction::new(move |window, cx| {
+                editor
+                    .update(cx, |editor, cx| {
+                        editor.change_selections(
+                            SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                            window,
+                            cx,
+                            |selections| selections.select_ranges([target..target]),
+                        );
+                    })
+                    .log_err();
+            });
+            return Some(Task::ready(Some((
+                range,
+                editor::hover_links::HoverLink::Action(go_to_definition),
+            ))));
+        }
         let note_index = self.note_index.as_ref().map(|(index, _)| index.clone());
         let definitions = self
             .parsed
@@ -916,6 +961,22 @@ impl Addon for VisualMdAddon {
             definitions,
             cx,
         )
+    }
+
+    fn hover_at(
+        &self,
+        buffer: &Entity<language::Buffer>,
+        position: language::Anchor,
+        project: Option<&Entity<project::Project>>,
+        cx: &mut App,
+    ) -> Option<Task<Option<(Range<language::Anchor>, String)>>> {
+        let note_index = self.note_index.as_ref().map(|(index, _)| index.clone());
+        if let Some((range, definition)) = self.footnote_at(buffer, position, cx) {
+            let (text, _) =
+                note_contents::preview_markdown(&definition.text, embeds::MAX_NOTE_BYTES);
+            return Some(Task::ready((!text.is_empty()).then_some((range, text))));
+        }
+        links::preview_at(self.active, buffer, position, project, note_index, cx)
     }
 
     fn handle_drop(
@@ -1334,16 +1395,17 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
                 VIEWPORT_OVERSCAN_ROWS,
                 cx,
             );
-            let link_definitions = editor
+            let parsed = editor
                 .addon::<VisualMdAddon>()
-                .and_then(|addon| addon.parsed.as_ref())
-                .map(|parsed| parsed.link_definitions.clone());
+                .and_then(|addon| addon.parsed.as_ref());
+            let link_definitions = parsed.map(|parsed| parsed.link_definitions.clone());
+            let footnotes = parsed.map(|parsed| parsed.footnotes.clone());
             let plan = plan::plan_viewport_with_extensions(
                 text,
                 block_tree,
                 &selections,
                 visible_range.clone(),
-                &plan_extensions(&style, link_definitions, cx),
+                &plan_extensions(&style, link_definitions, footnotes, cx),
             );
             if let Some(addon) = editor.addon_mut::<VisualMdAddon>() {
                 addon.planned = Some((snapshot.edit_count(), visible_range));
@@ -1416,6 +1478,16 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             range.clone(),
             format!("checkbox:{checked}"),
             checkbox_placeholder(editor_handle.clone(), *checked, style_handle.clone()),
+        )
+    }));
+    folds.extend(computed.footnote_marks.iter().map(|mark| {
+        (
+            mark.range.clone(),
+            format!(
+                "footnote:{}:{}:{}",
+                mark.number, mark.is_definition, mark.label
+            ),
+            footnote_placeholder(mark, style_handle.clone()),
         )
     }));
     folds.extend(computed.task_marks.iter().filter_map(|(range, mark)| {
@@ -1513,6 +1585,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
 fn plan_extensions(
     style: &ResolvedStyle,
     link_definitions: Option<Arc<HashMap<String, String>>>,
+    footnotes: Option<Arc<footnotes::Footnotes>>,
     cx: &App,
 ) -> plan::PlanExtensions {
     let task_marks = style.task_marks.keys().copied().collect();
@@ -1520,12 +1593,14 @@ fn plan_extensions(
         return plan::PlanExtensions {
             task_marks,
             link_definitions,
+            footnotes,
             ..Default::default()
         };
     };
     plan::PlanExtensions {
         task_marks,
         link_definitions,
+        footnotes,
         rendered_fence_languages: registry.fence_languages().into_iter().collect(),
         rules: rules::RuleSet {
             rules: registry.syntax_rules().into(),
@@ -1733,6 +1808,7 @@ fn parsed_document(
             text: text.clone(),
             foldable: fold_ranges::foldable_ranges(&text, &block_tree).into(),
             link_definitions: Arc::new(plan::link_definitions(&text, &block_tree)),
+            footnotes: Arc::new(footnotes::Footnotes::scan(&text, Some(&block_tree))),
             block_tree,
         });
     }
@@ -1865,6 +1941,44 @@ fn ordinal_placeholder(text: String) -> editor::FoldPlaceholder {
             std::sync::Arc::new(move |_, _, _| div().child(text.clone()).into_any_element())
         },
         collapsed_text: Some(text),
+        ..base_placeholder()
+    }
+}
+
+/// A footnote reference as its number, small and raised in the link color, or
+/// the marker of its definition as the number and a full stop.
+fn footnote_placeholder(
+    mark: &plan::FootnoteMark,
+    style: Arc<ArcSwap<ResolvedStyle>>,
+) -> editor::FoldPlaceholder {
+    let number = mark.number;
+    let is_definition = mark.is_definition;
+    let shown = SharedString::from(if is_definition {
+        format!("{number}.")
+    } else {
+        number.to_string()
+    });
+    editor::FoldPlaceholder {
+        render: std::sync::Arc::new(move |_, _, _| {
+            let color = style.load().link_color;
+            if is_definition {
+                div()
+                    .text_color(color)
+                    .child(format!("{number}."))
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .items_start()
+                    .h_full()
+                    .px(px(1.))
+                    .text_size(px(10.))
+                    .text_color(color)
+                    .child(number.to_string())
+                    .into_any_element()
+            }
+        }),
+        collapsed_text: Some(shown),
         ..base_placeholder()
     }
 }
@@ -3787,6 +3901,77 @@ mod integration_tests {
             " [x] doing\n [ ] unknown\n",
             "checking a marked item makes it an ordinary checked one"
         );
+    }
+
+    async fn footnote_editor(cx: &mut TestAppContext, marked_text: &str) -> EditorTestContext {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state(marked_text);
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| refresh(editor, window, cx));
+        cx
+    }
+
+    fn put_cursor_at(cx: &mut EditorTestContext, offset: usize) {
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([MultiBufferOffset(offset)..MultiBufferOffset(offset)]);
+            });
+            refresh(editor, window, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn a_footnote_reference_shows_its_number_until_the_cursor_touches_it(
+        cx: &mut TestAppContext,
+    ) {
+        let text = "One[^b] two[^a].\n\n[^a]: Alpha.\n[^b]: Beta.\n";
+        let mut cx = footnote_editor(cx, &format!("ˇ{text}")).await;
+        assert_eq!(cx.display_text(), "One1 two2.\n\n2. Alpha.\n1. Beta.\n");
+
+        put_cursor_at(&mut cx, 5);
+        assert_eq!(
+            cx.display_text(),
+            "One[^b] two2.\n\n2. Alpha.\n1. Beta.\n",
+            "the reference under the cursor is source again"
+        );
+
+        put_cursor_at(&mut cx, text.find("[^b]:").unwrap_or(0) + 5);
+        assert_eq!(
+            cx.display_text(),
+            "One1 two2.\n\n2. Alpha.\n[^b]: Beta.\n",
+            "and so is the marker of a definition"
+        );
+
+        put_cursor_at(&mut cx, text.len());
+        assert_eq!(cx.display_text(), "One1 two2.\n\n2. Alpha.\n1. Beta.\n");
+    }
+
+    #[gpui::test]
+    async fn a_reference_without_a_definition_stays_text(cx: &mut TestAppContext) {
+        let mut cx = footnote_editor(
+            cx,
+            "ˇNo definition[^9] here and a [^1] there.\n\n[^1]: One.\n",
+        )
+        .await;
+
+        assert_eq!(
+            cx.display_text(),
+            "No definition[^9] here and a 1 there.\n\n1. One.\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn typing_a_definition_numbers_the_reference(cx: &mut TestAppContext) {
+        let mut cx = footnote_editor(cx, "ˇSee[^1].\n").await;
+        assert_eq!(cx.display_text(), "See[^1].\n");
+
+        put_cursor_at(&mut cx, "See[^1].\n".len());
+        cx.simulate_input("\n[^1]: The text.");
+        put_cursor_at(&mut cx, 0);
+
+        assert_eq!(cx.display_text(), "See1.\n\n1. The text.");
     }
 
     #[gpui::test]

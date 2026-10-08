@@ -208,6 +208,9 @@
     // root of the worktree, "attachments" and "../images" are from the folder of
     // the note. It is created if it is not there. Default: next to the note.
     "attachment_folder": null,
+    // Whether hovering a [[wikilink]] shows a preview of the note, heading or
+    // block it names.
+    "page_preview": true,
     // Settings of Zed MD extensions, keyed by extension id, for example
     // `"my-extension": { "notes": ["Alpha", "Beta"] }`. An extension reads only
     // its own entry, and defines what goes in it.

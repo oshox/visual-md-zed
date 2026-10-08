@@ -291,7 +291,7 @@ fn show_hover(
     let language_registry = editor
         .project()
         .map(|project| project.read(cx).languages().clone());
-    let provider = editor.semantics_provider.clone()?;
+    let provider = editor.semantics_provider.clone();
 
     editor.hover_state.hiding_delay_task = None;
     editor.hover_state.closest_mouse_distance = None;
@@ -334,7 +334,12 @@ fn show_hover(
                 total_delay
             };
 
-            let hover_request = cx.update(|_, cx| provider.hover(&buffer, buffer_position, cx))?;
+            let hover_request = match &provider {
+                Some(provider) => {
+                    cx.update(|_, cx| provider.hover(&buffer, buffer_position, cx))?
+                }
+                None => None,
+            };
 
             if let Some(delay) = delay {
                 delay.await;
@@ -521,6 +526,22 @@ fn show_hover(
                 None => Vec::new(),
             };
 
+            let addon_hover_task = this
+                .update(cx, |editor, cx| {
+                    editor.addon_hover_at(&buffer, buffer_position, cx)
+                })
+                .ok()
+                .flatten();
+            let addon_hover = match addon_hover_task {
+                Some(task) => task.await.and_then(|(range, text)| {
+                    let multi_buffer_range = snapshot
+                        .buffer_snapshot()
+                        .buffer_anchor_range_to_anchor_range(range)?;
+                    Some((multi_buffer_range, SharedString::from(text)))
+                }),
+                None => None,
+            };
+
             for hover_result in hovers_response {
                 // Create symbol range of anchors for highlighting and filtering of future requests.
                 let range = hover_result
@@ -563,7 +584,7 @@ fn show_hover(
                 });
             }
 
-            for (multi_buffer_range, tooltip) in doc_link_tooltips {
+            for (multi_buffer_range, tooltip) in doc_link_tooltips.into_iter().chain(addon_hover) {
                 let blocks = vec![HoverBlock {
                     text: tooltip.to_string(),
                     kind: HoverBlockKind::Markdown,
@@ -1480,7 +1501,9 @@ mod tests {
         actions::ConfirmCompletion,
         editor_tests::{handle_completion_request, init_test},
         inlays::inlay_hints::tests::{cached_hint_labels, visible_hint_labels},
-        test::editor_lsp_test_context::EditorLspTestContext,
+        test::{
+            editor_lsp_test_context::EditorLspTestContext, editor_test_context::EditorTestContext,
+        },
     };
     use collections::BTreeSet;
     use futures::stream::StreamExt;
@@ -3330,6 +3353,141 @@ mod tests {
                 "No hover info task should be scheduled when hover is disabled"
             );
         });
+    }
+
+    /// An addon that answers a hover over the word "magic" with a fixed text and
+    /// counts how often it is asked.
+    struct MagicHoverAddon {
+        asked: Rc<Cell<usize>>,
+    }
+
+    impl crate::Addon for MagicHoverAddon {
+        fn to_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn hover_at(
+            &self,
+            buffer: &Entity<language::Buffer>,
+            position: text::Anchor,
+            _project: Option<&Entity<project::Project>>,
+            cx: &mut App,
+        ) -> Option<gpui::Task<Option<(Range<text::Anchor>, String)>>> {
+            use text::ToOffset as _;
+
+            self.asked.set(self.asked.get() + 1);
+            let snapshot = buffer.read(cx).snapshot();
+            let offset = position.to_offset(&snapshot);
+            let start = snapshot.text().find("magic")?;
+            let range = start..start + "magic".len();
+            if !range.contains(&offset) {
+                return None;
+            }
+            let anchors = snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end);
+            Some(gpui::Task::ready(Some((
+                anchors,
+                "the magic **docs**".to_string(),
+            ))))
+        }
+    }
+
+    fn hover_over(cx: &mut EditorTestContext, marked_text: &str) {
+        let hover_point = cx.display_point(marked_text);
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let anchor = snapshot
+                .buffer_snapshot()
+                .anchor_before(hover_point.to_offset(&snapshot, Bias::Left));
+            hover_at(editor, Some(anchor), None, window, cx)
+        });
+        cx.background_executor
+            .advance_clock(Duration::from_millis(get_hover_popover_delay(cx) + 100));
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_an_addon_supplies_hover_text_without_a_language_server(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        let asked = Rc::new(Cell::new(0));
+        cx.update_editor(|editor, _, _| {
+            editor.semantics_provider = None;
+            editor.register_addon(MagicHoverAddon {
+                asked: asked.clone(),
+            })
+        });
+        cx.set_state("one magic wordˇ and another word\n");
+
+        hover_over(&mut cx, "one maˇgic word and another word\n");
+
+        cx.editor(|editor, _, cx| {
+            assert!(editor.hover_state.visible());
+            assert_eq!(editor.hover_state.info_popovers.len(), 1);
+            assert_eq!(
+                editor.hover_state.info_popovers[0].get_rendered_text(cx),
+                "the magic docs"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_second_hover_over_the_same_range_does_not_ask_the_addon_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        let asked = Rc::new(Cell::new(0));
+        cx.update_editor(|editor, _, _| {
+            editor.register_addon(MagicHoverAddon {
+                asked: asked.clone(),
+            })
+        });
+        cx.set_state("one magic wordˇ and another word\n");
+
+        hover_over(&mut cx, "one maˇgic word and another word\n");
+        let asked_after_first = asked.get();
+        assert!(asked_after_first > 0);
+        hover_over(&mut cx, "one magˇic word and another word\n");
+
+        assert_eq!(asked.get(), asked_after_first);
+        cx.editor(|editor, _, _| {
+            assert_eq!(editor.hover_state.info_popovers.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_hover_away_from_the_addons_text_closes_its_popover(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_editor(|editor, _, _| {
+            editor.register_addon(MagicHoverAddon {
+                asked: Rc::new(Cell::new(0)),
+            })
+        });
+        cx.set_state("one magic wordˇ and another word\n");
+
+        hover_over(&mut cx, "one maˇgic word and another word\n");
+        cx.editor(|editor, _, _| assert!(editor.hover_state.visible()));
+        hover_over(&mut cx, "one magic word and anoˇther word\n");
+
+        cx.editor(|editor, _, _| assert!(!editor.hover_state.visible()));
+    }
+
+    #[gpui::test]
+    async fn test_a_plain_editor_without_an_addon_still_shows_no_hover(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("one magic wordˇ and another word\n");
+
+        hover_over(&mut cx, "one maˇgic word and another word\n");
+
+        cx.editor(|editor, _, _| assert!(!editor.hover_state.visible()));
     }
 
     #[test]
