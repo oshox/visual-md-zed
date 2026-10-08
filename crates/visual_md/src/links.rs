@@ -12,15 +12,19 @@ use std::sync::Arc;
 
 use editor::hover_links::{HoverAction, HoverLink, ResolvedFileTarget};
 use extension::{VisualMdLinkRequest, VisualMdLinkStyle, VisualMdLinkTarget, VisualMdOutline};
-use gpui::{App, AsyncApp, Entity, Task};
+use gpui::{App, AppContext as _, AsyncApp, Entity, Task};
+use language::language_settings::LanguageSettings;
 use language::{Anchor, Buffer, Point, ToOffset as _};
 use project::{Project, ProjectPath, ResolvedPath};
+use util::ResultExt as _;
 use workspace::DeploySearch;
 
+use crate::embeds::MAX_NOTE_BYTES;
 use crate::extensions::{HookError, LinkResolvers, VisualMdExtensions, when_not_busy};
+use crate::note_contents;
 use crate::notes::{self, NoteIndex};
 use crate::outline;
-use crate::plan::{self, parse_blocks};
+use crate::plan::{self, EmbedKind, parse_blocks};
 
 /// A link on one line of text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +219,21 @@ pub fn resolve(
     }
 }
 
+/// The line `position` is on, where it starts in the buffer, and where in the
+/// line `position` is, in bytes.
+fn line_at(
+    snapshot: &language::BufferSnapshot,
+    position: Anchor,
+) -> Option<(String, usize, usize)> {
+    let offset = position.to_offset(snapshot);
+    let row = snapshot.offset_to_point(offset).row;
+    let line_start = snapshot.point_to_offset(Point::new(row, 0));
+    let line_end = snapshot.point_to_offset(Point::new(row, snapshot.line_len(row)));
+    let line: String = snapshot.text_for_range(line_start..line_end).collect();
+    let relative_offset = offset.checked_sub(line_start)?;
+    Some((line, line_start, relative_offset))
+}
+
 /// The link at `position` for the editor's hover and click handling, when live
 /// preview is `active` in the editor.
 pub(crate) fn link_at(
@@ -230,12 +249,7 @@ pub(crate) fn link_at(
         return None;
     }
     let snapshot = buffer.read(cx).snapshot();
-    let offset = position.to_offset(&snapshot);
-    let row = snapshot.offset_to_point(offset).row;
-    let line_start = snapshot.point_to_offset(Point::new(row, 0));
-    let line_end = snapshot.point_to_offset(Point::new(row, snapshot.line_len(row)));
-    let line: String = snapshot.text_for_range(line_start..line_end).collect();
-    let relative_offset = offset.checked_sub(line_start)?;
+    let (line, line_start, relative_offset) = line_at(&snapshot, position)?;
     let link = link_in_line(&line, relative_offset).or_else(|| {
         definitions
             .as_deref()
@@ -303,6 +317,75 @@ pub(crate) fn link_at(
             None
         })),
     }
+}
+
+/// What the hover popover shows for the `[[wikilink]]` under `position`: the
+/// note, heading or block it names, as Markdown. Nothing when the link leads
+/// anywhere else than a note of the project, such as to a target an extension
+/// resolves, or when `visual_md.page_preview` is off.
+pub(crate) fn preview_at(
+    active: bool,
+    buffer: &Entity<Buffer>,
+    position: Anchor,
+    project: Option<&Entity<Project>>,
+    note_index: Option<Entity<NoteIndex>>,
+    cx: &mut App,
+) -> Option<Task<Option<(Range<Anchor>, String)>>> {
+    if !active
+        || !LanguageSettings::for_buffer(buffer.read(cx), cx)
+            .visual_md
+            .is_page_preview_enabled()
+    {
+        return None;
+    }
+    let snapshot = buffer.read(cx).snapshot();
+    let (line, line_start, relative_offset) = line_at(&snapshot, position)?;
+    let link = link_in_line(&line, relative_offset).filter(|link| link.is_wikilink)?;
+    let range = snapshot.anchor_before(line_start + link.range.start)
+        ..snapshot.anchor_after(line_start + link.range.end);
+
+    let resolvers = cx
+        .try_global::<VisualMdExtensions>()
+        .map(|registry| registry.link_resolvers())
+        .unwrap_or_default();
+    if !resolvers.wikilinks.is_empty() {
+        return None;
+    }
+
+    let (name, subpath) = plan::split_subpath(&link.target);
+    let opening = if name.is_empty() {
+        None
+    } else {
+        let from = notes::location_of(buffer.read(cx), cx);
+        let notes::Resolution::Found(file) = note_index?.read(cx).resolve(name, from.as_ref())
+        else {
+            return None;
+        };
+        let path = file.project_path();
+        let extension = path.path.extension().unwrap_or_default();
+        if !extension.is_empty() && EmbedKind::for_extension(extension) != Some(EmbedKind::Note) {
+            return None;
+        }
+        let project = project?;
+        Some(project.update(cx, |project, cx| project.open_buffer(path, cx)))
+    };
+
+    let current = buffer.clone();
+    Some(cx.spawn(async move |cx| {
+        let note = match opening {
+            Some(opening) => opening.await.log_err()?,
+            None => current,
+        };
+        let text = cx.update(|cx| note.read(cx).text());
+        let preview = cx
+            .background_spawn(async move {
+                let section = note_contents::section(&text, subpath.as_ref())?;
+                let (preview, _) = note_contents::preview_markdown(&section, MAX_NOTE_BYTES);
+                (!preview.trim().is_empty()).then_some(preview)
+            })
+            .await?;
+        Some((range, preview))
+    }))
 }
 
 /// A link from the tag under the pointer that searches the project for it.
@@ -624,7 +707,7 @@ mod integration_tests {
     use editor::test::editor_test_context::EditorTestContext;
     use editor::{Addon as _, Editor, EditorMode, HighlightKey, MultiBuffer};
     use fs::FakeFs;
-    use gpui::{AppContext as _, Modifiers, TestAppContext, WindowHandle};
+    use gpui::{Modifiers, TestAppContext, WindowHandle};
     use project::ResolvedPath;
     use serde_json::json;
 
@@ -1137,5 +1220,385 @@ mod integration_tests {
         );
         cx.simulate_click(on_text, Modifiers::secondary_key());
         assert_eq!(cx.opened_url(), Some("https://example.com/docs".into()));
+    }
+
+    async fn preview_for(
+        cx: &mut TestAppContext,
+        document: &Document,
+        offset: usize,
+    ) -> Option<(Range<usize>, String)> {
+        let buffer = document.buffer.clone();
+        let project = document.project.clone();
+        let task = document
+            .window
+            .update(cx, |editor, _window, cx| {
+                let position = buffer.read(cx).anchor_before(offset);
+                editor
+                    .addon::<VisualMdAddon>()
+                    .and_then(|addon| addon.hover_at(&buffer, position, Some(&project), cx))
+            })
+            .ok()
+            .flatten()?;
+        let (range, preview) = task.await?;
+        let snapshot = document.buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        Some((
+            range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot),
+            preview,
+        ))
+    }
+
+    const OTHER: &str = "---\ntitle: Other\n---\n# First\nfirst text\n\n## Nested\nnested text\n\n# Second\nsecond [[x|shown]] text ^second-id\n\nloose paragraph ^loose\n";
+
+    fn notes() -> serde_json::Value {
+        json!({ "other.md": OTHER, "empty.md": "", "pic.png": "x", "sub": { "deep.md": "deep text" } })
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_previews_the_note_without_its_front_matter(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "go [[Other]] now\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+
+        let (range, preview) = preview_for(cx, &document, 6).await.expect("a preview");
+
+        assert_eq!(text_of(text, range), "[[Other]]");
+        assert!(preview.starts_with("# First"), "{preview}");
+        assert!(!preview.contains("title: Other"), "{preview}");
+        assert!(preview.contains("second shown text"), "{preview}");
+        assert!(!preview.contains("^second-id"), "{preview}");
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_to_a_heading_previews_that_section(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "go [[Other#First]] and [[Other#Nested]]\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+
+        let (_, first) = preview_for(cx, &document, 6).await.expect("a preview");
+        assert_eq!(first, "# First\nfirst text\n\n## Nested\nnested text");
+
+        let nested = text.find("Nested").expect("the text has it");
+        let (_, nested) = preview_for(cx, &document, nested).await.expect("a preview");
+        assert_eq!(nested, "## Nested\nnested text");
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_to_a_block_previews_the_block_without_its_id(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "go [[Other#^loose]]\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+
+        let (_, preview) = preview_for(cx, &document, 6).await.expect("a preview");
+
+        assert_eq!(preview, "loose paragraph");
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_to_a_heading_of_this_note_previews_it_from_the_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let text = "# Intro\nintro text\n\n# Later\nsee [[#Intro]]\n";
+        let document = open(cx, json!({ "a.md": text }), "/dir/a.md", true).await;
+        let offset = text.find("[[#Intro]]").expect("the text has it") + 3;
+
+        let (_, preview) = preview_for(cx, &document, offset).await.expect("a preview");
+
+        assert_eq!(preview, "# Intro\nintro text");
+    }
+
+    #[gpui::test]
+    async fn test_a_preview_shows_edits_that_are_not_saved(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "go [[Other]] now\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+        let other = document
+            .project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/dir/other.md", cx)
+            })
+            .await
+            .expect("the file opens");
+        other.update(cx, |buffer, cx| buffer.edit([(0..0, "edited ")], None, cx));
+
+        let (_, preview) = preview_for(cx, &document, 6).await.expect("a preview");
+
+        assert!(preview.starts_with("edited ---"), "{preview}");
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_in_a_folder_previews_the_note_by_its_name(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "go [[Deep]] now\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+
+        let (_, preview) = preview_for(cx, &document, 6).await.expect("a preview");
+
+        assert_eq!(preview, "deep text");
+    }
+
+    #[gpui::test]
+    async fn test_nothing_is_previewed_that_is_not_a_note_with_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "[[Nobody]] [[pic.png]] [[Empty]] [[Other#Nowhere]] [[Other#^nowhere]] [a link](other.md) plain\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+
+        for needle in [
+            "Nobody",
+            "pic.png",
+            "Empty",
+            "Nowhere]]",
+            "^nowhere",
+            "a link",
+            "plain",
+        ] {
+            let offset = text.find(needle).expect("the text has it");
+            assert_eq!(
+                preview_for(cx, &document, offset).await,
+                None,
+                "{needle} has no preview"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_the_setting_turns_previews_off(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "go [[Other]] now\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+        assert!(preview_for(cx, &document, 6).await.is_some());
+
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .project
+                    .all_languages
+                    .defaults
+                    .visual_md
+                    .get_or_insert_default()
+                    .page_preview = Some(false);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(preview_for(cx, &document, 6).await, None);
+    }
+
+    #[gpui::test]
+    async fn test_a_wikilink_an_extension_resolves_is_not_previewed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let extension =
+            extension_with_links(cx, "a-first", "wikilinks = true\n", Behavior::Succeed);
+        extension.set_link_responder(|_| None);
+        let text = "go [[Other]] now\n";
+        let mut files = notes();
+        files["a.md"] = json!(text);
+        let document = open(cx, files, "/dir/a.md", true).await;
+
+        assert_eq!(preview_for(cx, &document, 6).await, None);
+    }
+
+    #[gpui::test]
+    async fn test_a_preview_is_cut_at_the_limit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let long = "a line of text\n".repeat(20_000);
+        let text = "go [[Long]] now\n";
+        let document = open(
+            cx,
+            json!({ "a.md": text, "long.md": long }),
+            "/dir/a.md",
+            true,
+        )
+        .await;
+
+        let (_, preview) = preview_for(cx, &document, 6).await.expect("a preview");
+
+        assert!(preview.len() <= MAX_NOTE_BYTES, "{}", preview.len());
+        assert!(preview.len() > MAX_NOTE_BYTES / 2, "{}", preview.len());
+    }
+
+    const NOTED: &str =
+        "see[^1] and[^2] there\n\n[^1]: The **note**\n    continues [[Other]].\n[^2]: Second.\n";
+
+    #[gpui::test]
+    async fn test_a_footnote_reference_previews_its_definition(cx: &mut TestAppContext) {
+        init_test(cx);
+        let document = open(cx, json!({ "a.md": NOTED }), "/dir/a.md", true).await;
+        let offset = NOTED.find("[^1]").expect("the text has it") + 2;
+
+        let (range, preview) = preview_for(cx, &document, offset).await.expect("a preview");
+
+        assert_eq!(text_of(NOTED, range), "[^1]");
+        assert_eq!(preview, "The **note**\ncontinues Other.");
+        assert_eq!(
+            preview_for(cx, &document, NOTED.find("there").unwrap_or(0)).await,
+            None
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_footnote_preview_does_not_depend_on_the_page_preview_setting(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let document = open(cx, json!({ "a.md": NOTED }), "/dir/a.md", true).await;
+        cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .project
+                    .all_languages
+                    .defaults
+                    .visual_md
+                    .get_or_insert_default()
+                    .page_preview = Some(false);
+            });
+        });
+        cx.run_until_parked();
+
+        let offset = NOTED.find("[^2]").expect("the text has it");
+        let (_, preview) = preview_for(cx, &document, offset).await.expect("a preview");
+
+        assert_eq!(preview, "Second.");
+    }
+
+    #[gpui::test]
+    async fn test_a_footnote_preview_follows_the_text_as_it_is_edited(cx: &mut TestAppContext) {
+        init_test(cx);
+        let document = open(cx, json!({ "a.md": NOTED }), "/dir/a.md", true).await;
+        let offset = NOTED.find("[^1]").expect("the text has it") + 2;
+        let added = "A longer start of the line, ";
+        document
+            .buffer
+            .update(cx, |buffer, cx| buffer.edit([(0..0, added)], None, cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            preview_for(cx, &document, offset).await,
+            None,
+            "that is now in the added text"
+        );
+        let (_, preview) = preview_for(cx, &document, offset + added.len())
+            .await
+            .expect("a preview");
+        assert_eq!(preview, "The **note**\ncontinues Other.");
+    }
+
+    #[gpui::test]
+    async fn test_clicking_a_footnote_reference_moves_the_cursor_to_its_definition(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let document = open(cx, json!({ "a.md": NOTED }), "/dir/a.md", true).await;
+        let offset = NOTED.find("[^1]").expect("the text has it") + 1;
+
+        let (range, link) = raw_link_for(cx, &document, offset).await.expect("a link");
+        assert_eq!(text_of(NOTED, range), "[^1]");
+        let HoverLink::Action(go_to_definition) = link else {
+            panic!("the link should be an action");
+        };
+        // Run where the editor navigation runs it, outside an update of the editor.
+        cx.update_window(document.window.into(), |_, window, cx| {
+            go_to_definition.run(window, cx)
+        })
+        .expect("the window is open");
+        cx.run_until_parked();
+
+        let head = document
+            .window
+            .update(cx, |editor, _window, cx| {
+                let display_snapshot = editor.display_snapshot(cx);
+                editor
+                    .selections
+                    .newest::<editor::MultiBufferOffset>(&display_snapshot)
+                    .head()
+                    .0
+            })
+            .expect("the window is open");
+        assert_eq!(
+            head,
+            NOTED.find("The **note**").expect("the text has it"),
+            "the cursor is at the start of the definition's text"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_the_mouse_over_a_footnote_number_hovers_and_follows_the_reference(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("see it now[^1] and more text\n\n[^1]: The definition.\n\nendˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| crate::refresh(editor, window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            cx.display_text(),
+            "see it now1 and more text\n\n1. The definition.\n\nend\n"
+        );
+
+        let on_number =
+            cx.pixel_position("see it now[ˇ^1] and more text\n\n[^1]: The definition.\n\nend\n");
+        cx.simulate_mouse_move(on_number, None, Modifiers::secondary_key());
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            "see it now«[^1]ˇ» and more text\n\n[^1]: The definition.\n\nend\n",
+        );
+        cx.simulate_click(on_number, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.assert_editor_state("see it now[^1] and more text\n\n[^1]: ˇThe definition.\n\nend\n");
+    }
+
+    #[gpui::test]
+    async fn test_resting_the_mouse_on_a_footnote_number_shows_the_definition(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.set_state("see it now[^1] and more text\n\n[^1]: The **definition**.\n\nendˇ\n");
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language()), cx));
+        cx.run_until_parked();
+        cx.update_editor(|editor, window, cx| crate::refresh(editor, window, cx));
+        cx.run_until_parked();
+
+        let on_number = cx
+            .pixel_position("see it now[ˇ^1] and more text\n\n[^1]: The **definition**.\n\nend\n");
+        cx.simulate_mouse_move(on_number, None, Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+
+        let shown = cx.editor(|editor, _, cx| {
+            editor
+                .hover_state
+                .info_popovers
+                .iter()
+                .filter_map(|popover| popover.parsed_content.as_ref())
+                .map(|markdown| markdown.read(cx).source().to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(shown, vec!["The **definition**.".to_string()]);
+
+        let elsewhere = cx
+            .pixel_position("see it now[^1] and moˇre text\n\n[^1]: The **definition**.\n\nend\n");
+        cx.simulate_mouse_move(elsewhere, None, Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1000));
+        cx.run_until_parked();
+        cx.editor(|editor, _, _| assert!(!editor.hover_state.visible()));
     }
 }

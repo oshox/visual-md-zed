@@ -964,6 +964,11 @@ pub struct VisualMdSettingsContent {
     ///
     /// Default: null
     pub attachment_folder: Option<String>,
+    /// Whether hovering a `[[wikilink]]` shows a preview of the note, heading or
+    /// block it names.
+    ///
+    /// Default: true
+    pub page_preview: Option<bool>,
     /// Settings for Zed MD extensions, keyed by extension id. An extension reads
     /// only its own entry, whose shape it defines.
     ///
@@ -975,6 +980,11 @@ impl VisualMdSettingsContent {
     /// Live preview is on unless a settings file turns it off.
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// Page previews are on unless a settings file turns them off.
+    pub fn is_page_preview_enabled(&self) -> bool {
+        self.page_preview.unwrap_or(true)
     }
 }
 

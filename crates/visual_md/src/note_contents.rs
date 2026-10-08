@@ -80,15 +80,18 @@ pub fn block_ids(text: &str) -> Vec<BlockId> {
         .collect()
 }
 
-/// The text of a note after its front matter.
-fn without_front_matter<'a>(text: &'a str, tree: &tree_sitter::Tree) -> &'a str {
+/// Where the front matter of a note ends, or 0 when it has none.
+pub(crate) fn front_matter_end(tree: &tree_sitter::Tree) -> usize {
     let mut cursor = tree.root_node().walk();
-    let end = tree
-        .root_node()
+    tree.root_node()
         .children(&mut cursor)
         .find(|child| matches!(child.kind(), "minus_metadata" | "plus_metadata"))
-        .map_or(0, |front_matter| front_matter.end_byte());
-    text.get(end..).unwrap_or(text)
+        .map_or(0, |front_matter| front_matter.end_byte())
+}
+
+/// The text of a note after its front matter.
+fn without_front_matter<'a>(text: &'a str, tree: &tree_sitter::Tree) -> &'a str {
+    text.get(front_matter_end(tree)..).unwrap_or(text)
 }
 
 /// What `![[Note#...]]` and a preview of `[[Note#...]]` show: the whole note
@@ -209,8 +212,13 @@ pub fn preview_markdown(text: &str, max_bytes: usize) -> (String, bool) {
 
 /// Fenced and indented code blocks, and inline code spans, of `text`.
 fn code_ranges(text: &str) -> Vec<Range<usize>> {
+    code_ranges_in(text, parse_blocks(text).as_ref())
+}
+
+/// [`code_ranges`] for a text whose block parse the caller already has.
+pub(crate) fn code_ranges_in(text: &str, tree: Option<&tree_sitter::Tree>) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
-    if let Some(tree) = parse_blocks(text) {
+    if let Some(tree) = tree {
         let mut pending = vec![tree.root_node()];
         while let Some(node) = pending.pop() {
             if matches!(node.kind(), "fenced_code_block" | "indented_code_block") {
