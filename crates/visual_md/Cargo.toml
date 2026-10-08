@@ -27,6 +27,7 @@ icons.workspace = true
 language.workspace = true
 log.workspace = true
 markdown.workspace = true
+menu.workspace = true
 multi_buffer.workspace = true
 parking_lot.workspace = true
 project.workspace = true
@@ -40,6 +41,7 @@ theme_settings.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-md.workspace = true
+tree-sitter-yaml.workspace = true
 util.workspace = true
 workspace.workspace = true
 

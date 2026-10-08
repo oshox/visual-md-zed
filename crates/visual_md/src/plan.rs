@@ -19,6 +19,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::footnotes::Footnotes;
 use crate::inline_scan;
+use crate::note_contents;
+use crate::properties;
 use crate::rules::{self, DynamicKey, DynamicResult, RuleHit, RuleSet};
 
 /// A persistent style to apply to a content span (never to its markers).
@@ -259,6 +261,10 @@ pub struct Plan {
     /// note needs the editor's real width, which a fold can't stretch to. See
     /// `embeds.rs`.
     pub embeds: Vec<EmbedInfo>,
+    /// The front matter, when no selection touches it and it is YAML that the
+    /// properties panel can show. Rendered as a block that replaces all of it,
+    /// see `properties_panel.rs`.
+    pub properties: Option<PropertiesInfo>,
     /// Footnote references and the markers of their definitions in view, that no
     /// selection touches, with the number each shows in their place. One that a
     /// selection touches is in `dimmed_markers` instead.
@@ -281,6 +287,20 @@ pub struct Plan {
     candidate_hidden: Vec<Range<usize>>,
     candidate_dimmed: Vec<Range<usize>>,
     candidate_replacements: Vec<(Range<usize>, String)>,
+}
+
+/// The front matter of a note, see `Plan::properties`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertiesInfo {
+    /// From the start of the opening `---` to the end of the closing one,
+    /// without its line break, so a cursor at the start of the next line does
+    /// not touch it.
+    pub range: Range<usize>,
+    /// The lines between the two `---`.
+    pub body_range: Range<usize>,
+    /// A hash of the body, so a change to it that leaves the ranges alone still
+    /// makes the plan differ.
+    pub body_hash: u64,
 }
 
 /// A footnote reference `[^label]`, or the `[^label]:` that starts its
@@ -585,7 +605,13 @@ pub fn plan_viewport_with_extensions(
 
     // Standalone images are planned before the extension candidates are
     // resolved, since their rows are among the ranges extensions must stay off.
-    plan_embeds(text, selections, &visible_range, &mut plan);
+    plan_embeds(
+        text,
+        selections,
+        &visible_range,
+        note_contents::front_matter_end(block_tree),
+        &mut plan,
+    );
     if let Some(footnotes) = &extensions.footnotes {
         plan_footnotes(footnotes, selections, &visible_range, &mut plan);
     }
@@ -621,6 +647,7 @@ fn plan_embeds(
     text: &str,
     selections: &[Range<usize>],
     visible_range: &Range<usize>,
+    front_matter_end: usize,
     plan: &mut Plan,
 ) {
     let mut offset = 0;
@@ -628,6 +655,9 @@ fn plan_embeds(
     for line in text.split_inclusive('\n') {
         let line_start = offset;
         offset += line.len();
+        if line_start < front_matter_end {
+            continue;
+        }
         let content = line.trim_end_matches(['\n', '\r']);
         let trimmed = content.trim_start_matches(' ');
         let indentation = content.len() - trimmed.len();
@@ -956,6 +986,7 @@ fn occupied_ranges(plan: &Plan) -> Vec<Range<usize>> {
         .chain(plan.embeds.iter().map(|embed| embed.range.clone()))
         .chain(plan.rendered_fences.iter().map(|fence| fence.range.clone()))
         .chain(plan.footnote_marks.iter().map(|mark| mark.range.clone()))
+        .chain(plan.properties.iter().map(|info| info.range.clone()))
         .collect();
     for callout in &plan.callouts {
         occupied.push(callout.marker_range.clone());
@@ -971,6 +1002,26 @@ fn occupied_ranges(plan: &Plan) -> Vec<Range<usize>> {
         }
     }
     merge_ranges(occupied)
+}
+
+/// The front matter `node` as the properties panel shows it, unless a selection
+/// touches it, which shows its source, or it is not a YAML mapping of properties.
+fn plan_properties(node: Node, text: &str, selections: &[Range<usize>]) -> Option<PropertiesInfo> {
+    let range = node.start_byte()..end_of_line_content(text, node.end_byte());
+    if touches_selection(&range, selections) {
+        return None;
+    }
+    let written = text.get(range.clone())?;
+    let body_start = range.start + written.find('\n')? + 1;
+    let closing_start = range.start + written.rfind('\n')? + 1;
+    let body_range = body_start..closing_start;
+    let body = text.get(body_range.clone())?;
+    properties::parse(body)?;
+    Some(PropertiesInfo {
+        range,
+        body_range,
+        body_hash: hash_text(body),
+    })
 }
 
 /// The footnote references and definition markers in `visible_range`. One that a
@@ -1143,6 +1194,12 @@ fn walk_block(
                 plan,
             );
             return;
+        }
+        "minus_metadata" => {
+            if let Some(info) = plan_properties(node, text, selections) {
+                plan.properties = Some(info);
+                return;
+            }
         }
         "thematic_break" => {
             // Without the line's newline: the rule is a one-row block, and a
@@ -4447,6 +4504,36 @@ mod tests {
         }
 
         #[test]
+        fn extensions_stay_off_the_properties_panel() {
+            let text = "---\ntitle: x\n---\n\nbody\n";
+            let effects = RuleEffects {
+                hidden: vec![0..3],
+                replacements: vec![(4..9, "T".to_string())],
+                ..Default::default()
+            };
+            let rules = with_result(
+                rule_set(&[VisualMdSyntaxRuleManifestEntry {
+                    dynamic: true,
+                    ..node_rule("meta", "minus_metadata")
+                }]),
+                key("meta", "---\ntitle: x\n---\n"),
+                ready(effects),
+            );
+
+            let source = plan_with(text, &[5..5], rules.clone());
+            assert!(
+                source.dimmed_markers.contains(&(0..3)),
+                "the rule works on the front matter when it is source"
+            );
+
+            let panel = plan_with(text, &[], rules);
+            assert!(panel.properties.is_some());
+            assert!(panel.hidden_markers.is_empty());
+            assert!(panel.dimmed_markers.is_empty());
+            assert!(panel.extension_replacements.is_empty());
+        }
+
+        #[test]
         fn extensions_stay_off_table_gaps_and_the_delimiter_row() {
             let text = "| a | b |\n|---|---|\n| c | d |\n";
             let rules = rule_set(&[hiding_rule("r", r"[ -]+", &[0])]);
@@ -4866,6 +4953,89 @@ mod tests {
                 .iter()
                 .all(|mark| mark.is_definition),
             "the reference in a collapsed callout is not replaced"
+        );
+    }
+
+    const NOTE_WITH_PROPERTIES: &str = "---\ntitle: Hello\ntags: [a, b]\n---\n\nbody text\n";
+
+    #[test]
+    fn untouched_front_matter_is_planned_as_properties() {
+        let result = plan(NOTE_WITH_PROPERTIES, &[40..40]);
+        let info = result.properties.expect("properties");
+
+        assert_eq!(
+            NOTE_WITH_PROPERTIES.get(info.range.clone()),
+            Some("---\ntitle: Hello\ntags: [a, b]\n---")
+        );
+        assert_eq!(
+            NOTE_WITH_PROPERTIES.get(info.body_range),
+            Some("title: Hello\ntags: [a, b]\n")
+        );
+        assert!(result.hidden_markers.is_empty());
+    }
+
+    #[test]
+    fn front_matter_a_selection_touches_stays_source() {
+        for selection in [0..0, 2..2, 20..20, 32..32, 33..33, 0..40] {
+            let result = plan(NOTE_WITH_PROPERTIES, std::slice::from_ref(&selection));
+
+            assert_eq!(result.properties, None, "{selection:?}");
+        }
+        let end = NOTE_WITH_PROPERTIES.find("\n\nbody").unwrap_or(0);
+        assert!(plan(NOTE_WITH_PROPERTIES, &[end..end]).properties.is_none());
+        assert!(
+            plan(NOTE_WITH_PROPERTIES, &[end + 1..end + 1])
+                .properties
+                .is_some(),
+            "the start of the line after the closing line does not touch it"
+        );
+    }
+
+    #[test]
+    fn properties_change_with_the_text_even_when_the_ranges_do_not() {
+        let hash = |text: &str| plan(text, &[]).properties.map(|info| info.body_hash);
+
+        assert_ne!(
+            hash("---\ndone: true\n---\n"),
+            hash("---\ndone: fals\n---\n")
+        );
+    }
+
+    #[test]
+    fn front_matter_that_is_not_a_yaml_mapping_stays_source() {
+        for text in [
+            "---\n- a\n- b\n---\n\nbody\n",
+            "---\nkey: [unclosed\n---\n\nbody\n",
+            "+++\ntitle = \"x\"\n+++\n\nbody\n",
+            "body\n\n---\ntitle: x\n---\n",
+            "---\ntitle: x\n\nno closing line\n",
+        ] {
+            assert_eq!(plan(text, &[]).properties, None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn empty_front_matter_is_properties_with_nothing_in_them() {
+        let text = "---\n---\n\nbody\n";
+        let info = plan(text, &[10..10]).properties.expect("properties");
+
+        assert_eq!(info.range, 0..7);
+        assert_eq!(info.body_range, 4..4);
+    }
+
+    #[test]
+    fn a_line_in_front_matter_is_never_an_embed() {
+        let text = "---\ncover: x\n![[a.png]]\n---\n\n![[b.png]]\n";
+        let result = plan(text, &[]);
+
+        assert_eq!(
+            result
+                .embeds
+                .iter()
+                .map(|embed| embed.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.png"],
+            "only the line after the front matter"
         );
     }
 }

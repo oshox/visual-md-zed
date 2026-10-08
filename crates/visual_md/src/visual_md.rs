@@ -250,6 +250,8 @@ mod note_contents;
 mod notes;
 pub mod outline;
 mod plan;
+mod properties;
+mod properties_panel;
 pub mod rules;
 mod style;
 
@@ -423,6 +425,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         sections_applied: None,
         hr_blocks: Vec::new(),
         embed_blocks: Vec::new(),
+        properties_block: None,
+        property_input: None,
         rendered_fence_blocks: Vec::new(),
         code_fence_borders: Vec::new(),
         code_languages: HashMap::new(),
@@ -802,6 +806,10 @@ struct VisualMdAddon {
     /// retyping the path changes the source without moving the range's start,
     /// and the block must be rebuilt to show the new image.
     embed_blocks: Vec<embeds::EmbedBlock>,
+    /// The block standing in for the front matter, and the text input that is
+    /// open in it, if one is (see [`properties_panel`]).
+    properties_block: Option<properties_panel::PanelBlock>,
+    property_input: Option<properties_panel::PropertyInput>,
     /// Blocks standing in for fenced code blocks that an extension renders
     /// (see `fence_render::apply_rendered_fences`).
     rendered_fence_blocks: Vec<fence_render::RenderedFenceBlock>,
@@ -1564,6 +1572,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     apply_style_highlights(editor, &snapshot, &computed, enabled, &style, cx);
     apply_horizontal_rules(editor, &snapshot, &computed, style_handle.clone(), cx);
     embeds::apply_embeds(editor, &snapshot, &computed, cx);
+    properties_panel::apply_properties(editor, &snapshot, &text, &computed, cx);
     fence_render::apply_rendered_fences(editor, &snapshot, &text, &computed, cx);
     apply_table_dividers(editor, &snapshot, &computed, style_handle.clone(), cx);
     apply_code_fence_borders(editor, &snapshot, &computed, style_handle, cx);
