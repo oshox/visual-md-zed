@@ -25,7 +25,7 @@ purpose even though the app is branded Zed MD.
 | M15 | Extension hooks on par with Obsidian, Notion and Logseq | Built. The hooks that need keystrokes or the mouse were not run in the app, see "Checked in the running app" under M15 |
 | M16 | Block layout fixes, native wikilinks, tags, comments, block ids and task marks | Built. Clicking a link or a tag was not run in the app, see "As built" under M16 |
 | M17 | Editing tools and the outliner | Built. Nothing that needs a key or the mouse was run in the app, see "M17" |
-| M18 | Embeds, hover previews, footnotes and an editable properties panel | In progress: embeds built, see "M18" |
+| M18 | Embeds, hover previews, footnotes and an editable properties panel | In progress: embeds, hover previews and footnotes built, see "M18" |
 | M19 | Math (after a renderer spike), an HTML subset, callout and table polish | Planned |
 | M20 | Extension surface for knowledge-base features | Planned, see the feature audit |
 
@@ -327,8 +327,9 @@ work, "API" needs new extension API.
 | Custom task marks `[/]` `[-]` | only `[ ]` and `[x]` | Core, **M16** |
 | Highlight and inline code chips | no background | Core, **M16** |
 | Embeds: `![[Note]]`, `#Heading`, sizes, audio, video, PDF | only a line that is one image | Core, **M18** (audio, video and PDF as a chip that opens the file) |
-| Hover page preview, footnote hover | none | Core, M18 |
-| Footnotes, YAML properties panel | none | Core, M18 |
+| Hover page preview, footnote hover | none | Core, **M18** (the popover is the editor's hover box, fed by a new `Addon::hover_at`) |
+| Footnotes | none | Core, **M18** |
+| YAML properties panel | none | Core, M18 |
 | Math, embedded HTML | none | Core, M19 |
 | Callouts: whole-row fold click, right-click type menu, per-type accent bar | chevron click only | Core, M19 |
 | Tables: row lines, per-cell raw reveal | cells always raw | Core, M19 |
@@ -672,3 +673,60 @@ cursor in the line, which shows the source.
   that text wins.
 - The Open button and a click on the block were not run in the app; the tests
   call the same functions the click does.
+
+### As built: hover previews and footnotes
+
+**The hook.** An editor addon can now supply hover content, which it could not
+before: `Addon::hover_at(buffer, position, project, cx)` returns the range the
+popover is about and Markdown to show in it. `show_hover` in `hover_popover.rs`
+asks the addons beside the language server and the document links, and shows what
+comes back as an ordinary info popover, so the delay, the sticky behaviour, the
+dismissal and the `hover_popover_enabled` setting all apply. `show_hover` used to
+give up when the editor had no language server provider; now only the request to
+the language server depends on one, so a Markdown note in a folder with no
+language server can have a popover.
+
+**Page preview.** Resting the pointer on a `[[wikilink]]` shows the note it names,
+without its front matter, as Markdown, using the same code as an embed:
+`[[Note#Heading]]` shows that heading and what is under it, `[[Note#^id]]` the
+block, `[[#Heading]]` a part of the note being edited. The text is cut at 100 KB.
+It is read through the project, so an unsaved edit shows. Nothing is previewed
+for a note that is not there, an empty one, a file that is not a note
+(`[[image.png]]`), a link an extension resolves, or an ordinary `[text](url)`
+link. `visual_md.page_preview` turns it off; it is on by default and is in the
+settings UI under Markdown Live Preview.
+
+**Footnotes.** The Markdown grammar has none: `[^1]` parses as a link whose text
+is `^1`, and `[^1]: text` as a paragraph, or, when the text is one word, as a link
+reference definition. `footnotes.rs` finds them in the text, outside code and
+front matter, once for each parse of a document and keeps the result with it.
+A reference is numbered by the order in which labels are first referred to, and
+its definition has the same number. Labels match without regard to case. The
+first of two definitions of a label counts.
+- A reference to a label that is defined shows a small number in the link color,
+  raised to the top of the line, in place of `[^label]`. A definition's
+  `[^label]:` shows `1.`. Both turn back into dimmed source while the cursor
+  touches them, so they can be edited. A reference with no definition, and a
+  definition nothing refers to, stay text.
+- Resting the pointer on a reference shows the definition's text, with its
+  continuation lines. Ctrl or Cmd and a click moves the cursor to the start of the
+  definition. This is not tied to `visual_md.page_preview`.
+- A definition continues on indented lines, on lines that follow it without a blank
+  line unless they begin a heading, quote, list item, fence, rule or another
+  definition, and, after a blank line, on lines indented four spaces or a tab.
+- `[^label]: word` is no longer taken for a link reference definition.
+- A footnote over another decoration is left as text: in a link's destination or
+  in the body of a collapsed callout.
+
+**Limitations.**
+- Inline footnotes `^[text]` are not supported.
+- A definition's second paragraph is, to the Markdown parser, an indented code
+  block, so it is drawn as code though it is read as part of the footnote.
+- Definitions are not moved to the end of the note, and there is no link back from
+  a definition to its reference.
+- A footnote in a table cell is replaced like any other. How that looks next to
+  the alignment spacers of the table's columns was not checked.
+- Hovering and Ctrl-clicking a footnote number were run through the editor's own
+  mouse path in the tests, with the pointer placed by pixel position. The wikilink
+  preview was tested through the addon, and the popover through a stand-in addon
+  in the editor's tests. None of it was run in the app.
